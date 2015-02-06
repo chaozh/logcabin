@@ -15,7 +15,7 @@
 
 #include <memory>
 
-#include "RPC/Buffer.h"
+#include "Core/Buffer.h"
 #include "RPC/MessageSocket.h"
 #include "RPC/OpaqueServer.h"
 
@@ -36,7 +36,7 @@ namespace RPC {
 class OpaqueServerRPC {
     /**
      * Constructor for OpaqueServerRPC. This is called by OpaqueServer.
-     * \param messageSocket
+     * \param socket
      *      The socket on which to send the reply.
      * \param messageId
      *      The message ID received with the request.
@@ -44,9 +44,9 @@ class OpaqueServerRPC {
      *      The RPC request received from the client.
      */
     OpaqueServerRPC(
-            std::weak_ptr<OpaqueServer::ServerMessageSocket> messageSocket,
+            std::weak_ptr<OpaqueServer::SocketWithHandler> socket,
             MessageSocket::MessageId messageId,
-            Buffer request);
+            Core::Buffer request);
 
   public:
     /**
@@ -88,18 +88,18 @@ class OpaqueServerRPC {
     /**
      * The RPC request received from the client.
      */
-    Buffer request;
+    Core::Buffer request;
 
     /**
      * The reply to the RPC, to send back to the client.
      */
-    Buffer response;
+    Core::Buffer response;
 
   private:
     /**
      * The socket on which to send the reply.
      */
-    std::weak_ptr<OpaqueServer::ServerMessageSocket> messageSocket;
+    std::weak_ptr<OpaqueServer::SocketWithHandler> socket;
 
     /**
      * The message ID received with the request. This should be sent back to
@@ -113,7 +113,7 @@ class OpaqueServerRPC {
      * always NULL. If this is not NULL when sendReply() is invoked, the reply
      * will be moved here.
      */
-    Buffer* responseTarget;
+    Core::Buffer* responseTarget;
 
     // The OpaqueServer class uses the private members of this object.
     friend class OpaqueServer;

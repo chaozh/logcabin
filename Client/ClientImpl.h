@@ -1,5 +1,5 @@
 /* Copyright (c) 2012-2014 Stanford University
- * Copyright (c) 2014 Diego Ongaro
+ * Copyright (c) 2014-2015 Diego Ongaro
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -17,12 +17,16 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 
 #include "include/LogCabin/Client.h"
+#include "Client/Backoff.h"
 #include "Client/LeaderRPC.h"
 #include "Core/ConditionVariable.h"
+#include "Core/Config.h"
 #include "Core/Mutex.h"
 #include "Core/Time.h"
+#include "Event/Loop.h"
 
 #ifndef LOGCABIN_CLIENT_CLIENTIMPL_H
 #define LOGCABIN_CLIENT_CLIENTIMPL_H
@@ -45,8 +49,14 @@ typedef std::pair<std::string, std::string> Condition;
  */
 class ClientImpl {
   public:
+    /// Clock used for timeouts.
+    typedef LeaderRPC::Clock Clock;
+    /// Type for absolute time values used for timeouts.
+    typedef LeaderRPC::TimePoint TimePoint;
+
     /// Constructor.
-    ClientImpl();
+    explicit ClientImpl(const std::map<std::string, std::string>& options =
+                            std::map<std::string, std::string>());
     /// Destructor.
     virtual ~ClientImpl();
 
@@ -71,6 +81,11 @@ class ClientImpl {
                             uint64_t oldId,
                             const Configuration& newConfiguration);
 
+    /// See Cluster::getServerStats.
+    Result getServerStats(const std::string& host,
+                          TimePoint timeout,
+                          Protocol::ServerStats& stats);
+
     /**
      * Return the canonicalized path name resulting from accessing path
      * relative to workingDirectory.
@@ -88,35 +103,41 @@ class ClientImpl {
     /// See Tree::makeDirectory.
     Result makeDirectory(const std::string& path,
                          const std::string& workingDirectory,
-                         const Condition& condition);
+                         const Condition& condition,
+                         TimePoint timeout);
 
     /// See Tree::listDirectory.
     Result listDirectory(const std::string& path,
                          const std::string& workingDirectory,
                          const Condition& condition,
+                         TimePoint timeout,
                          std::vector<std::string>& children);
 
     /// See Tree::removeDirectory.
     Result removeDirectory(const std::string& path,
                            const std::string& workingDirectory,
-                           const Condition& condition);
+                           const Condition& condition,
+                           TimePoint timeout);
 
     /// See Tree::write.
     Result write(const std::string& path,
                  const std::string& workingDirectory,
                  const std::string& contents,
-                 const Condition& condition);
+                 const Condition& condition,
+                 TimePoint timeout);
 
     /// See Tree::read.
     Result read(const std::string& path,
                 const std::string& workingDirectory,
                 const Condition& condition,
+                TimePoint timeout,
                 std::string& contents);
 
     /// See Tree::removeFile.
     Result removeFile(const std::string& path,
                       const std::string& workingDirectory,
-                      const Condition& condition);
+                      const Condition& condition,
+                      TimePoint timeout);
 
 
   protected:
@@ -127,6 +148,22 @@ class ClientImpl {
      * and server are speaking the same version of the RPC protocol.
      */
     uint32_t negotiateRPCVersion();
+
+    /**
+     * Options/settings.
+     */
+    const Core::Config config;
+
+    /**
+     * The Event::Loop used to drive the underlying RPC mechanism.
+     */
+    Event::Loop eventLoop;
+
+    /**
+     * Used to rate-limit the creation of ClientSession objects (TCP
+     * connections).
+     */
+    Backoff sessionCreationBackoff;
 
     /**
      * Describes the hosts in the cluster.
@@ -145,9 +182,9 @@ class ClientImpl {
     uint32_t rpcProtocolVersion;
 
     /**
-     * This class helps with providing exactly-once semantics for RPCs. For
-     * example, it assigns sequence numbers to RPCs, which servers then use to 
-     * prevent duplicate processing of duplicate requests.
+     * This class helps with providing exactly-once semantics for read-write
+     * RPCs. For example, it assigns sequence numbers to RPCs, which servers
+     * then use to prevent duplicate processing of duplicate requests.
      *
      * This class is implemented in a monitor style.
      */
@@ -169,8 +206,16 @@ class ClientImpl {
         void exit();
         /**
          * Call this before sending an RPC.
+         * \param timeout
+         *      If this timeout elapses before a session can be opened with the
+         *      cluster, this method will return early and the returned
+         *      information will have a client_id set to 0, which is not a
+         *      valid ID.
+         * \return
+         *      Info to be used with read-write RPCs, or if the timeout
+         *      elapsed, a client_id set to 0.
          */
-        Protocol::Client::ExactlyOnceRPCInfo getRPCInfo();
+        Protocol::Client::ExactlyOnceRPCInfo getRPCInfo(TimePoint timeout);
         /**
          * Call this after receiving an RPCs response.
          */
@@ -182,7 +227,8 @@ class ClientImpl {
          * Internal version of getRPCInfo() to avoid deadlock with self.
          */
         Protocol::Client::ExactlyOnceRPCInfo getRPCInfo(
-            std::unique_lock<Core::Mutex>& lockGuard);
+            std::unique_lock<Core::Mutex>& lockGuard,
+            TimePoint timeout);
         /**
          * Internal version of doneWithRPC() to avoid deadlock with self.
          */
@@ -193,15 +239,6 @@ class ClientImpl {
          * requests to the cluster to keep the client's session active.
          */
         void keepAliveThreadMain();
-
-        /**
-         * Clock type used for keep-alive timer.
-         */
-        typedef Core::Time::SteadyClock Clock;
-        /**
-         * TimePoint type used for keep-alive timer.
-         */
-        typedef Clock::time_point TimePoint;
 
         /**
          * Used to open a session with the cluster.
@@ -257,7 +294,7 @@ class ClientImpl {
          * Runs keepAliveThreadMain().
          * Since this thread would be unexpected/wasteful for clients that only
          * issue read-only requests (or no requests at all), it is spawned
-         * lazy, if/when the client opens its session with the cluster (upon
+         * lazily, if/when the client opens its session with the cluster (upon
          * its first read-write request).
          */
         std::thread keepAliveThread;
@@ -266,6 +303,11 @@ class ClientImpl {
         ExactlyOnceRPCHelper(const ExactlyOnceRPCHelper&) = delete;
         ExactlyOnceRPCHelper& operator=(const ExactlyOnceRPCHelper&) = delete;
     } exactlyOnceRPCHelper;
+
+    /**
+     * A thread that runs the Event::Loop.
+     */
+    std::thread eventLoopThread;
 
     // ClientImpl is not copyable
     ClientImpl(const ClientImpl&) = delete;

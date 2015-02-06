@@ -1,4 +1,5 @@
 /* Copyright (c) 2012 Stanford University
+ * Copyright (c) 2015 Diego Ongaro
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -22,6 +23,7 @@
 
 #include "build/Protocol/Raft.pb.h"
 #include "build/Server/SnapshotMetadata.pb.h"
+#include "Core/Buffer.h"
 #include "Core/Debug.h"
 #include "Core/ProtoBuf.h"
 #include "Core/Random.h"
@@ -29,10 +31,8 @@
 #include "Core/ThreadId.h"
 #include "Core/Util.h"
 #include "Protocol/Common.h"
-#include "RPC/Buffer.h"
 #include "RPC/ClientRPC.h"
 #include "RPC/ClientSession.h"
-#include "RPC/ProtoBuf.h"
 #include "RPC/ServerRPC.h"
 #include "Server/RaftConsensus.h"
 #include "Server/Globals.h"
@@ -135,6 +135,13 @@ LocalServer::dumpToStream(std::ostream& os) const
 {
     // Nothing interesting to dump.
     return os;
+}
+
+void
+LocalServer::updatePeerStats(Protocol::ServerStats::Raft::Peer& peerStats,
+                             Core::Time::SteadyTimeConverter& time) const
+{
+    peerStats.set_last_synced_index(lastSyncedIndex);
 }
 
 ////////// Peer //////////
@@ -249,7 +256,7 @@ Peer::callRPC(Protocol::Raft::OpCode opCode,
                          request);
     // release lock for concurrency
     Core::MutexUnlock<Mutex> unlockGuard(lockGuard);
-    switch (rpc.waitForReply(&response, NULL)) {
+    switch (rpc.waitForReply(&response, NULL, TimePoint::max())) {
         case RPCStatus::OK:
             if (rpcFailuresSinceLastWarning > 0) {
                 WARNING("RPC to server succeeded after %lu failures",
@@ -259,6 +266,8 @@ Peer::callRPC(Protocol::Raft::OpCode opCode,
             return true;
         case RPCStatus::SERVICE_SPECIFIC_ERROR:
             PANIC("unexpected service-specific error");
+        case RPCStatus::TIMEOUT:
+            PANIC("unexpected RPC timeout");
         case RPCStatus::RPC_FAILED:
             ++rpcFailuresSinceLastWarning;
             if (rpcFailuresSinceLastWarning == 1) {
@@ -292,10 +301,14 @@ Peer::getSession(std::unique_lock<Mutex>& lockGuard)
     if (!session || !session->getErrorMessage().empty()) {
         // release lock for concurrency
         Core::MutexUnlock<Mutex> unlockGuard(lockGuard);
+        RPC::Address target(address, Protocol::Common::DEFAULT_PORT);
+        target.refresh(RPC::Address::TimePoint::max());
         session = RPC::ClientSession::makeSession(
             eventLoop,
-            RPC::Address(address, Protocol::Common::DEFAULT_PORT),
-            Protocol::Common::MAX_MESSAGE_LENGTH);
+            target,
+            Protocol::Common::MAX_MESSAGE_LENGTH,
+            RPC::ClientSession::TimePoint::max(),
+            consensus.globals.config);
     }
     return session;
 }
@@ -328,6 +341,21 @@ Peer::dumpToStream(std::ostream& os) const
     }
     os << "address: " << address << std::endl;
     return os;
+}
+
+void
+Peer::updatePeerStats(Protocol::ServerStats::Raft::Peer& peerStats,
+                      Core::Time::SteadyTimeConverter& time) const
+{
+    peerStats.set_request_vote_done(requestVoteDone);
+    peerStats.set_have_vote(haveVote_);
+    peerStats.set_force_heartbeat(forceHeartbeat);
+    peerStats.set_next_index(nextIndex);
+    peerStats.set_last_agree_index(lastAgreeIndex);
+    peerStats.set_is_caught_up(isCaughtUp_);
+
+    peerStats.set_next_heartbeat_at(time.unixNanos(nextHeartbeatTime));
+    peerStats.set_backoff_until(time.unixNanos(backoffUntil));
 }
 
 ////////// Configuration::SimpleConfiguration //////////
@@ -587,6 +615,26 @@ Configuration::stagingMin(const GetValue& getValue) const
         return 0;
 }
 
+void
+Configuration::updateServerStats(Protocol::ServerStats& serverStats,
+                                 Core::Time::SteadyTimeConverter& time) const
+{
+    for (auto it = knownServers.begin();
+         it != knownServers.end();
+         ++it) {
+        Protocol::ServerStats::Raft::Peer& peerStats =
+            *serverStats.mutable_raft()->add_peer();
+        peerStats.set_server_id(it->first);
+        const ServerRef& peer = it->second;
+        peerStats.set_old_member(oldServers.contains(peer));
+        peerStats.set_new_member(state == State::TRANSITIONAL &&
+                                 newServers.contains(peer));
+        peerStats.set_staging_member(state == State::STAGING &&
+                                     newServers.contains(peer));
+        peer->updatePeerStats(peerStats, time);
+    }
+}
+
 std::ostream&
 operator<<(std::ostream& os, Configuration::State state)
 {
@@ -722,19 +770,44 @@ ConfigurationManager::restoreInvariants()
 }
 
 
+////////// RaftConsensus::Entry //////////
+
+RaftConsensus::Entry::Entry()
+    : entryId()
+    , type(SKIP)
+    , data()
+    , snapshotReader()
+{
+}
+
+RaftConsensus::Entry::Entry(Entry&& other)
+    : entryId(other.entryId)
+    , type(other.type)
+    , data(std::move(other.data))
+    , snapshotReader(std::move(other.snapshotReader))
+{
+}
+
+RaftConsensus::Entry::~Entry()
+{
+}
+
+
 ////////// RaftConsensus //////////
 
-uint64_t RaftConsensus::ELECTION_TIMEOUT_MS = 150;
-
-uint64_t RaftConsensus::HEARTBEAT_PERIOD_MS = ELECTION_TIMEOUT_MS / 2;
-
-uint64_t RaftConsensus::RPC_FAILURE_BACKOFF_MS = ELECTION_TIMEOUT_MS / 2;
-
-uint64_t RaftConsensus::SOFT_RPC_SIZE_LIMIT =
-                Protocol::Common::MAX_MESSAGE_LENGTH - 1024;
-
 RaftConsensus::RaftConsensus(Globals& globals)
-    : globals(globals)
+    : ELECTION_TIMEOUT_MS(globals.config.read<uint64_t>(
+        "electionTimeoutMilliseconds", 150))
+    , HEARTBEAT_PERIOD_MS(globals.config.read<uint64_t>(
+        "heartbeatPeriodMilliseconds",
+        ELECTION_TIMEOUT_MS / 2))
+    , RPC_FAILURE_BACKOFF_MS(globals.config.read<uint64_t>(
+        "rpcFailureBackoffMilliseconds",
+        ELECTION_TIMEOUT_MS / 2))
+    , SOFT_RPC_SIZE_LIMIT(Protocol::Common::MAX_MESSAGE_LENGTH - 1024)
+    , serverId(0)
+    , serverAddress()
+    , globals(globals)
     , storageDirectory()
     , mutex()
     , stateChanged()
@@ -919,21 +992,21 @@ RaftConsensus::getLeaderHint() const
     return configuration->lookupAddress(leaderId);
 }
 
-Consensus::Entry
+RaftConsensus::Entry
 RaftConsensus::getNextEntry(uint64_t lastEntryId) const
 {
     std::unique_lock<Mutex> lockGuard(mutex);
     uint64_t nextEntryId = lastEntryId + 1;
     while (true) {
         if (exiting)
-            throw ThreadInterruptedException();
+            throw Core::Util::ThreadInterruptedException();
         if (commitIndex >= nextEntryId) {
-            Consensus::Entry entry;
+            RaftConsensus::Entry entry;
 
             // Make the state machine load a snapshot if we don't have the next
             // entry it needs in the log.
             if (log->getLogStartIndex() > nextEntryId) {
-                entry.type = Consensus::Entry::SNAPSHOT;
+                entry.type = Entry::SNAPSHOT;
                 // For well-behaved state machines, we expect 'snapshotReader'
                 // to contain a SnapshotFile::Reader that we can return
                 // directly to the state machine. In the case that a State
@@ -956,10 +1029,10 @@ RaftConsensus::getNextEntry(uint64_t lastEntryId) const
                 const Log::Entry& logEntry = log->getEntry(nextEntryId);
                 entry.entryId = nextEntryId;
                 if (logEntry.type() == Protocol::Raft::EntryType::DATA) {
-                    entry.type = Consensus::Entry::DATA;
+                    entry.type = Entry::DATA;
                     entry.data = logEntry.data();
                 } else {
-                    entry.type = Consensus::Entry::SKIP;
+                    entry.type = Entry::SKIP;
                 }
             }
             return entry;
@@ -1003,9 +1076,9 @@ RaftConsensus::handleAppendEntries(
         return; // response was set to a rejection above
     }
     if (request.term() > currentTerm) {
-        VERBOSE("Caller(%lu) has newer term, updating. "
-                "Ours was %lu, theirs is %lu",
-                request.server_id(), currentTerm, request.term());
+        NOTICE("Received AppendEntries request from server %lu in term %lu "
+               "(this server's term was %lu)",
+                request.server_id(), request.term(), currentTerm);
         // We're about to bump our term in the stepDown below: update
         // 'response' accordingly.
         response.set_term(request.term());
@@ -1125,9 +1198,9 @@ RaftConsensus::handleAppendSnapshotChunk(
         return;
     }
     if (request.term() > currentTerm) {
-        VERBOSE("Caller(%lu) has newer term, updating. "
-                "Ours was %lu, theirs is %lu",
-                request.server_id(), currentTerm, request.term());
+        NOTICE("Received AppendSnapshotChunk request from server %lu in "
+               "term %lu (this server's term was %lu)",
+                request.server_id(), request.term(), currentTerm);
         // We're about to bump our term in the stepDown below: update
         // 'response' accordingly.
         response.set_term(request.term());
@@ -1201,16 +1274,16 @@ RaftConsensus::handleRequestVote(
                "this server (which is in term %lu) recently heard from a "
                "leader (%lu). Should server %lu be shut down?",
                request.term(), request.server_id(), currentTerm,
-               request.server_id(), leaderId);
+               leaderId, request.server_id());
         response.set_term(currentTerm);
         response.set_granted(false);
         return;
     }
 
     if (request.term() > currentTerm) {
-        VERBOSE("Caller(%lu) has newer term, updating. "
-                "Ours was %lu, theirs is %lu",
-                request.server_id(), currentTerm, request.term());
+        NOTICE("Received RequestVote request from server %lu in term %lu "
+               "(this server's term was %lu)",
+                request.server_id(), request.term(), currentTerm);
         stepDown(request.term());
     }
 
@@ -1225,14 +1298,16 @@ RaftConsensus::handleRequestVote(
                     (request.last_log_term() == lastLogTerm &&
                      request.last_log_index() >= lastLogIndex));
 
-    if (request.term() == currentTerm && logIsOk && votedFor == 0) {
-        // Give caller our vote
-        VERBOSE("Voting for %lu in term %lu",
-                request.server_id(), currentTerm);
-        stepDown(currentTerm);
-        setElectionTimer();
-        votedFor = request.server_id();
-        updateLogMetadata();
+    if (request.term() == currentTerm) {
+        if (logIsOk && votedFor == 0) {
+            // Give caller our vote
+            NOTICE("Voting for %lu in term %lu",
+                   request.server_id(), currentTerm);
+            stepDown(currentTerm);
+            setElectionTimer();
+            votedFor = request.server_id();
+            updateLogMetadata();
+        }
     }
 
     // Fill in response.
@@ -1442,6 +1517,40 @@ RaftConsensus::snapshotDone(
     discardUnneededEntries();
 }
 
+void
+RaftConsensus::updateServerStats(Protocol::ServerStats& serverStats) const
+{
+    std::unique_lock<Mutex> lockGuard(mutex);
+    Core::Time::SteadyTimeConverter time;
+    serverStats.clear_raft();
+    Protocol::ServerStats::Raft& raftStats = *serverStats.mutable_raft();
+
+    raftStats.set_current_term(currentTerm);
+    switch (state) {
+        case State::FOLLOWER:
+            raftStats.set_state(Protocol::ServerStats::Raft::FOLLOWER);
+            break;
+        case State::CANDIDATE:
+            raftStats.set_state(Protocol::ServerStats::Raft::CANDIDATE);
+            break;
+        case State::LEADER:
+            raftStats.set_state(Protocol::ServerStats::Raft::LEADER);
+            break;
+    }
+    raftStats.set_commit_index(commitIndex);
+    raftStats.set_last_log_index(log->getLastLogIndex());
+    raftStats.set_leader_id(leaderId);
+    raftStats.set_voted_for(votedFor);
+    raftStats.set_start_election_at(time.unixNanos(startElectionAt));
+    raftStats.set_withhold_votes_until(time.unixNanos(withholdVotesUntil));
+
+    raftStats.set_last_snapshot_index(lastSnapshotIndex);
+    raftStats.set_last_snapshot_bytes(lastSnapshotBytes);
+    raftStats.set_log_start_index(log->getLogStartIndex());
+    raftStats.set_log_bytes(log->getSizeBytes());
+    configuration->updateServerStats(serverStats, time);
+}
+
 std::ostream&
 operator<<(std::ostream& os, const RaftConsensus& raft)
 {
@@ -1611,7 +1720,9 @@ RaftConsensus::stepDownThreadMain()
             if (configuration->quorumMin(&Server::getLastAckEpoch) >= epoch)
                 break;
             if (Clock::now() >= stepDownAt) {
-                NOTICE("No broadcast for a timeout, stepping down");
+                NOTICE("No broadcast for a timeout, stepping down from leader "
+                       "of term %lu (converting to follower in term %lu)",
+                       currentTerm, currentTerm + 1);
                 stepDown(currentTerm + 1);
                 break;
             }
@@ -1653,6 +1764,8 @@ RaftConsensus::advanceCommittedId()
         // Upon committing a configuration that excludes itself, the leader
         // steps down.
         if (!configuration->hasVote(configuration->localServer)) {
+            NOTICE("Newly committed configuration does not include self. "
+                   "Stepping down as leader");
             stepDown(currentTerm + 1);
             return;
         }
@@ -1778,6 +1891,9 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
     // this term.
     assert(state == State::LEADER);
     if (response.term() > currentTerm) {
+        NOTICE("Received AppendEntries response from server %lu in term %lu "
+               "(this server's term was %lu)",
+                peer.serverId, response.term(), currentTerm);
         stepDown(response.term());
     } else {
         assert(response.term() == currentTerm);
@@ -1880,6 +1996,9 @@ RaftConsensus::appendSnapshotChunk(std::unique_lock<Mutex>& lockGuard,
     // this term.
     assert(state == State::LEADER);
     if (response.term() > currentTerm) {
+        NOTICE("Received AppendSnapshotChunk response from server %lu in "
+               "term %lu (this server's term was %lu)",
+                peer.serverId, response.term(), currentTerm);
         stepDown(response.term());
     } else {
         assert(response.term() == currentTerm);
@@ -2107,6 +2226,9 @@ RaftConsensus::requestVote(std::unique_lock<Mutex>& lockGuard, Peer& peer)
     }
 
     if (response.term() > currentTerm) {
+        NOTICE("Received RequestVote response from server %lu in "
+               "term %lu (this server's term was %lu)",
+                peer.serverId, response.term(), currentTerm);
         stepDown(response.term());
     } else {
         peer.requestVoteDone = true;
@@ -2115,11 +2237,13 @@ RaftConsensus::requestVote(std::unique_lock<Mutex>& lockGuard, Peer& peer)
 
         if (response.granted()) {
             peer.haveVote_ = true;
-            VERBOSE("Got vote for term %lu", currentTerm);
+            NOTICE("Got vote from server %lu for term %lu",
+                   peer.serverId, currentTerm);
             if (configuration->quorumAll(&Server::haveVote))
                 becomeLeader();
         } else {
-            VERBOSE("vote not granted");
+            NOTICE("Vote denied by server %lu for term %lu",
+                   peer.serverId, currentTerm);
         }
     }
 }
@@ -2143,10 +2267,7 @@ RaftConsensus::startNewElection()
         return;
     }
 
-    if (state == State::FOLLOWER) {
-        // too verbose otherwise when server is partitioned
-        NOTICE("Running for election in term %lu", currentTerm + 1);
-    }
+    NOTICE("Running for election in term %lu", currentTerm + 1);
     ++currentTerm;
     state = State::CANDIDATE;
     leaderId = 0;
@@ -2224,6 +2345,7 @@ RaftConsensus::upToDateLeader(std::unique_lock<Mutex>& lockGuard) const
     uint64_t epoch = currentEpoch;
     // schedule a heartbeat now so that this returns quickly
     configuration->forEach(&Server::scheduleHeartbeat);
+    stateChanged.notify_all();
     while (true) {
         if (exiting || state != State::LEADER)
             return false;

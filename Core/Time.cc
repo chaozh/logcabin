@@ -1,5 +1,5 @@
 /* Copyright (c) 2012 Stanford University
- * Copyright (c) 2014 Diego Ongaro
+ * Copyright (c) 2014-2015 Diego Ongaro
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -41,11 +41,11 @@ CSteadyClock::now()
               STEADY_CLOCK_ID, strerror(errno));
     }
     return time_point(std::chrono::nanoseconds(
-                uint64_t(now.tv_sec) * 1000 * 1000 * 1000 +
+                int64_t(now.tv_sec) * 1000 * 1000 * 1000 +
                 now.tv_nsec));
 }
 
-uint64_t
+int64_t
 getTimeNanos()
 {
     struct timespec now;
@@ -54,8 +54,50 @@ getTimeNanos()
         PANIC("clock_gettime(CLOCK_REALTIME) failed: %s",
               strerror(errno));
     }
-    return uint64_t(now.tv_sec) * 1000 * 1000 * 1000 + now.tv_nsec;
+    return int64_t(now.tv_sec) * 1000 * 1000 * 1000 + now.tv_nsec;
 }
+
+void
+sleep(SteadyClock::time_point wake)
+{
+    struct timespec wakeSpec = makeTimeSpec(wake);
+    if (wakeSpec.tv_sec < 0)
+        return;
+    int r = clock_nanosleep(STEADY_CLOCK_ID,
+                            TIMER_ABSTIME,
+                            &wakeSpec,
+                            NULL);
+    if (r != 0) {
+        PANIC("clock_nanosleep(STEADY_CLOCK_ID=%d, %s) failed: %s",
+              STEADY_CLOCK_ID,
+              Core::StringUtil::toString(wake).c_str(),
+              strerror(r));
+    }
+}
+
+SteadyTimeConverter::SteadyTimeConverter()
+    : steadyNow(SteadyClock::now())
+    , systemNow(SystemClock::now())
+{
+}
+
+SystemClock::time_point
+SteadyTimeConverter::convert(SteadyClock::time_point when)
+{
+    std::chrono::nanoseconds diff = when - steadyNow;
+    SystemClock::time_point then = systemNow + diff;
+    if (when > steadyNow && then < systemNow) // overflow
+        return SystemClock::time_point::max();
+    return then;
+}
+
+int64_t
+SteadyTimeConverter::unixNanos(SteadyClock::time_point when)
+{
+    return std::chrono::nanoseconds(
+        convert(when).time_since_epoch()).count();
+}
+
 
 } // namespace LogCabin::Core::Time
 } // namespace LogCabin::Core

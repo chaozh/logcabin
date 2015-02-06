@@ -15,10 +15,10 @@
  */
 
 #include "Core/Debug.h"
+#include "Core/ProtoBuf.h"
 #include "RPC/Protocol.h"
 #include "RPC/ClientRPC.h"
 #include "RPC/ClientSession.h"
-#include "RPC/ProtoBuf.h"
 
 namespace LogCabin {
 namespace RPC {
@@ -37,9 +37,9 @@ ClientRPC::ClientRPC(std::shared_ptr<RPC::ClientSession> session,
     : opaqueRPC() // placeholder, set again below
 {
     // Serialize the request into a Buffer
-    Buffer requestBuffer;
-    ProtoBuf::serialize(request, requestBuffer,
-                        sizeof(RequestHeaderVersion1));
+    Core::Buffer requestBuffer;
+    Core::ProtoBuf::serialize(request, requestBuffer,
+                              sizeof(RequestHeaderVersion1));
     auto& requestHeader =
         *static_cast<RequestHeaderVersion1*>(requestBuffer.getData());
     requestHeader.prefix.version = 1;
@@ -89,12 +89,20 @@ ClientRPC::isReady()
 
 ClientRPC::Status
 ClientRPC::waitForReply(google::protobuf::Message* response,
-                        google::protobuf::Message* serviceSpecificError)
+                        google::protobuf::Message* serviceSpecificError,
+                        TimePoint timeout)
 {
-    opaqueRPC.waitForReply();
+    opaqueRPC.waitForReply(timeout);
     switch (opaqueRPC.getStatus()) {
         case OpaqueClientRPC::Status::NOT_READY:
-            PANIC("Waited for RPC but not ready");
+            if (Clock::now() > timeout) {
+                return Status::TIMEOUT;
+            } else {
+                PANIC("Waited for RPC but not ready and "
+                      "timeout hasn't elapsed (timeout=%s, now=%s)",
+                      Core::StringUtil::toString(timeout).c_str(),
+                      Core::StringUtil::toString(Clock::now()).c_str());
+            }
         case OpaqueClientRPC::Status::OK:
             break;
         case OpaqueClientRPC::Status::ERROR:
@@ -102,12 +110,13 @@ ClientRPC::waitForReply(google::protobuf::Message* response,
         case OpaqueClientRPC::Status::CANCELED:
             return Status::RPC_CANCELED;
     }
-    const Buffer& responseBuffer = *opaqueRPC.peekReply();
+    const Core::Buffer& responseBuffer = *opaqueRPC.peekReply();
 
     // Extract the response's status field.
     if (responseBuffer.getLength() < sizeof(ResponseHeaderPrefix)) {
-        PANIC("The response from the server was too short to be valid. "
-              "This probably indicates network or memory corruption.");
+        PANIC("The response from the server was too short to be valid "
+              "(%u bytes). This probably indicates network or memory "
+              "corruption.", responseBuffer.getLength());
     }
     ResponseHeaderPrefix responseHeaderPrefix =
         *static_cast<const ResponseHeaderPrefix*>(responseBuffer.getData());
@@ -134,8 +143,8 @@ ClientRPC::waitForReply(google::protobuf::Message* response,
         // The RPC succeeded. Parse the response into a protocol buffer.
         case ProtocolStatus::OK:
             if (response != NULL &&
-                !RPC::ProtoBuf::parse(responseBuffer, *response,
-                                      sizeof(responseHeader))) {
+                !Core::ProtoBuf::parse(responseBuffer, *response,
+                                       sizeof(responseHeader))) {
                 PANIC("Could not parse the protocol buffer out of the server "
                       "response");
             }
@@ -145,8 +154,8 @@ ClientRPC::waitForReply(google::protobuf::Message* response,
         // protocol buffer.
         case ProtocolStatus::SERVICE_SPECIFIC_ERROR:
             if (serviceSpecificError != NULL &&
-                !RPC::ProtoBuf::parse(responseBuffer, *serviceSpecificError,
-                                      sizeof(responseHeader))) {
+                !Core::ProtoBuf::parse(responseBuffer, *serviceSpecificError,
+                                       sizeof(responseHeader))) {
                 PANIC("Could not parse the protocol buffer out of the "
                       "service-specific error details");
             }
@@ -195,6 +204,8 @@ operator<<(::std::ostream& os, ClientRPC::Status status)
             return os << "RPC_FAILED";
         case Status::RPC_CANCELED:
             return os << "RPC_CANCELED";
+        case Status::TIMEOUT:
+            return os << "TIMEOUT";
         default:
             return os << "(INVALID VALUE)";
     }

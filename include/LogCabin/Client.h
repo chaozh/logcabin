@@ -1,5 +1,5 @@
 /* Copyright (c) 2011-2014 Stanford University
- * Copyright (c) 2014 Diego Ongaro
+ * Copyright (c) 2014-2015 Diego Ongaro
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -21,6 +21,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -29,6 +30,11 @@
 #define LOGCABIN_INCLUDE_LOGCABIN_CLIENT_H
 
 namespace LogCabin {
+
+namespace Protocol {
+class ServerStats; // forward declaration
+} // namespace LogCabin::Protocol
+
 namespace Client {
 
 class ClientImpl; // forward declaration
@@ -104,6 +110,14 @@ enum class Status {
      * Tree::setCondition() was not satisfied.
      */
     CONDITION_NOT_MET = 4,
+
+    /**
+     * A timeout specified by Tree::setTimeout() elapsed while waiting for
+     * an operation to complete. It is not known whether the operation has or
+     * will complete, only that a positive acknowledgment was not received
+     * before the timeout elapsed.
+     */
+    TIMEOUT = 5,
 };
 
 /**
@@ -170,6 +184,14 @@ class TypeException : public Exception {
 class ConditionNotMetException : public Exception {
   public:
     explicit ConditionNotMetException(const std::string& error);
+};
+
+/**
+ * See Status::TIMEOUT.
+ */
+class TimeoutException : public Exception {
+  public:
+    explicit TimeoutException(const std::string& error);
 };
 
 /**
@@ -262,6 +284,26 @@ class Tree {
      * Like setCondition but throws exceptions upon errors.
      */
     void setConditionEx(const std::string& path, const std::string& value);
+
+    /**
+     * Return the timeout set by a previous call to setTimeout().
+     * \return
+     *      The maximum duration of each operation (in nanoseconds), or 0
+     *      for no timeout.
+     */
+    uint64_t getTimeout() const;
+
+    /**
+     * Abort each future operation if it may not have completed within the
+     * specified period of time.
+     * \warning
+     *      The client library does not currently implement timeouts for DNS
+     *      lookups. See https://github.com/logcabin/logcabin/issues/75
+     * \param nanoseconds
+     *      The maximum duration of each operation (in nanoseconds). Set to 0
+     *      for no timeout.
+     */
+    void setTimeout(uint64_t nanoseconds);
 
     /**
      * Make sure a directory exists at the given path.
@@ -432,6 +474,13 @@ class Cluster {
   public:
 
     /**
+     * Settings for the client library. These are all optional.
+     * Currently supported options:
+     * - tcpHeartbeatTimeoutMilliseconds (see sample.conf)
+     */
+    typedef std::map<std::string, std::string> Options;
+
+    /**
      * Defines a special type to use as an argument to the constructor that is
      * for testing purposes only.
      */
@@ -441,8 +490,13 @@ class Cluster {
      * Construct a Cluster object for testing purposes only. Instead of
      * connecting to a LogCabin cluster, it will keep all state locally in
      * memory.
+     * \param t
+     *      The only possible value is Cluster::FOR_TESTING.
+     * \param options
+     *      Settings for the client library.
      */
-    explicit Cluster(ForTesting t);
+    explicit Cluster(ForTesting t,
+                     const Options& options = Options());
 
     /**
      * Constructor.
@@ -451,8 +505,15 @@ class Cluster {
      *      form host:port, where host is usually a DNS name that resolves to
      *      multiple IP addresses. Alternatively, you can pass a list of hosts
      *      as host1:port1;host2:port2;host3:port3.
+     * \param options
+     *      Settings for the client library.
      */
-    explicit Cluster(const std::string& hosts);
+    explicit Cluster(const std::string& hosts,
+                     const Options& options = Options());
+
+    /**
+     * Destructor.
+     */
     ~Cluster();
 
     /**
@@ -474,6 +535,36 @@ class Cluster {
     ConfigurationResult setConfiguration(
                                 uint64_t oldId,
                                 const Configuration& newConfiguration);
+
+    /**
+     * Retrieve statistics from the given server, which are useful for
+     * diagnostics.
+     * \param host
+     *      The hostname or IP address of the server to retrieve stats from. It
+     *      is recommended that you do not use a DNS name that resolves to
+     *      multiple hosts here.
+     * \param timeoutNanoseconds
+     *      Abort the operation if it has not completed within the specified
+     *      period of time. Time is specified in nanoseconds, and the special
+     *      value of 0 indicates no timeout.
+     * \warning
+     *      The client library does not currently implement timeouts for DNS
+     *      lookups. See https://github.com/logcabin/logcabin/issues/75
+     * \param[out] stats
+     *      Protocol buffer of Stats as retrieved from the server.
+     * \return
+     *      Either OK or TIMEOUT.
+     */
+    Result
+    getServerStats(const std::string& host,
+                   uint64_t timeoutNanoseconds,
+                   Protocol::ServerStats& stats);
+    /**
+     * Like getServerStats but throws exceptions upon errors.
+     */
+    Protocol::ServerStats
+    getServerStatsEx(const std::string& host,
+                     uint64_t timeoutNanoseconds);
 
     /**
      * Return an object to access the hierarchical key-value store.

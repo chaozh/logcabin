@@ -38,14 +38,20 @@
 namespace LogCabin {
 namespace {
 
+typedef RPC::OpaqueClientRPC::TimePoint TimePoint;
+
 class ReplyTimer : public Event::Timer {
     ReplyTimer(Event::Loop& eventLoop,
                RPC::OpaqueServerRPC serverRPC,
                uint32_t delayMicros)
-        : Timer(eventLoop)
+        : Timer()
         , serverRPC(std::move(serverRPC))
+        , monitor(eventLoop, *this)
     {
         schedule(delayMicros * 1000);
+    }
+    ~ReplyTimer() {
+        monitor.disableForever();
     }
     void handleTimerEvent() {
         VERBOSE("Ok responding");
@@ -53,19 +59,25 @@ class ReplyTimer : public Event::Timer {
         delete this;
     }
     RPC::OpaqueServerRPC serverRPC;
+    // You aren't really supposed to put a monitor in an Event::Timer, but the
+    // memory management here is weird. Just make sure to call
+    // monitor.disableForever() as the first thing in the destructor.
+    Event::Timer::Monitor monitor;
 };
 
-class EchoServer : public RPC::OpaqueServer {
-    EchoServer(Event::Loop& eventLoop, uint32_t maxMessageLength)
-        : OpaqueServer(eventLoop, maxMessageLength)
+class EchoServer : public RPC::OpaqueServer::Handler {
+    explicit EchoServer(Event::Loop& eventLoop)
+        : eventLoop(eventLoop)
         , delayMicros(0)
     {
     }
     void handleRPC(RPC::OpaqueServerRPC serverRPC) {
         serverRPC.response = std::move(serverRPC.request);
+        serverRPC.sendReply();
         VERBOSE("Delaying response for %u microseconds", delayMicros);
         new ReplyTimer(eventLoop, std::move(serverRPC), delayMicros);
     }
+    Event::Loop& eventLoop;
     uint32_t delayMicros;
 };
 
@@ -76,12 +88,18 @@ class RPCClientServerTest : public ::testing::Test {
         , clientEventLoopThread(&Event::Loop::runForever, &clientEventLoop)
         , serverEventLoopThread(&Event::Loop::runForever, &serverEventLoop)
         , address("127.0.0.1", Protocol::Common::DEFAULT_PORT)
-        , server(serverEventLoop, 1024)
+        , rpcHandler(serverEventLoop)
+        , server(rpcHandler, serverEventLoop, 1024)
         , clientSession()
     {
+        Core::Config config;
+        config.set("tcpHeartbeatTimeoutMilliseconds", 24);
+        address.refresh(RPC::Address::TimePoint::max());
         EXPECT_EQ("", server.bind(address));
         clientSession = RPC::ClientSession::makeSession(
-                            clientEventLoop, address, 1024);
+                            clientEventLoop, address, 1024,
+                            RPC::ClientSession::TimePoint::max(),
+                            config);
     }
     ~RPCClientServerTest()
     {
@@ -96,7 +114,8 @@ class RPCClientServerTest : public ::testing::Test {
     std::thread clientEventLoopThread;
     std::thread serverEventLoopThread;
     RPC::Address address;
-    EchoServer server;
+    EchoServer rpcHandler;
+    RPC::OpaqueServer server;
     std::shared_ptr<RPC::ClientSession> clientSession;
 };
 
@@ -107,34 +126,35 @@ TEST_F(RPCClientServerTest, echo) {
         for (uint32_t i = 0; i < bufLen; ++i)
             buf[i] = char(i);
         RPC::OpaqueClientRPC rpc = clientSession->sendRequest(
-                                        RPC::Buffer(buf, bufLen, NULL));
-        RPC::Buffer reply = rpc.extractReply();
+                                        Core::Buffer(buf, bufLen, NULL));
+        rpc.waitForReply(TimePoint::max());
+        EXPECT_EQ(RPC::OpaqueClientRPC::Status::OK, rpc.getStatus());
+        Core::Buffer& reply = *rpc.peekReply();
         EXPECT_EQ(bufLen, reply.getLength());
         EXPECT_EQ(0, memcmp(reply.getData(), buf, bufLen));
     }
 }
 
 // Test the RPC timeout (ping) mechanism.
-// This test assumes TIMEOUT_MS is set to 100ms in ClientSession.
 TEST_F(RPCClientServerTest, timeout) {
-    server.delayMicros = 110 * 1000;
+    EXPECT_EQ(12U, clientSession->PING_TIMEOUT_MS);
+    rpcHandler.delayMicros = 14 * 1000;
 
     // The server should not time out, since the serverEventLoopThread should
     // respond to pings.
-    RPC::OpaqueClientRPC rpc = clientSession->sendRequest(RPC::Buffer());
-    rpc.waitForReply();
+    RPC::OpaqueClientRPC rpc = clientSession->sendRequest(Core::Buffer());
+    rpc.waitForReply(TimePoint::max());
     EXPECT_EQ("", rpc.getErrorMessage());
 
     // This time, if we don't let the server event loop run, the RPC should
     // time out.
     Event::Loop::Lock blockPings(serverEventLoop);
-    RPC::OpaqueClientRPC rpc2 = clientSession->sendRequest(RPC::Buffer());
-    rpc2.waitForReply();
+    RPC::OpaqueClientRPC rpc2 = clientSession->sendRequest(Core::Buffer());
+    rpc2.waitForReply(TimePoint::max());
     EXPECT_EQ("Server 127.0.0.1 (resolved to 127.0.0.1:61023) timed out",
               rpc2.getErrorMessage());
 
 }
-
 
 } // namespace LogCabin::<anonymous>
 } // namespace LogCabin

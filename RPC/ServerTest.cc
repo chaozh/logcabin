@@ -17,10 +17,10 @@
 #include <thread>
 
 #include "build/Core/ProtoBufTest.pb.h"
+#include "Core/Buffer.h"
 #include "Core/Debug.h"
 #include "Event/Loop.h"
 #include "Protocol/Common.h"
-#include "RPC/Buffer.h"
 #include "RPC/ClientRPC.h"
 #include "RPC/ClientSession.h"
 #include "RPC/Server.h"
@@ -33,6 +33,7 @@ namespace {
 
 using LogCabin::Protocol::Common::DEFAULT_PORT;
 using LogCabin::Protocol::Common::MAX_MESSAGE_LENGTH;
+typedef ClientSession::TimePoint TimePoint;
 
 class RPCServerTest : public ::testing::Test {
     RPCServerTest()
@@ -47,11 +48,14 @@ class RPCServerTest : public ::testing::Test {
         , request()
         , reply()
     {
+        address.refresh(Address::TimePoint::max());
         EXPECT_EQ("", server.bind(address));
         session = ClientSession::makeSession(
                         eventLoop,
                         address,
-                        MAX_MESSAGE_LENGTH);
+                        MAX_MESSAGE_LENGTH,
+                        RPC::ClientSession::TimePoint::max(),
+                        Core::Config());
         request.set_field_a(3);
         request.set_field_b(4);
         reply.set_field_a(5);
@@ -81,9 +85,37 @@ class RPCServerTest : public ::testing::Test {
     ProtoBuf::TestMessage reply;
 };
 
+TEST_F(RPCServerTest, handleRPC_normal) {
+    server.registerService(1, service1, 1);
+    service1->reply(0, request, reply);
+    ClientRPC rpc(session, 1, 1, 0, request);
+    EXPECT_EQ(ClientRPC::Status::OK,
+              rpc.waitForReply(NULL, NULL, TimePoint::max()));
+}
+
+TEST_F(RPCServerTest, handleRPC_badHeader) {
+    server.registerService(1, service1, 1);
+    deinit();
+    ClientRPC rpc;
+    rpc.opaqueRPC = session->sendRequest(Core::Buffer());
+    EXPECT_DEATH({ childDeathInit();
+                   rpc.waitForReply(NULL, NULL, TimePoint::max());
+                 }, "request.*invalid");
+}
+
+TEST_F(RPCServerTest, handleRPC_badService) {
+    deinit();
+    ClientRPC rpc(session, 1, 1, 0, request);
+    EXPECT_DEATH({ childDeathInit();
+                   rpc.waitForReply(NULL, NULL, TimePoint::max());
+                 }, "not running.*service");
+}
+
 // constructor: nothing to test
 
 // destructor: nothing to test
+
+// bind: nothing to test
 
 TEST_F(RPCServerTest, registerService) {
     server.registerService(1, service1, 1);
@@ -94,36 +126,10 @@ TEST_F(RPCServerTest, registerService) {
     service2->reply(0, request, reply);
     ClientRPC rpc(session, 1, 1, 0, request);
     EXPECT_EQ(ClientRPC::Status::OK,
-              rpc.waitForReply(NULL, NULL));
+              rpc.waitForReply(NULL, NULL, TimePoint::max()));
     rpc = ClientRPC(session, 2, 1, 0, request);
     EXPECT_EQ(ClientRPC::Status::OK,
-              rpc.waitForReply(NULL, NULL));
-}
-
-TEST_F(RPCServerTest, handleRPC_normal) {
-    server.registerService(1, service1, 1);
-    service1->reply(0, request, reply);
-    ClientRPC rpc(session, 1, 1, 0, request);
-    EXPECT_EQ(ClientRPC::Status::OK,
-              rpc.waitForReply(NULL, NULL));
-}
-
-TEST_F(RPCServerTest, handleRPC_badHeader) {
-    server.registerService(1, service1, 1);
-    deinit();
-    ClientRPC rpc;
-    rpc.opaqueRPC = session->sendRequest(Buffer());
-    EXPECT_DEATH({ childDeathInit();
-                   rpc.waitForReply(NULL, NULL);
-                 }, "request.*invalid");
-}
-
-TEST_F(RPCServerTest, handleRPC_badService) {
-    deinit();
-    ClientRPC rpc(session, 1, 1, 0, request);
-    EXPECT_DEATH({ childDeathInit();
-                   rpc.waitForReply(NULL, NULL);
-                 }, "not running.*service");
+              rpc.waitForReply(NULL, NULL, TimePoint::max()));
 }
 
 } // namespace LogCabin::RPC::<anonymous>

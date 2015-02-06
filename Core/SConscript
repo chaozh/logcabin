@@ -1,6 +1,7 @@
 Import('env', 'object_files')
 
 src = [
+    "Buffer.cc",
     "Checksum.cc",
     "ConditionVariable.cc",
     "Config.cc",
@@ -10,6 +11,7 @@ src = [
     "ThreadId.cc",
     "Time.cc",
     "StringUtil.cc",
+    "Util.cc",
 ]
 object_files['Core'] = (env.StaticObject(src) +
                         env.Protobuf("ProtoBufTest.proto"))

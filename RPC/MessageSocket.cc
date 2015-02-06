@@ -1,4 +1,5 @@
 /* Copyright (c) 2010-2014 Stanford University
+ * Copyright (c) 2015 Diego Ongaro
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -25,6 +26,7 @@
 
 #include "Core/Debug.h"
 #include "Core/Endian.h"
+#include "Event/Loop.h"
 #include "RPC/MessageSocket.h"
 
 namespace LogCabin {
@@ -46,10 +48,9 @@ dupOrPanic(int oldfd)
 
 ////////// MessageSocket::SendSocket //////////
 
-MessageSocket::SendSocket::SendSocket(Event::Loop& eventLoop,
-                                      int fd,
+MessageSocket::SendSocket::SendSocket(int fd,
                                       MessageSocket& messageSocket)
-    : Event::File(eventLoop, fd, 0)
+    : Event::File(fd)
     , messageSocket(messageSocket)
 {
     int flag = 1;
@@ -74,10 +75,9 @@ MessageSocket::SendSocket::handleFileEvent(int events)
 
 ////////// MessageSocket::ReceiveSocket //////////
 
-MessageSocket::ReceiveSocket::ReceiveSocket(Event::Loop& eventLoop,
-                                            int fd,
+MessageSocket::ReceiveSocket::ReceiveSocket(int fd,
                                             MessageSocket& messageSocket)
-    : Event::File(eventLoop, fd, EPOLLIN)
+    : Event::File(fd)
     , messageSocket(messageSocket)
 {
     // I don't know that TCP_NODELAY has any effect if we're only reading from
@@ -144,7 +144,7 @@ MessageSocket::Outbound::Outbound(Outbound&& other)
 }
 
 MessageSocket::Outbound::Outbound(MessageId messageId,
-                                  Buffer message)
+                                  Core::Buffer message)
     : bytesSent(0)
     , header()
     , message(std::move(message))
@@ -165,14 +165,19 @@ MessageSocket::Outbound::operator=(Outbound&& other)
 
 ////////// MessageSocket //////////
 
-MessageSocket::MessageSocket(Event::Loop& eventLoop, int fd,
+MessageSocket::MessageSocket(Handler& handler,
+                             Event::Loop& eventLoop, int fd,
                              uint32_t maxMessageLength)
     : maxMessageLength(maxMessageLength)
+    , handler(handler)
+    , eventLoop(eventLoop)
     , inbound()
     , outboundQueueMutex()
     , outboundQueue()
-    , receiveSocket(eventLoop, dupOrPanic(fd), *this)
-    , sendSocket(eventLoop, fd, *this)
+    , receiveSocket(dupOrPanic(fd), *this)
+    , sendSocket(fd, *this)
+    , receiveSocketMonitor(eventLoop, receiveSocket, EPOLLIN)
+    , sendSocketMonitor(eventLoop, sendSocket, 0)
 {
 }
 
@@ -181,7 +186,19 @@ MessageSocket::~MessageSocket()
 }
 
 void
-MessageSocket::sendMessage(MessageId messageId, Buffer contents)
+MessageSocket::close()
+{
+    receiveSocketMonitor.disableForever();
+    sendSocketMonitor.disableForever();
+
+    // Take an Event::Loop::Lock in case the handler assumes it's being
+    // executed on the event loop thread.
+    Event::Loop::Lock lock(eventLoop);
+    handler.handleDisconnect();
+}
+
+void
+MessageSocket::sendMessage(MessageId messageId, Core::Buffer contents)
 {
     // Check the message length.
     if (contents.getLength() > maxMessageLength) {
@@ -198,28 +215,22 @@ MessageSocket::sendMessage(MessageId messageId, Buffer contents)
     }
     // Make sure the SendSocket is set up to call writable().
     if (kick)
-        sendSocket.setEvents(EPOLLOUT|EPOLLONESHOT);
+        sendSocketMonitor.setEvents(EPOLLOUT|EPOLLONESHOT);
 }
 
 void
 MessageSocket::disconnect()
 {
-    int r = close(receiveSocket.release());
-    if (r != 0)
-        PANIC("Could not close receive socket: %s", strerror(errno));
-    r = close(sendSocket.release());
-    if (r != 0)
-        PANIC("Could not close send socket: %s", strerror(errno));
-    // TODO(ongaro): to make it safe for epoll_wait to return  multiple events,
-    // need to somehow queue the onDisconnect for later.
-    onDisconnect();
+    receiveSocketMonitor.disableForever();
+    sendSocketMonitor.disableForever();
+    // TODO(ongaro): to make it safe for epoll_wait to return multiple events,
+    // need to somehow queue the handleDisconnect for later.
+    handler.handleDisconnect();
 }
 
 void
 MessageSocket::readable()
 {
-    if (receiveSocket.fd < 0)
-        return;
     // Try to read data from the kernel until there is no more left.
     while (true) {
         if (inbound.bytesRead < sizeof(Header)) {
@@ -245,7 +256,7 @@ MessageSocket::readable()
             }
             inbound.message.setData(new char[inbound.header.payloadLength],
                                     inbound.header.payloadLength,
-                                    Buffer::deleteArrayFn<char>);
+                                    Core::Buffer::deleteArrayFn<char>);
         }
         // Don't use 'else' here; we want to check this branch for two reasons:
         // First, if there is a header with a length of 0, the socket won't be
@@ -269,8 +280,8 @@ MessageSocket::readable()
                                      inbound.header.payloadLength)) {
                 return;
             }
-            onReceiveMessage(inbound.header.messageId,
-                             std::move(inbound.message));
+            handler.handleReceivedMessage(inbound.header.messageId,
+                                          std::move(inbound.message));
             // Transition to receiving header
             inbound.bytesRead = 0;
         }
@@ -295,8 +306,6 @@ MessageSocket::read(void* buf, size_t maxBytes)
 void
 MessageSocket::writable()
 {
-    if (receiveSocket.fd < 0)
-        return;
     // Each iteration of this loop tries to write one message
     // from outboundQueue.
     while (true) {
@@ -353,7 +362,7 @@ MessageSocket::writable()
             } else if (errno == ECONNRESET || errno == EPIPE) {
                 // Connection closed; disconnect this end.
                 // This must be the last line to touch this object, in case
-                // onDisconnect() deletes this object.
+                // handleDisconnect() deletes this object.
                 disconnect();
                 return;
             } else {
@@ -367,7 +376,7 @@ MessageSocket::writable()
         outbound.bytesSent += bytesSent;
         if (outbound.bytesSent != (sizeof(Header) +
                                    outbound.message.getLength())) {
-            sendSocket.setEvents(EPOLLOUT|EPOLLONESHOT);
+            sendSocketMonitor.setEvents(EPOLLOUT|EPOLLONESHOT);
             std::unique_lock<Core::Mutex> lockGuard(outboundQueueMutex);
             outboundQueue.emplace_front(std::move(outbound));
             return;

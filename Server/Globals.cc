@@ -31,7 +31,8 @@ namespace Server {
 ////////// Globals::SigIntHandler //////////
 
 Globals::ExitHandler::ExitHandler(Event::Loop& eventLoop, int signalNumber)
-    : Signal(eventLoop, signalNumber)
+    : Signal(signalNumber)
+    , eventLoop(eventLoop)
 {
 }
 
@@ -47,8 +48,14 @@ Globals::ExitHandler::handleSignalEvent()
 Globals::Globals()
     : config()
     , eventLoop()
+    , sigIntBlocker(SIGINT)
+    , sigTermBlocker(SIGTERM)
+    , sigUsr1Blocker(SIGUSR1)
     , sigIntHandler(eventLoop, SIGINT)
+    , sigIntMonitor(eventLoop, sigIntHandler)
     , sigTermHandler(eventLoop, SIGTERM)
+    , sigTermMonitor(eventLoop, sigTermHandler)
+    , serverStats(*this)
     , raft()
     , stateMachine()
     , raftService()
@@ -67,6 +74,11 @@ Globals::~Globals()
 void
 Globals::init(uint64_t serverId)
 {
+    {
+        ServerStats::Lock serverStatsLock(serverStats);
+        serverStatsLock->set_server_id(serverId);
+        // TODO(ongaro): write entire 'config' into serverStats
+    }
     if (!raft) {
         raft.reset(new RaftConsensus(*this));
     }
@@ -105,11 +117,17 @@ Globals::init(uint64_t serverId)
                 continue;
             RPC::Address address(listenAddresses[i],
                                  Protocol::Common::DEFAULT_PORT);
+            address.refresh(RPC::Address::TimePoint::max());
             error = rpcServer->bind(address);
             if (error.empty()) {
                 NOTICE("Serving on %s", address.toString().c_str());
                 raft->serverId = i + 1;
                 raft->serverAddress = listenAddresses[i];
+                {
+                    ServerStats::Lock serverStatsLock(serverStats);
+                    serverStatsLock->set_server_id(raft->serverId);
+                    serverStatsLock->set_address(raft->serverAddress);
+                }
                 Core::Debug::processName =
                     Core::StringUtil::format("%lu", raft->serverId);
                 raft->init();
@@ -128,6 +146,7 @@ Globals::init(uint64_t serverId)
         stateMachine.reset(new StateMachine(raft, config));
     }
 
+    serverStats.enable();
 }
 
 void

@@ -1,4 +1,5 @@
 /* Copyright (c) 2012-2014 Stanford University
+ * Copyright (c) 2014 Diego Ongaro
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -15,58 +16,80 @@
 
 #include <assert.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <unistd.h>
 
 #include "Core/Debug.h"
 #include "Core/StringUtil.h"
+#include "Event/File.h"
+#include "Event/Loop.h"
+#include "Event/Timer.h"
+#include "Protocol/Common.h"
 #include "RPC/ClientSession.h"
-
-/**
- * The number of milliseconds to wait until the client gets suspicious about
- * the server not responding. After this amount of time elapses, the client
- * will send a ping to the server. If no response is received within another
- * TIMEOUT_MS milliseconds, the session is closed.
- *
- * TODO(ongaro): How should this value be chosen?
- * Ideally, you probably want this to be set to something like the 99-th
- * percentile of your RPC latency.
- *
- * TODO(ongaro): How does this interact with TCP?
- */
-enum { TIMEOUT_MS = 100 };
-
-/**
- * A message ID reserved for ping messages used to check the server's liveness.
- * No real RPC will ever be assigned this ID.
- */
-enum { PING_MESSAGE_ID = 0 };
 
 namespace LogCabin {
 namespace RPC {
 
-////////// ClientSession::ClientMessageSocket //////////
+namespace {
 
-ClientSession::ClientMessageSocket::ClientMessageSocket(
-        ClientSession& session,
-        int fd,
-        uint32_t maxMessageLength)
-    : MessageSocket(session.eventLoop, fd, maxMessageLength)
-    , session(session)
+/**
+ * Exits an event loop when a file event occurs.
+ * Helper for ClientSession constructor.
+ */
+struct FileNotifier : public Event::File {
+    FileNotifier(Event::Loop& eventLoop, int fd, Ownership ownership)
+        : Event::File(fd, ownership)
+        , eventLoop(eventLoop)
+        , count(0)
+    {
+    }
+    void handleFileEvent(int events) {
+        ++count;
+        eventLoop.exit();
+    }
+    Event::Loop& eventLoop;
+    uint64_t count;
+};
+
+/**
+ * Exits an event loop when a timer event occurs.
+ * Helper for ClientSession constructor.
+ */
+struct TimerNotifier : public Event::Timer {
+    explicit TimerNotifier(Event::Loop& eventLoop)
+        : Event::Timer()
+        , eventLoop(eventLoop)
+    {
+    }
+    void handleTimerEvent() {
+        eventLoop.exit();
+    }
+    Event::Loop& eventLoop;
+};
+
+} // anonymous namespace
+
+////////// ClientSession::MessageSocketHandler //////////
+
+ClientSession::MessageSocketHandler::MessageSocketHandler(
+        ClientSession& session)
+    : session(session)
 {
 }
 
 void
-ClientSession::ClientMessageSocket::onReceiveMessage(MessageId messageId,
-                                                     Buffer message)
+ClientSession::MessageSocketHandler::handleReceivedMessage(
+        MessageId messageId,
+        Core::Buffer message)
 {
     std::unique_lock<std::mutex> mutexGuard(session.mutex);
 
-    if (messageId == PING_MESSAGE_ID) {
+    if (messageId == Protocol::Common::PING_MESSAGE_ID) {
         if (session.numActiveRPCs > 0 && session.activePing) {
             // The server has shown that it is alive for now.
-            // Let's get suspicious again in another TIMEOUT_MS.
+            // Let's get suspicious again in another PING_TIMEOUT_MS.
             session.activePing = false;
-            session.timer.schedule(TIMEOUT_MS * 1000 * 1000);
+            session.timer.schedule(session.PING_TIMEOUT_MS * 1000 * 1000);
         } else {
             VERBOSE("Received an unexpected ping response. This can happen "
                     "for a number of reasons and is no cause for alarm. For "
@@ -101,7 +124,7 @@ ClientSession::ClientMessageSocket::onReceiveMessage(MessageId messageId,
     if (session.numActiveRPCs == 0)
         session.timer.deschedule();
     else
-        session.timer.schedule(TIMEOUT_MS * 1000 * 1000);
+        session.timer.schedule(session.PING_TIMEOUT_MS * 1000 * 1000);
 
     // Fill in the response
     response.status = Response::HAS_REPLY;
@@ -110,7 +133,7 @@ ClientSession::ClientMessageSocket::onReceiveMessage(MessageId messageId,
 }
 
 void
-ClientSession::ClientMessageSocket::onDisconnect()
+ClientSession::MessageSocketHandler::handleDisconnect()
 {
     VERBOSE("Disconnected from server %s",
             session.address.toString().c_str());
@@ -142,7 +165,7 @@ ClientSession::Response::Response()
 ////////// ClientSession::Timer //////////
 
 ClientSession::Timer::Timer(ClientSession& session)
-    : Event::Timer(session.eventLoop)
+    : Event::Timer()
     , session(session)
 {
 }
@@ -163,8 +186,9 @@ ClientSession::Timer::handleTimerEvent()
     if (!session.activePing) {
         VERBOSE("ClientSession is suspicious. Sending ping.");
         session.activePing = true;
-        session.messageSocket->sendMessage(PING_MESSAGE_ID, Buffer());
-        schedule(TIMEOUT_MS * 1000 * 1000);
+        session.messageSocket->sendMessage(Protocol::Common::PING_MESSAGE_ID,
+                                           Core::Buffer());
+        schedule(session.PING_TIMEOUT_MS * 1000 * 1000);
     } else {
         VERBOSE("ClientSession to %s timed out.",
                 session.address.toString().c_str());
@@ -184,13 +208,22 @@ ClientSession::Timer::handleTimerEvent()
 
 ////////// ClientSession //////////
 
+std::function<
+    int(int sockfd,
+        const struct sockaddr *addr,
+        socklen_t addrlen)> ClientSession::connectFn = ::connect;
+
 ClientSession::ClientSession(Event::Loop& eventLoop,
                              const Address& address,
-                             uint32_t maxMessageLength)
+                             uint32_t maxMessageLength,
+                             TimePoint timeout,
+                             const Core::Config& config)
     : self() // makeSession will fill this in shortly
+    , PING_TIMEOUT_MS(config.read<uint64_t>(
+        "tcpHeartbeatTimeoutMilliseconds", 200) / 2)
     , eventLoop(eventLoop)
     , address(address)
-    , messageSocket()
+    , messageSocketHandler(*this)
     , timer(*this)
     , mutex()
     , nextMessageId(1) // 0 is reserved for PING_MESSAGE_ID
@@ -198,39 +231,112 @@ ClientSession::ClientSession(Event::Loop& eventLoop,
     , errorMessage()
     , numActiveRPCs(0)
     , activePing(false)
+    , messageSocket()
+    , timerMonitor(eventLoop, timer)
 {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        errorMessage = "Failed to create socket";
-        return;
-    }
+    static_assert(1 > Protocol::Common::PING_MESSAGE_ID,
+                  "PING_MESSAGE_ID changed?");
+
     // Be careful not to pass a sockaddr of length 0 to conect(). Although it
     // should return -1 EINVAL, on some systems (e.g., RHEL6) it instead
     // returns OK but leaves the socket unconnected! See
     // https://github.com/logcabin/logcabin/issues/66 for more details.
     if (!address.isValid()) {
         errorMessage = "Failed to resolve " + address.toString();
-        close(fd);
         return;
     }
-    int r = connect(fd,
-                    address.getSockAddr(),
-                    address.getSockAddrLen());
+
+    // Some TCP connection timeouts appear to be ridiculously long in the wild.
+    // Limit this to 10 seconds, after which you'd most likely want to retry.
+    timeout = std::min(timeout, Clock::now() + std::chrono::seconds(10));
+
+    // Setting NONBLOCK here makes connect return right away with EINPROGRESS.
+    // Then we can monitor the fd until it's writable to know when it's done,
+    // along with a timeout. See man page for connect under EINPROGRESS.
+    int fd = socket(AF_INET, SOCK_STREAM|SOCK_NONBLOCK, 0);
+    if (fd < 0) {
+        errorMessage = "Failed to create socket";
+        return;
+    }
+
+    // According to the spec, connect() could return OK done here, but in
+    // practice it'll return EINPROGRESS.
+    bool waiting = false;
+    int r = connectFn(fd,
+                      address.getSockAddr(),
+                      address.getSockAddrLen());
     if (r != 0) {
-        errorMessage = "Failed to connect socket to " + address.toString();
+        switch (errno) {
+            case EINPROGRESS:
+                waiting = true;
+                break;
+            default:
+                errorMessage = Core::StringUtil::format(
+                    "Failed to connect socket to %s: %s",
+                    address.toString().c_str(),
+                    strerror(errno));
+                close(fd);
+                return;
+        }
+    }
+
+    if (waiting) {
+        // This is a pretty heavy-weight method of watching a file descriptor
+        // for a given period of time. On the other hand, it's only a few lines
+        // of code with the LogCabin::Event classes, so it's easier for now.
+        Event::Loop loop;
+        FileNotifier fileNotifier(loop, fd, Event::File::CALLER_CLOSES_FD);
+        TimerNotifier timerNotifier(loop);
+        Event::File::Monitor fileMonitor(loop, fileNotifier, EPOLLOUT);
+        Event::Timer::Monitor timerMonitor(loop, timerNotifier);
+        timerNotifier.scheduleAbsolute(timeout);
+        while (true) {
+            loop.runForever();
+            if (fileNotifier.count > 0) {
+                int error = 0;
+                socklen_t errorlen = sizeof(error);
+                r = getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &errorlen);
+                if (r != 0)
+                    PANIC("getsockopt failed: %s", strerror(errno));
+                if (error != 0) {
+                    errorMessage = Core::StringUtil::format(
+                        "Failed to connect socket to %s: %s",
+                        address.toString().c_str(),
+                        strerror(error));
+                }
+                break;
+            }
+            if (Clock::now() > timeout) {
+                errorMessage = Core::StringUtil::format(
+                    "Failed to connect socket to %s: timeout expired",
+                    address.toString().c_str());
+                break;
+            }
+            WARNING("spurious exit from event loop?");
+        }
+    }
+    if (!errorMessage.empty()) {
         close(fd);
         return;
     }
-    messageSocket.reset(new ClientMessageSocket(*this, fd, maxMessageLength));
+
+    messageSocket.reset(new MessageSocket(
+        messageSocketHandler, eventLoop, fd, maxMessageLength));
 }
 
 std::shared_ptr<ClientSession>
 ClientSession::makeSession(Event::Loop& eventLoop,
                            const Address& address,
-                           uint32_t maxMessageLength)
+                           uint32_t maxMessageLength,
+                           TimePoint timeout,
+                           const Core::Config& config)
 {
     std::shared_ptr<ClientSession> session(
-        new ClientSession(eventLoop, address, maxMessageLength));
+        new ClientSession(eventLoop,
+                          address,
+                          maxMessageLength,
+                          timeout,
+                          config));
     session->self = session;
     return session;
 }
@@ -238,13 +344,14 @@ ClientSession::makeSession(Event::Loop& eventLoop,
 
 ClientSession::~ClientSession()
 {
-    timer.deschedule();
+    timerMonitor.disableForever();
+    messageSocket.reset();
     for (auto it = responses.begin(); it != responses.end(); ++it)
         delete it->second;
 }
 
 OpaqueClientRPC
-ClientSession::sendRequest(Buffer request)
+ClientSession::sendRequest(Core::Buffer request)
 {
     MessageSocket::MessageId messageId;
     {
@@ -257,7 +364,7 @@ ClientSession::sendRequest(Buffer request)
         if (numActiveRPCs == 1) {
             // activePing's value was undefined while numActiveRPCs = 0
             activePing = false;
-            timer.schedule(TIMEOUT_MS * 1000 * 1000);
+            timer.schedule(PING_TIMEOUT_MS * 1000 * 1000);
         }
     }
     // Release the mutex before sending so that receives can be processed
@@ -357,7 +464,7 @@ ClientSession::update(OpaqueClientRPC& rpc)
 }
 
 void
-ClientSession::wait(const OpaqueClientRPC& rpc)
+ClientSession::wait(const OpaqueClientRPC& rpc, TimePoint timeout)
 {
     // The RPC may be holding the last reference to this session. This
     // temporary reference makes sure this object isn't destroyed until after
@@ -379,9 +486,11 @@ ClientSession::wait(const OpaqueClientRPC& rpc)
             return;
         } else if (!errorMessage.empty()) {
             return; // session has error
+        } else if (timeout < Clock::now()) {
+            return; // timeout
         }
         response->hasWaiter = true;
-        response->ready.wait(mutexGuard);
+        response->ready.wait_until(mutexGuard, timeout);
         response->hasWaiter = false;
     }
 }

@@ -22,7 +22,9 @@
 #include "Core/STLUtil.h"
 #include "Core/StringUtil.h"
 #include "Core/Time.h"
+#include "Core/Util.h"
 #include "Protocol/Common.h"
+#include "RPC/Address.h"
 #include "RPC/ServiceMock.h"
 #include "RPC/Server.h"
 #include "Server/RaftConsensus.h"
@@ -438,12 +440,12 @@ class ServerRaftConsensusTest : public ::testing::Test {
         , entry4()
         , entry5()
     {
-        RaftConsensus::ELECTION_TIMEOUT_MS = 5000;
-        RaftConsensus::HEARTBEAT_PERIOD_MS = 2500;
-        RaftConsensus::RPC_FAILURE_BACKOFF_MS = 3000;
-        RaftConsensus::SOFT_RPC_SIZE_LIMIT = 1024;
+        globals.config.set("electionTimeoutMilliseconds", 5000);
+        globals.config.set("heartbeatPeriodMilliseconds", 2500);
+        globals.config.set("rpcFailureBackoffMilliseconds", 3000);
         startThreads = false;
         consensus.reset(new RaftConsensus(globals));
+        consensus->SOFT_RPC_SIZE_LIMIT = 1024;
         consensus->serverId = 1;
         consensus->serverAddress = "127.0.0.1:61023";
         Clock::useMockValue = true;
@@ -522,6 +524,7 @@ class ServerRaftConsensusPTest : public ServerRaftConsensusTest {
         peerServer.reset(new RPC::Server(globals.eventLoop,
                                      Protocol::Common::MAX_MESSAGE_LENGTH));
         RPC::Address address("127.0.0.1:61024", 0);
+        address.refresh(RPC::Address::TimePoint::max());
         EXPECT_EQ("", peerServer->bind(address));
         peerServer->registerService(
                             Protocol::Common::ServiceId::RAFT_SERVICE,
@@ -553,7 +556,7 @@ TEST_F(ServerRaftConsensusTest, init_blanklog)
     EXPECT_EQ(0U, consensus->commitIndex);
     EXPECT_LT(Clock::mockValue, consensus->startElectionAt);
     EXPECT_GT(Clock::mockValue +
-              milliseconds(RaftConsensus::ELECTION_TIMEOUT_MS * 2),
+              milliseconds(consensus->ELECTION_TIMEOUT_MS * 2),
               consensus->startElectionAt);
 }
 
@@ -708,24 +711,24 @@ TEST_F(ServerRaftConsensusTest, getNextEntry)
     consensus->append({&entry4});
     consensus->stepDown(5);
     consensus->commitIndex = 4;
-    consensus->stateChanged.callback = std::bind(&Consensus::exit,
+    consensus->stateChanged.callback = std::bind(&RaftConsensus::exit,
                                                  consensus.get());
-    Consensus::Entry e1 = consensus->getNextEntry(0);
+    RaftConsensus::Entry e1 = consensus->getNextEntry(0);
     EXPECT_EQ(1U, e1.entryId);
-    EXPECT_EQ(Consensus::Entry::SKIP, e1.type);
-    Consensus::Entry e2 = consensus->getNextEntry(e1.entryId);
+    EXPECT_EQ(RaftConsensus::Entry::SKIP, e1.type);
+    RaftConsensus::Entry e2 = consensus->getNextEntry(e1.entryId);
     EXPECT_EQ(2U, e2.entryId);
-    EXPECT_EQ(Consensus::Entry::DATA, e2.type);
+    EXPECT_EQ(RaftConsensus::Entry::DATA, e2.type);
     EXPECT_EQ("hello", e2.data);
-    Consensus::Entry e3 = consensus->getNextEntry(e2.entryId);
+    RaftConsensus::Entry e3 = consensus->getNextEntry(e2.entryId);
     EXPECT_EQ(3U, e3.entryId);
-    EXPECT_EQ(Consensus::Entry::SKIP, e3.type);
-    Consensus::Entry e4 = consensus->getNextEntry(e3.entryId);
+    EXPECT_EQ(RaftConsensus::Entry::SKIP, e3.type);
+    RaftConsensus::Entry e4 = consensus->getNextEntry(e3.entryId);
     EXPECT_EQ(4U, e4.entryId);
-    EXPECT_EQ(Consensus::Entry::DATA, e4.type);
+    EXPECT_EQ(RaftConsensus::Entry::DATA, e4.type);
     EXPECT_EQ("goodbye", e4.data);
     EXPECT_THROW(consensus->getNextEntry(e4.entryId),
-                 ThreadInterruptedException);
+                 Core::Util::ThreadInterruptedException);
 }
 
 TEST_F(ServerRaftConsensusTest, getNextEntry_snapshot)
@@ -747,9 +750,9 @@ TEST_F(ServerRaftConsensusTest, getNextEntry_snapshot)
     LogCabin::Core::Debug::setLogPolicy({
         {"Server/RaftConsensus.cc", "ERROR"}
     });
-    Consensus::Entry e1 = consensus->getNextEntry(0);
+    RaftConsensus::Entry e1 = consensus->getNextEntry(0);
     EXPECT_EQ(2U, e1.entryId);
-    EXPECT_EQ(Consensus::Entry::SNAPSHOT, e1.type);
+    EXPECT_EQ(RaftConsensus::Entry::SNAPSHOT, e1.type);
     uint32_t x;
     EXPECT_TRUE(e1.snapshotReader->getStream().ReadLittleEndian32(&x));
     EXPECT_EQ(0xdeadbeef, x);
@@ -831,7 +834,7 @@ TEST_F(ServerRaftConsensusTest, handleAppendEntries_newLeaderAndCommittedId)
     EXPECT_EQ(10U, consensus->currentTerm);
     EXPECT_LT(Clock::mockValue, consensus->startElectionAt);
     EXPECT_GT(Clock::mockValue +
-              milliseconds(RaftConsensus::ELECTION_TIMEOUT_MS * 2),
+              milliseconds(consensus->ELECTION_TIMEOUT_MS * 2),
               consensus->startElectionAt);
     EXPECT_EQ(1U, consensus->commitIndex);
     EXPECT_EQ("term: 10 "
@@ -1083,7 +1086,7 @@ TEST_F(ServerRaftConsensusTest, handleSnapshotChunk_newLeader)
     EXPECT_EQ(10U, consensus->currentTerm);
     EXPECT_LT(Clock::mockValue, consensus->startElectionAt);
     EXPECT_GT(Clock::mockValue +
-              milliseconds(RaftConsensus::ELECTION_TIMEOUT_MS * 2),
+              milliseconds(consensus->ELECTION_TIMEOUT_MS * 2),
               consensus->startElectionAt);
     EXPECT_EQ("term: 10 ", response);
     consensus->snapshotWriter->discard();
@@ -1246,9 +1249,9 @@ setConfigurationHelper(RaftConsensus* consensus)
     TimePoint waitUntil(
                 consensus->stateChanged.lastWaitUntilTimeSinceEpoch);
     EXPECT_EQ(round(Clock::mockValue) +
-              milliseconds(RaftConsensus::ELECTION_TIMEOUT_MS),
+              milliseconds(consensus->ELECTION_TIMEOUT_MS),
               waitUntil);
-    Clock::mockValue += milliseconds(RaftConsensus::ELECTION_TIMEOUT_MS);
+    Clock::mockValue += milliseconds(consensus->ELECTION_TIMEOUT_MS);
 }
 
 TEST_F(ServerRaftConsensusTest, setConfiguration_catchupFail)
@@ -1738,7 +1741,7 @@ class StepDownThreadMainHelper2 {
         } else if (iter == 3) {
             EXPECT_EQ(3U, consensus.currentEpoch);
             Clock::mockValue +=
-                milliseconds(RaftConsensus::ELECTION_TIMEOUT_MS);
+                milliseconds(consensus.ELECTION_TIMEOUT_MS);
         } else if (iter == 4) {
             EXPECT_EQ(3U, consensus.currentEpoch);
             consensus.exit();
@@ -1959,7 +1962,7 @@ TEST_F(ServerRaftConsensusPATest, appendEntries_rpcFailed)
 
 TEST_F(ServerRaftConsensusPATest, appendEntries_limitSizeAndIgnoreResult)
 {
-    RaftConsensus::SOFT_RPC_SIZE_LIMIT = 1;
+    consensus->SOFT_RPC_SIZE_LIMIT = 1;
     request.mutable_entries()->RemoveLast();
     request.mutable_entries()->RemoveLast();
     request.mutable_entries()->RemoveLast();
@@ -2019,7 +2022,7 @@ TEST_F(ServerRaftConsensusPATest, appendEntries_ok)
     EXPECT_EQ(consensus->currentEpoch, peer->lastAckEpoch);
     EXPECT_EQ(4U, peer->lastAgreeIndex);
     EXPECT_EQ(Clock::mockValue +
-              milliseconds(RaftConsensus::HEARTBEAT_PERIOD_MS),
+              milliseconds(consensus->HEARTBEAT_PERIOD_MS),
               peer->nextHeartbeatTime);
 
     // TODO(ongaro): test catchup code
@@ -2128,7 +2131,7 @@ TEST_F(ServerRaftConsensusPSTest, appendSnapshotChunk_termStale)
 
 TEST_F(ServerRaftConsensusPSTest, appendSnapshotChunk_ok)
 {
-    RaftConsensus::SOFT_RPC_SIZE_LIMIT = 7;
+    consensus->SOFT_RPC_SIZE_LIMIT = 7;
     request.set_data("hello, ");
     request.set_done(false);
     peerService->reply(Protocol::Raft::OpCode::APPEND_SNAPSHOT_CHUNK,
@@ -2150,7 +2153,7 @@ TEST_F(ServerRaftConsensusPSTest, appendSnapshotChunk_ok)
     EXPECT_EQ(0U, peer->lastSnapshotIndex);
     EXPECT_EQ(consensus->currentEpoch, peer->lastAckEpoch);
     EXPECT_EQ(Clock::mockValue +
-              milliseconds(RaftConsensus::HEARTBEAT_PERIOD_MS),
+              milliseconds(consensus->HEARTBEAT_PERIOD_MS),
               peer->nextHeartbeatTime);
 }
 
@@ -2506,10 +2509,10 @@ TEST_F(ServerRaftConsensusTest, setElectionTimer)
     for (uint64_t i = 0; i < 100; ++i) {
         consensus->setElectionTimer();
         EXPECT_LE(Clock::now() +
-                  milliseconds(RaftConsensus::ELECTION_TIMEOUT_MS),
+                  milliseconds(consensus->ELECTION_TIMEOUT_MS),
                   consensus->startElectionAt);
         EXPECT_GE(Clock::now() +
-                  milliseconds(RaftConsensus::ELECTION_TIMEOUT_MS) * 2,
+                  milliseconds(consensus->ELECTION_TIMEOUT_MS) * 2,
                   consensus->startElectionAt);
     }
 }
@@ -2524,7 +2527,7 @@ TEST_F(ServerRaftConsensusTest, startNewElection)
     EXPECT_EQ(0U, consensus->currentTerm);
     EXPECT_LT(Clock::now(), consensus->startElectionAt);
     EXPECT_GT(Clock::now() +
-              milliseconds(RaftConsensus::ELECTION_TIMEOUT_MS) * 2,
+              milliseconds(consensus->ELECTION_TIMEOUT_MS) * 2,
               consensus->startElectionAt);
 
     // need other votes to win
@@ -2541,7 +2544,7 @@ TEST_F(ServerRaftConsensusTest, startNewElection)
     EXPECT_EQ(1U, consensus->votedFor);
     EXPECT_LT(Clock::now(), consensus->startElectionAt);
     EXPECT_GT(Clock::now() +
-              milliseconds(RaftConsensus::ELECTION_TIMEOUT_MS) * 2,
+              milliseconds(consensus->ELECTION_TIMEOUT_MS) * 2,
               consensus->startElectionAt);
     EXPECT_FALSE(bool(consensus->snapshotWriter));
 
@@ -2587,7 +2590,7 @@ TEST_F(ServerRaftConsensusTest, stepDown)
     EXPECT_EQ(Configuration::State::STABLE, consensus->configuration->state);
     EXPECT_LT(Clock::now(), consensus->startElectionAt);
     EXPECT_GT(Clock::now() +
-              milliseconds(RaftConsensus::ELECTION_TIMEOUT_MS) * 2,
+              milliseconds(consensus->ELECTION_TIMEOUT_MS) * 2,
               consensus->startElectionAt);
     EXPECT_FALSE(consensus->logSyncQueued);
 

@@ -1,5 +1,5 @@
 /* Copyright (c) 2011-2012 Stanford University
- * Copyright (c) 2014 Diego Ongaro
+ * Copyright (c) 2014-2015 Diego Ongaro
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -23,56 +23,34 @@
 #ifndef LOGCABIN_CORE_TIME_H
 #define LOGCABIN_CORE_TIME_H
 
-namespace std {
-
-/**
- * Prints std::milliseconds values in a way that is useful for unit tests.
- */
-inline std::ostream&
-operator<<(std::ostream& os,
-           const std::chrono::milliseconds& duration) {
-    return os << duration.count() << " ms";
-}
-
-/**
- * Prints std::nanoseconds values in a way that is useful for unit tests.
- */
-inline std::ostream&
-operator<<(std::ostream& os,
-           const std::chrono::nanoseconds& duration) {
-    return os << duration.count() << " ns";
-}
-
-
-/**
- * Prints std::time_point values in a way that is useful for unit tests.
- */
-template<typename Clock, typename Duration>
-std::ostream&
-operator<<(std::ostream& os,
-           const std::chrono::time_point<Clock, Duration>& timePoint) {
-    typedef std::chrono::time_point<Clock, Duration> TimePoint;
-    using LogCabin::Core::StringUtil::format;
-
-    if (timePoint == TimePoint::min())
-        return os << "TimePoint::min()";
-    if (timePoint == TimePoint::max())
-        return os << "TimePoint::max()";
-
-    TimePoint epoch = TimePoint();
-    uint64_t nanosSinceEpoch =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                timePoint - epoch).count();
-    return os << format("%lu.%09lu",
-                        nanosSinceEpoch / 1000000000UL,
-                        nanosSinceEpoch % 1000000000UL);
-}
-
-}
-
 namespace LogCabin {
 namespace Core {
 namespace Time {
+
+/**
+ * Convert a C++11 time point into a POSIX timespec.
+ * \param when
+ *      Time point to convert.
+ * \return
+ *      Time in seconds and nanoseconds relative to the Clock's epoch.
+ */
+template<typename Clock, typename Duration>
+struct timespec
+makeTimeSpec(const std::chrono::time_point<Clock, Duration>& when)
+{
+    std::chrono::nanoseconds::rep nanosSinceEpoch =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+           when.time_since_epoch()).count();
+    struct timespec ts;
+    ts.tv_sec  = nanosSinceEpoch / 1000000000L;
+    ts.tv_nsec = nanosSinceEpoch % 1000000000L;
+    // tv_nsec must always be in range [0, 1e9)
+    if (nanosSinceEpoch < 0) {
+        ts.tv_sec  -= 1;
+        ts.tv_nsec += 1000000000L;
+    }
+    return ts;
+}
 
 /**
  * Wall clock in nanosecond granularity.
@@ -209,10 +187,95 @@ rdtsc()
 /**
  * Return the system time since the Unix epoch in nanoseconds.
  */
-uint64_t getTimeNanos();
+int64_t getTimeNanos();
+
+/**
+ * Block the calling thread until the given time.
+ */
+void sleep(SteadyClock::time_point wake);
+
+/**
+ * Used to convert one or more SteadyClock::time_point values into values of
+ * the SystemClock. Using the same instance for many conversions is more
+ * efficient, since the current time only has to be queried once for each clock
+ * in the constructor.
+ */
+class SteadyTimeConverter {
+  public:
+    /**
+     * Constructor.
+     */
+    SteadyTimeConverter();
+
+    /**
+     * Return the given time according the system clock (assuming no time
+     * jumps).
+     */
+    SystemClock::time_point
+    convert(SteadyClock::time_point when);
+
+    /**
+     * Return the given time in nanoseconds since the Unix epoch according the
+     * system clock (assuming no time jumps).
+     */
+    int64_t
+    unixNanos(SteadyClock::time_point when);
+
+  private:
+    /**
+     * Time this object was constructed according to the SteadyClock.
+     */
+    SteadyClock::time_point steadyNow;
+    /**
+     * Time this object was constructed according to the SystemClock.
+     */
+    SystemClock::time_point systemNow;
+};
 
 } // namespace LogCabin::Core::Time
 } // namespace LogCabin::Core
 } // namespace LogCabin
+
+namespace std {
+
+/**
+ * Prints std::milliseconds values in a way that is useful for unit tests.
+ */
+inline std::ostream&
+operator<<(std::ostream& os,
+           const std::chrono::milliseconds& duration) {
+    return os << duration.count() << " ms";
+}
+
+/**
+ * Prints std::nanoseconds values in a way that is useful for unit tests.
+ */
+inline std::ostream&
+operator<<(std::ostream& os,
+           const std::chrono::nanoseconds& duration) {
+    return os << duration.count() << " ns";
+}
+
+
+/**
+ * Prints std::time_point values in a way that is useful for unit tests.
+ */
+template<typename Clock, typename Duration>
+std::ostream&
+operator<<(std::ostream& os,
+           const std::chrono::time_point<Clock, Duration>& timePoint) {
+    typedef std::chrono::time_point<Clock, Duration> TimePoint;
+    using LogCabin::Core::StringUtil::format;
+
+    if (timePoint == TimePoint::min())
+        return os << "TimePoint::min()";
+    if (timePoint == TimePoint::max())
+        return os << "TimePoint::max()";
+
+    struct timespec ts = LogCabin::Core::Time::makeTimeSpec(timePoint);
+    return os << format("%ld.%09ld", ts.tv_sec, ts.tv_nsec);
+}
+
+} // namespace std
 
 #endif /* LOGCABIN_CORE_TIME_H */

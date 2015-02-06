@@ -16,11 +16,10 @@
 #include <gtest/gtest.h>
 
 #include "build/Core/ProtoBufTest.pb.h"
+#include "Core/Buffer.h"
 #include "Core/Debug.h"
 #include "Core/ProtoBuf.h"
-#include "RPC/Buffer.h"
 #include "RPC/OpaqueServerRPC.h"
-#include "RPC/ProtoBuf.h"
 #include "RPC/Protocol.h"
 #include "RPC/ServerRPC.h"
 
@@ -51,12 +50,13 @@ class RPCServerRPCTest : public ::testing::Test {
                 const google::protobuf::Message* payload)
     {
         if (payload == NULL) {
-            request.setData(new RequestHeaderVersion1(),
-                            sizeof(RequestHeaderVersion1),
-                            Buffer::deleteObjectFn<RequestHeaderVersion1*>);
+            request.setData(
+                new RequestHeaderVersion1(),
+                sizeof(RequestHeaderVersion1),
+                Core::Buffer::deleteObjectFn<RequestHeaderVersion1*>);
         } else {
-            ProtoBuf::serialize(*payload, request,
-                                sizeof(RequestHeaderVersion1));
+            Core::ProtoBuf::serialize(*payload, request,
+                                      sizeof(RequestHeaderVersion1));
         }
         RequestHeaderVersion1& header =
             *static_cast<RequestHeaderVersion1*>(request.getData());
@@ -88,8 +88,8 @@ class RPCServerRPCTest : public ::testing::Test {
         return header.prefix.status;
     }
 
-    Buffer request;
-    Buffer response;
+    Core::Buffer request;
+    Core::Buffer response;
     ServerRPC serverRPC;
     LogCabin::ProtoBuf::TestMessage payload;
 };
@@ -112,6 +112,7 @@ TEST_F(RPCServerRPCTest, constructor_normal) {
     EXPECT_EQ(3U, serverRPC.getServiceSpecificErrorVersion());
     EXPECT_EQ(4U, serverRPC.getOpCode());
     EXPECT_TRUE(serverRPC.needsReply());
+    serverRPC.closeSession();
 }
 
 // default constructor: nothing to test
@@ -126,6 +127,7 @@ TEST_F(RPCServerRPCTest, getRequest_normal) {
     EXPECT_TRUE(serverRPC.getRequest(actual));
     EXPECT_EQ(payload, actual);
     EXPECT_TRUE(serverRPC.needsReply());
+    serverRPC.closeSession();
 }
 
 TEST_F(RPCServerRPCTest, getRequest_inactive) {
@@ -154,9 +156,9 @@ TEST_F(RPCServerRPCTest, reply) {
     EXPECT_EQ(Status::OK, getStatus());
     EXPECT_FALSE(serverRPC.needsReply());
     LogCabin::ProtoBuf::TestMessage actual;
-    EXPECT_TRUE(ProtoBuf::parse(response,
-                                actual,
-                                sizeof(ResponseHeaderVersion1)));
+    EXPECT_TRUE(Core::ProtoBuf::parse(response,
+                                      actual,
+                                      sizeof(ResponseHeaderVersion1)));
     EXPECT_EQ(payload, actual);
 }
 
@@ -167,9 +169,9 @@ TEST_F(RPCServerRPCTest, returnError) {
     EXPECT_EQ(Status::SERVICE_SPECIFIC_ERROR, getStatus());
     EXPECT_FALSE(serverRPC.needsReply());
     LogCabin::ProtoBuf::TestMessage actual;
-    EXPECT_TRUE(ProtoBuf::parse(response,
-                                actual,
-                                sizeof(ResponseHeaderVersion1)));
+    EXPECT_TRUE(Core::ProtoBuf::parse(response,
+                                      actual,
+                                      sizeof(ResponseHeaderVersion1)));
     EXPECT_EQ(payload, actual);
 }
 
@@ -194,7 +196,7 @@ TEST_F(RPCServerRPCTest, closeSession) {
     call();
     serverRPC.closeSession();
     EXPECT_FALSE(serverRPC.needsReply());
-    EXPECT_FALSE(serverRPC.opaqueRPC.messageSocket.lock());
+    EXPECT_FALSE(serverRPC.opaqueRPC.socket.lock());
 }
 
 // reject tested sufficiently by rejectInvalidService

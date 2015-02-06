@@ -16,8 +16,10 @@
 #include <memory>
 
 #include "Core/Config.h"
+#include "Core/Mutex.h"
 #include "Event/Loop.h"
 #include "Event/Signal.h"
+#include "Server/ServerStats.h"
 
 #ifndef LOGCABIN_SERVER_GLOBALS_H
 #define LOGCABIN_SERVER_GLOBALS_H
@@ -55,6 +57,7 @@ class Globals {
       public:
         ExitHandler(Event::Loop& eventLoop, int signalNumber);
         void handleSignalEvent();
+        Event::Loop& eventLoop;
     };
 
   public:
@@ -89,16 +92,52 @@ class Globals {
 
   private:
     /**
+     * Block SIGINT, which is handled by sigIntHandler.
+     * Signals are blocked early on in the startup process so that newly
+     * spawned threads also have them blocked.
+     */
+    Event::Signal::Blocker sigIntBlocker;
+
+    /**
+     * Block SIGTERM, which is handled by sigTermHandler.
+     * Signals are blocked early on in the startup process so that newly
+     * spawned threads also have them blocked.
+     */
+    Event::Signal::Blocker sigTermBlocker;
+
+    /**
+     * Block SIGUSR1, which is handled by serverStats.
+     * Signals are blocked early on in the startup process so that newly
+     * spawned threads also have them blocked.
+     */
+    Event::Signal::Blocker sigUsr1Blocker;
+
+    /**
      * Exits the event loop upon receiving SIGINT (keyboard interrupt).
      */
     ExitHandler sigIntHandler;
+
+    /**
+     * Registers sigIntHandler with the event loop.
+     */
+    Event::Signal::Monitor sigIntMonitor;
 
     /**
      * Exits the event loop upon receiving SIGTERM (kill).
      */
     ExitHandler sigTermHandler;
 
+    /**
+     * Registers sigTermHandler with the event loop.
+     */
+    Event::Signal::Monitor sigTermMonitor;
+
   public:
+    /**
+     * Statistics and information about the server's current state. Useful for
+     * diagnostics.
+     */
+    Server::ServerStats serverStats;
 
     /**
      * Consensus module.

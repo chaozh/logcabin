@@ -1,5 +1,5 @@
 /* Copyright (c) 2012 Stanford University
- * Copyright (c) 2014 Diego Ongaro
+ * Copyright (c) 2014-2015 Diego Ongaro
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -18,10 +18,8 @@
 #include <deque>
 #include <memory>
 #include <mutex>
-#include <thread>
 
 #include "build/Protocol/Client.pb.h"
-#include "Event/Loop.h"
 #include "RPC/Address.h"
 #include "RPC/ClientRPC.h"
 
@@ -31,11 +29,24 @@
 namespace LogCabin {
 
 // forward declaration
+namespace Core {
+class Config;
+}
+
+// forward declaration
+namespace Event {
+class Loop;
+}
+
+// forward declaration
 namespace RPC {
 class ClientSession;
 }
 
 namespace Client {
+
+// forward declaration
+class Backoff;
 
 /**
  * This class is used to send RPCs from clients to the leader of the LogCabin
@@ -47,10 +58,34 @@ namespace Client {
  */
 class LeaderRPCBase {
   public:
+    /// Clock used for timeouts.
+    typedef RPC::ClientRPC::Clock Clock;
+    /// Type for absolute time values used for timeouts.
+    typedef RPC::ClientRPC::TimePoint TimePoint;
+
     /**
      * RPC operation code.
      */
     typedef Protocol::Client::OpCode OpCode;
+
+    /**
+     * Return type for LeaderRPCBase::call().
+     */
+    enum class Status {
+        /**
+         * The RPC completed scucessfully.
+         */
+        OK,
+        /**
+         * The given timeout elapsed before the RPC completed.
+         */
+        TIMEOUT,
+    };
+
+    /**
+     * Print out a Status for debugging purposes.
+     */
+    friend std::ostream& operator<<(std::ostream& os, const Status& server);
 
     /// Constructor.
     LeaderRPCBase() {}
@@ -68,12 +103,16 @@ class LeaderRPCBase {
      *      The parameters for the operation. The caller must guarantee that
      *      this is a well-formed request. (If the server rejects it, this will
      *      PANIC.)
+     * \param timeout
+     *      After this time has elapsed, stop waiting and return TIMEOUT.
+     *      In this case, response will be left unmodified.
      * \param[out] response
      *      The response to the operation will be filled in here.
      */
-    virtual void call(OpCode opCode,
-                      const google::protobuf::Message& request,
-                      google::protobuf::Message& response) = 0;
+    virtual Status call(OpCode opCode,
+                        const google::protobuf::Message& request,
+                        google::protobuf::Message& response,
+                        TimePoint timeout) = 0;
 
     /**
      * An asynchronous version of call(). This allows multiple RPCs to be
@@ -82,6 +121,32 @@ class LeaderRPCBase {
      */
     class Call {
       public:
+        /**
+         * Return type for LeaderRPCBase::Call::wait().
+         */
+        enum class Status {
+            /**
+             * The RPC completed scucessfully.
+             */
+            OK,
+            /**
+             * The RPC did not succeed, nor did it timeout.
+             * The caller should try again.
+             * TODO(ongaro): this is a bit ugly
+             */
+            RETRY,
+            /**
+             * The given timeout elapsed before the RPC completed.
+             */
+            TIMEOUT,
+        };
+
+        /**
+         * Print out a Status for debugging purposes.
+         */
+        friend std::ostream& operator<<(std::ostream& os,
+                                        const Status& server);
+
         /**
          * Constructor.
          */
@@ -99,9 +164,14 @@ class LeaderRPCBase {
          *      The parameters for the operation. The caller must guarantee
          *      that this is a well-formed request. (If the server rejects it,
          *      this will PANIC.)
+         * \param timeout
+         *      After this time has elapsed, stop trying to initiate the
+         *      connection to the leader and use an invalid session, which will
+         *      cause the RPC to fail later.
          */
         virtual void start(OpCode opCode,
-                           const google::protobuf::Message& request) = 0;
+                           const google::protobuf::Message& request,
+                           TimePoint timeout) = 0;
         /**
          * Cancel the RPC. This may only be called after start(), but it may
          * be called safely from a separate thread.
@@ -112,12 +182,16 @@ class LeaderRPCBase {
          * \param[out] response
          *      If successful, the response to the operation will be filled in
          *      here.
+         * \param timeout
+         *      After this time has elapsed, stop waiting and return TIMEOUT.
+         *      In this case, response will be left unmodified.
          * \return
          *      True if the RPC completed successfully, false otherwise. If
          *      this returns false, it is the callers responsibility to start
          *      over to achieve the same at-most-once semantics as #call().
          */
-        virtual bool wait(google::protobuf::Message& response) = 0;
+        virtual Status wait(google::protobuf::Message& response,
+                            TimePoint timeout) = 0;
     };
 
     /**
@@ -143,16 +217,26 @@ class LeaderRPC : public LeaderRPCBase {
      *      Describe the servers to connect to. This class assumes that
      *      refreshing 'hosts' will result in a random host that might be the
      *      current cluster leader.
+     * \param eventLoop
+     *      Used to invoke RPCs.
+     * \param sessionCreationBackoff
+     *      Used to rate-limit new TCP connections.
+     * \param config
+     *      Settings for the client library. This object keeps a reference.
      */
-    explicit LeaderRPC(const RPC::Address& hosts);
+    LeaderRPC(const RPC::Address& hosts,
+              Event::Loop& eventLoop,
+              Backoff& sessionCreationBackoff,
+              const Core::Config& config);
 
     /// Destructor.
     ~LeaderRPC();
 
-    /// See LeaderRPCBase::call().
-    void call(OpCode opCode,
-              const google::protobuf::Message& request,
-              google::protobuf::Message& response);
+    /// See LeaderRPCBase::call.
+    Status call(OpCode opCode,
+                const google::protobuf::Message& request,
+                google::protobuf::Message& response,
+                TimePoint timeout);
 
     /// See LeaderRPCBase::makeCall().
     std::unique_ptr<LeaderRPCBase::Call> makeCall();
@@ -164,9 +248,12 @@ class LeaderRPC : public LeaderRPCBase {
       public:
         explicit Call(LeaderRPC& leaderRPC);
         ~Call();
-        void start(OpCode opCode, const google::protobuf::Message& request);
+        void start(OpCode opCode,
+                   const google::protobuf::Message& request,
+                   TimePoint timeout);
         void cancel();
-        bool wait(google::protobuf::Message& response);
+        Status wait(google::protobuf::Message& response,
+                    TimePoint timeout);
         LeaderRPC& leaderRPC;
         /**
          * Copy of leaderSession when the RPC was started (might have changed
@@ -179,64 +266,65 @@ class LeaderRPC : public LeaderRPCBase {
         RPC::ClientRPC rpc;
     };
 
-
     /**
-     * A helper for call() that decodes errors thrown by the service.
+     * Return a session connected to the most likely cluster leader, creating
+     * it if necessary.
+     * \param timeout
+     *      After this time has elapsed, stop trying to initiate the connection
+     *      and return an invalid session.
+     * \return
+     *      Session on which to execute RPCs.
      */
-    void handleServiceSpecificError(
-        std::shared_ptr<RPC::ClientSession> cachedSession,
-        const Protocol::Client::Error& error);
+    std::shared_ptr<RPC::ClientSession>
+    getSession(TimePoint timeout);
 
     /**
-     * Connect to a new host in hopes that it is the cluster leader.
-     * \param address
-     *      The host to connect to.
-     * \param lockGuard
-     *      Proof that the caller is holding #mutex.
-     */
-    void
-    connect(const RPC::Address& address,
-            std::unique_lock<std::mutex>& lockGuard);
-
-    /**
-     * Connect to a random host in #hosts in hopes that it is the cluster
-     * leader.
+     * Notify this class that an RPC on the given session failed. This will
+     * usually cause this class to connect to a random server next time
+     * getSession() is called.
      * \param cachedSession
-     *      This operation will only disconnect the current session if it is
-     *      the same as the session that is provided here. This is used to
-     *      detect races in which some other thread has already solved the
-     *      problem.
+     *      Session previously returned by getSession(). This is used to detect
+     *      races in which some other thread has already solved the problem.
      */
     void
-    connectRandom(std::shared_ptr<RPC::ClientSession> cachedSession);
+    reportFailure(std::shared_ptr<RPC::ClientSession> cachedSession);
 
     /**
-     * Connect to a specific host in hopes that it is the cluster leader.
+     * Notify this class that an RPC on the given session was redirected by a
+     * non-leader server. This will usually cause this class to connect to the
+     * given host the next time getSession() is called.
+     * \param cachedSession
+     *      Session previously returned by getSession(). This is used to detect
+     *      races in which some other thread has already solved the problem.
      * \param host
-     *      A string describing the host to connect to. This is passed in
-     *      string form rather than as an Address, which might save a DNS
-     *      lookup in case cachedSession turns out to be stale.
-     * \param cachedSession
-     *      This operation will only disconnect the current session if it is
-     *      the same as the session that is provided here. This is used to
-     *      detect races in which some other thread has already solved the
-     *      problem.
+     *      Address of the server that is likely the leader.
      */
     void
-    connectHost(const std::string& host,
-                std::shared_ptr<RPC::ClientSession> cachedSession);
+    reportRedirect(std::shared_ptr<RPC::ClientSession> cachedSession,
+                   const std::string& host);
 
     /**
-     * As a backoff mechanism, at most #windowCount connections are allowed in
-     * any #windowNanos period of time.
+     * Used to drive the underlying RPC mechanism.
      */
-    const uint64_t windowCount;
+    Event::Loop& eventLoop;
 
     /**
-     * As a backoff mechanism, at most #windowCount connections are allowed in
-     * any #windowNanos period of time.
+     * Used to rate-limit the creation of ClientSession objects (TCP
+     * connections).
      */
-    const uint64_t windowNanos;
+    Backoff& sessionCreationBackoff;
+
+    /**
+     * Settings for client library.
+     */
+    const Core::Config& config;
+
+    /**
+     * Protects all of the following member variables in this class.
+     * Threads hang on to this mutex while initiating new sessions to possible
+     * cluster leaders, in case other threads are already handling the problem.
+     */
+    std::mutex mutex;
 
     /**
      * An address referring to the hosts in the LogCabin cluster. A random host
@@ -246,35 +334,16 @@ class LeaderRPC : public LeaderRPCBase {
     RPC::Address hosts;
 
     /**
-     * The Event::Loop used to drive the underlying RPC mechanism.
+     * If nonempty, the address of the server that is likely to be the
+     * current leader.
      */
-    Event::Loop eventLoop;
-
-    /**
-     * A thread that runs the Event::Loop.
-     */
-    std::thread eventLoopThread;
-
-    /**
-     * Protects #leaderSession and #lastConnectTimes.
-     * Threads hang on to this mutex while initiating new sessions to possible
-     * cluster leaders, in case other threads are already handling the problem.
-     */
-    std::mutex mutex;
+     std::string leaderHint;
 
     /**
      * The goal is to get this session connected to the cluster leader.
      * This is never null, but it might sometimes point to the wrong host.
      */
     std::shared_ptr<RPC::ClientSession> leaderSession;
-
-    /**
-     * The time in nanoseconds since the Unix epoch when the last #windowCount
-     * connections were initiated. If fewer than #windowCount connections have
-     * been initiated, this is padded with zeros. The first time is the
-     * oldest, and the last is the most recent.
-     */
-    std::deque<uint64_t> lastConnectTimes;
 };
 
 } // namespace LogCabin::Client

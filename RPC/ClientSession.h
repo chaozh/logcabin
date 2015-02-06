@@ -1,4 +1,5 @@
 /* Copyright (c) 2012-2014 Stanford University
+ * Copyright (c) 2014 Diego Ongaro
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -18,10 +19,11 @@
 #include <string>
 #include <unordered_map>
 
+#include "Core/Buffer.h"
 #include "Core/ConditionVariable.h"
+#include "Core/Config.h"
 #include "Event/Timer.h"
 #include "RPC/Address.h"
-#include "RPC/Buffer.h"
 #include "RPC/OpaqueClientRPC.h"
 #include "RPC/MessageSocket.h"
 
@@ -43,6 +45,12 @@ namespace RPC {
  * clients should keep them around.
  */
 class ClientSession {
+  public:
+    /// Clock used for timeouts.
+    typedef Address::Clock Clock;
+    /// Type for absolute time values used for timeouts.
+    typedef Address::TimePoint TimePoint;
+
   private:
     /**
      * This constructor is private because the class must be allocated in a
@@ -50,7 +58,9 @@ class ClientSession {
      */
     ClientSession(Event::Loop& eventLoop,
                   const Address& address,
-                  uint32_t maxMessageLength);
+                  uint32_t maxMessageLength,
+                  TimePoint timeout,
+                  const Core::Config& config);
   public:
     /**
      * Return a new ClientSession object. This object is managed by a
@@ -70,11 +80,18 @@ class ClientSession {
      *      exists to limit the amount of buffer space a single RPC can use.
      *      Attempting to send longer requests will PANIC; attempting to
      *      receive longer requests will disconnect the underlying socket.
+     * \param timeout
+     *      After this time has elapsed, stop trying to initiate the connection
+     *      and leave the session in an error state.
+     * \param config
+     *      General settings. This object does not keep a reference.
      */
     static std::shared_ptr<ClientSession>
     makeSession(Event::Loop& eventLoop,
                 const Address& address,
-                uint32_t maxMessageLength);
+                uint32_t maxMessageLength,
+                TimePoint timeout,
+                const Core::Config& config);
 
     /**
      * Destructor.
@@ -89,7 +106,7 @@ class ClientSession {
      * \return
      *      This is be used to wait for and retrieve the reply to the RPC.
      */
-    OpaqueClientRPC sendRequest(Buffer request);
+    OpaqueClientRPC sendRequest(Core::Buffer request);
 
     /**
      * If the socket has been disconnected, return a descriptive message.
@@ -113,24 +130,13 @@ class ClientSession {
   private:
 
     /**
-     * This is a MessageSocket with callbacks set up for ClientSession.
+     * This handles events from #messageSocket.
      */
-    class ClientMessageSocket : public MessageSocket {
+    class MessageSocketHandler : public MessageSocket::Handler {
       public:
-        /**
-         * Constructor.
-         * \param clientSession
-         *      ClientSession owning this socket.
-         * \param fd
-         *      A connected TCP socket.
-         * \param maxMessageLength
-         *      See MessageSocket's constructor.
-         */
-        ClientMessageSocket(ClientSession& clientSession,
-                            int fd,
-                            uint32_t maxMessageLength);
-        void onReceiveMessage(MessageId messageId, Buffer message);
-        void onDisconnect();
+        explicit MessageSocketHandler(ClientSession& clientSession);
+        void handleReceivedMessage(MessageId messageId, Core::Buffer message);
+        void handleDisconnect();
         ClientSession& session;
     };
 
@@ -166,7 +172,7 @@ class ClientSession {
          * The contents of the response. This is valid when
          * #status is HAS_REPLY.
          */
-        Buffer reply;
+        Core::Buffer reply;
         /**
          * If true, a thread is blocked waiting on #ready,
          * and this object may not be deleted.
@@ -219,13 +225,32 @@ class ClientSession {
      * call update() after this returns to learn of the response.
      *
      * This must not be called while holding the RPC's lock.
+     * \param rpc
+     *      Wait for response to this.
+     * \param timeout
+     *      After this time has elapsed, stop waiting and return. The RPC's
+     *      results will probably not be available yet in this case.
      */
-    void wait(const OpaqueClientRPC& rpc);
+    void wait(const OpaqueClientRPC& rpc, TimePoint timeout);
 
     /**
      * This is used to keep this object alive while there are outstanding RPCs.
      */
     std::weak_ptr<ClientSession> self;
+
+    /**
+     * The number of milliseconds to wait until the client gets suspicious
+     * about the server not responding. After this amount of time elapses, the
+     * client will send a ping to the server. If no response is received within
+     * another PING_TIMEOUT_MS milliseconds, the session is closed.
+     *
+     * TODO(ongaro): How should this value be chosen?
+     * Ideally, you probably want this to be set to something like the 99-th
+     * percentile of your RPC latency.
+     *
+     * TODO(ongaro): How does this interact with TCP?
+     */
+    const uint64_t PING_TIMEOUT_MS;
 
     /**
      * The event loop that is used for non-blocking I/O.
@@ -238,11 +263,9 @@ class ClientSession {
     const Address address;
 
     /**
-     * The MessageSocket used to send RPC requests and receive RPC responses.
-     * This may be NULL if the socket was never created. In this case,
-     * #errorMessage will be set.
+     * Receives events from #messageSocket.
      */
-    std::unique_ptr<ClientMessageSocket> messageSocket;
+    MessageSocketHandler messageSocketHandler;
 
     /**
      * This is used to time out RPCs and sessions when the server is no longer
@@ -251,8 +274,12 @@ class ClientSession {
     Timer timer;
 
     /**
-     * This mutex protects all of the members of this class defined below this
-     * point.
+     * This mutex protects several members of this class:
+     *  - #nextMessageId
+     *  - #responses
+     *  - #errorMessage
+     *  - #numActiveRPCs
+     *  - #activePing
      */
     mutable std::mutex mutex;
 
@@ -282,7 +309,8 @@ class ClientSession {
      * The number of outstanding RPC requests that have been sent but whose
      * responses have not yet been received. This does not include ping
      * requests sent by the #timer (which aren't real RPCs).
-     * TODO(ongaro): Document what this is for.
+     * This is used to determine when to schedule the timer: the timer is
+     * scheduled if numActiveRPCs is non-zero.
      */
     uint32_t numActiveRPCs;
 
@@ -292,6 +320,26 @@ class ClientSession {
      * When numActiveRPCs = 0, this field is undefined.
      */
     bool activePing;
+
+    /**
+     * The MessageSocket used to send RPC requests and receive RPC responses.
+     * This may be NULL if the socket was never created. In this case,
+     * #errorMessage will be set.
+     */
+    std::unique_ptr<MessageSocket> messageSocket;
+
+    /**
+     * Registers timer with the event loop.
+     */
+    Event::Timer::Monitor timerMonitor;
+
+    /**
+     * Usually set to connect() but mocked out in some unit tests.
+     */
+    static std::function<
+        int(int sockfd,
+            const struct sockaddr *addr,
+            socklen_t addrlen)> connectFn;
 
     // ClientSession is non-copyable.
     ClientSession(const ClientSession&) = delete;

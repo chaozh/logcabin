@@ -5,8 +5,8 @@ src = [
     "RaftConsensusInvariants.cc",
     "RaftService.cc",
     "ClientService.cc",
-    "Consensus.cc",
     "Globals.cc",
+    "ServerStats.cc",
     "StateMachine.cc",
 ]
 object_files['Server'] = (env.StaticObject(src) +

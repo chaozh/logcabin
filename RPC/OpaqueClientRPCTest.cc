@@ -22,14 +22,14 @@ namespace LogCabin {
 namespace RPC {
 namespace {
 
+typedef OpaqueClientRPC::TimePoint TimePoint;
+
 TEST(RPCOpaqueClientRPCTest, constructor_default) {
     // make sure a default-constructed RPC object behaves sensibly
     OpaqueClientRPC rpc;
     EXPECT_EQ("", rpc.getErrorMessage());
     EXPECT_EQ(OpaqueClientRPC::Status::NOT_READY, rpc.getStatus());
-    EXPECT_THROW(rpc.extractReply(),
-                 OpaqueClientRPC::Error);
-    rpc.waitForReply();
+    rpc.waitForReply(TimePoint::max());
     EXPECT_EQ(OpaqueClientRPC::Status::ERROR, rpc.getStatus());
     EXPECT_EQ("This RPC was never associated with a ClientSession.",
               rpc.getErrorMessage());
@@ -57,19 +57,6 @@ TEST(RPCOpaqueClientRPCTest, cancel) {
     // tested in RPCClientSessionTest
 }
 
-TEST(RPCOpaqueClientRPCTest, extractReply) {
-    OpaqueClientRPC rpc;
-    rpc.status = OpaqueClientRPC::Status::ERROR;
-    rpc.errorMessage = "error";
-    EXPECT_THROW(rpc.extractReply(),
-                 OpaqueClientRPC::Error);
-    rpc.status = OpaqueClientRPC::Status::OK;
-    rpc.errorMessage = "";
-    rpc.reply = Buffer(NULL, 3, NULL);
-    EXPECT_EQ(3U, rpc.extractReply().getLength());
-    EXPECT_EQ(0U, rpc.extractReply().getLength());
-}
-
 TEST(RPCOpaqueClientRPCTest, getErrorMessage) {
     OpaqueClientRPC rpc;
     rpc.status = OpaqueClientRPC::Status::ERROR;
@@ -87,7 +74,7 @@ TEST(RPCOpaqueClientRPCTest, getStatus) {
 TEST(RPCOpaqueClientRPCTest, peekReply) {
     OpaqueClientRPC rpc;
     rpc.status = OpaqueClientRPC::Status::OK;
-    rpc.reply = Buffer(NULL, 3, NULL);
+    rpc.reply = Core::Buffer(NULL, 3, NULL);
     EXPECT_EQ(3U, rpc.peekReply()->getLength());
     rpc.status = OpaqueClientRPC::Status::ERROR;
     rpc.errorMessage = "foo";
