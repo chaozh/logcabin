@@ -19,9 +19,11 @@
  */
 
 #include <cassert>
+#include <cstdlib>
 #include <getopt.h>
 #include <iostream>
 
+#include <google/protobuf/stubs/common.h>
 #include <LogCabin/Client.h>
 
 namespace {
@@ -39,7 +41,7 @@ class OptionParser {
     OptionParser(int& argc, char**& argv)
         : argc(argc)
         , argv(argv)
-        , cluster("logcabin:61023")
+        , cluster("logcabin:5254")
         , mock(false)
     {
         while (true) {
@@ -75,17 +77,39 @@ class OptionParser {
     }
 
     void usage() {
-        std::cout << "Usage: " << argv[0] << " [options]" << std::endl;
-        std::cout << "Options: " << std::endl;
-        std::cout << "  -c, --cluster <address> "
-                  << "The network address of the LogCabin cluster "
-                  << "(default: logcabin:61023)" << std::endl;
-        std::cout << "  -h, --help              "
-                  << "Print this usage information" << std::endl;
-        std::cout << "  -m, --mock              "
-                  << "Instead of connecting to a LogCabin cluster, "
-                  << "fake it with a local, in-memory implementation."
-                  << std::endl;
+        std::cout
+            << "Runs an extremely basic test against LogCabin, useful as a "
+            << "quick sanity check."
+            << std::endl
+            << std::endl
+
+            << "Usage: " << argv[0] << " [options]"
+            << std::endl
+            << std::endl
+
+            << "Options:"
+            << std::endl
+
+            << "  -c <addresses>, --cluster=<addresses>  "
+            << "Network addresses of the LogCabin"
+            << std::endl
+            << "                                         "
+            << "servers, comma-separated"
+            << std::endl
+            << "                                         "
+            << "[default: logcabin:5254]"
+            << std::endl
+
+            << "  -h, --help                     "
+            << "Print this usage information"
+            << std::endl
+
+            << "  -m, --mock                     "
+            << "Instead of connecting to a LogCabin cluster,"
+            << std::endl
+            << "                                 "
+            << "use a client-local, in-memory data structure"
+            << std::endl;
     }
 
     int& argc;
@@ -99,16 +123,24 @@ class OptionParser {
 int
 main(int argc, char** argv)
 {
+    atexit(google::protobuf::ShutdownProtobufLibrary);
     OptionParser options(argc, argv);
-    Cluster cluster = options.mock ? Cluster(Cluster::FOR_TESTING)
-                                   : Cluster(options.cluster);
+    Cluster cluster = (options.mock
+        ? Cluster(std::make_shared<LogCabin::Client::TestingCallbacks>())
+        : Cluster(options.cluster));
 
     Tree tree = cluster.getTree();
     tree.makeDirectoryEx("/etc");
     tree.writeEx("/etc/passwd", "ha");
     std::string contents = tree.readEx("/etc/passwd");
     assert(contents == "ha");
-    tree.removeDirectoryEx("/etc");
 
+    // need to write a kilobyte for snapshot to be taken under default settings
+    std::string laughter;
+    for (int i = 0; i < 512; ++i)
+        laughter += "ha";
+    tree.writeEx("/etc/lol", laughter);
+
+    tree.removeDirectoryEx("/etc");
     return 0;
 }

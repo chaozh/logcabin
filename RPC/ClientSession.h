@@ -1,5 +1,5 @@
 /* Copyright (c) 2012-2014 Stanford University
- * Copyright (c) 2014 Diego Ongaro
+ * Copyright (c) 2014-2015 Diego Ongaro
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -92,6 +92,20 @@ class ClientSession {
                 uint32_t maxMessageLength,
                 TimePoint timeout,
                 const Core::Config& config);
+
+    /**
+     * Return a ClientSession object that's already in an error state. This can
+     * be useful for delaying errors until an RPC is waited on.
+     * \param eventLoop
+     *      Ignored but usually readily available to callers and needed to
+     *      satisfy type requirements.
+     * \param errorMessage
+     *      Description of the error, as will be returned by getErrorMessage()
+     *      later.
+     */
+    static std::shared_ptr<ClientSession>
+    makeErrorSession(Event::Loop& eventLoop,
+                     const std::string& errorMessage);
 
     /**
      * Destructor.
@@ -239,10 +253,10 @@ class ClientSession {
     std::weak_ptr<ClientSession> self;
 
     /**
-     * The number of milliseconds to wait until the client gets suspicious
+     * The number of nanoseconds to wait until the client gets suspicious
      * about the server not responding. After this amount of time elapses, the
      * client will send a ping to the server. If no response is received within
-     * another PING_TIMEOUT_MS milliseconds, the session is closed.
+     * another PING_TIMEOUT_NS milliseconds, the session is closed.
      *
      * TODO(ongaro): How should this value be chosen?
      * Ideally, you probably want this to be set to something like the 99-th
@@ -250,7 +264,7 @@ class ClientSession {
      *
      * TODO(ongaro): How does this interact with TCP?
      */
-    const uint64_t PING_TIMEOUT_MS;
+    const uint64_t PING_TIMEOUT_NS;
 
     /**
      * The event loop that is used for non-blocking I/O.
@@ -284,9 +298,8 @@ class ClientSession {
     mutable std::mutex mutex;
 
     /**
-     * The message ID to assign to the next RPC. These start at 1 and
-     * increment from there; the value 0 is reserved for ping messages to check
-     * server liveness.
+     * The message ID to assign to the next RPC. These start at 0 and
+     * increment from there.
      */
     MessageSocket::MessageId nextMessageId;
 

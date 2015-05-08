@@ -1,4 +1,5 @@
 /* Copyright (c) 2012 Stanford University
+ * Copyright (c) 2015 Diego Ongaro
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -17,12 +18,14 @@
 #include <thread>
 
 #include "build/Protocol/Client.pb.h"
+#include "include/LogCabin/Debug.h"
 #include "Core/Buffer.h"
 #include "Core/ProtoBuf.h"
 #include "Protocol/Common.h"
 #include "RPC/ClientRPC.h"
 #include "RPC/ClientSession.h"
 #include "Server/Globals.h"
+#include "Storage/FilesystemUtil.h"
 
 namespace LogCabin {
 namespace Server {
@@ -34,7 +37,8 @@ typedef RPC::ClientRPC::TimePoint TimePoint;
 
 class ServerClientServiceTest : public ::testing::Test {
     ServerClientServiceTest()
-        : globals()
+        : storagePath(Storage::FilesystemUtil::mkdtemp())
+        , globals()
         , session()
         , thread()
     {
@@ -47,7 +51,9 @@ class ServerClientServiceTest : public ::testing::Test {
             globals.reset(new Globals());
             globals->config.set("storageModule", "Memory");
             globals->config.set("uuid", "my-fake-uuid-123");
-            globals->config.set("servers", "127.0.0.1");
+            globals->config.set("listenAddresses", "127.0.0.1");
+            globals->config.set("serverId", "1");
+            globals->config.set("storagePath", storagePath);
             globals->init();
             RPC::Address address("127.0.0.1", Protocol::Common::DEFAULT_PORT);
             address.refresh(RPC::Address::TimePoint::max());
@@ -67,6 +73,7 @@ class ServerClientServiceTest : public ::testing::Test {
             globals->eventLoop.exit();
             thread.join();
         }
+        Storage::FilesystemUtil::remove(storagePath);
     }
 
     void
@@ -82,30 +89,74 @@ class ServerClientServiceTest : public ::testing::Test {
             << rpc.getErrorMessage();
     }
 
+    // Because of the EXPECT_DEATH call below, we need to take extra care to
+    // clean up the storagePath tmpdir: destructors in the child process won't
+    // get a chance.
+    std::string storagePath;
     std::unique_ptr<Globals> globals;
     std::shared_ptr<RPC::ClientSession> session;
     std::thread thread;
 };
 
 TEST_F(ServerClientServiceTest, handleRPCBadOpcode) {
-    Protocol::Client::GetSupportedRPCVersions::Request request;
-    Protocol::Client::GetSupportedRPCVersions::Response response;
+    init();
+    Protocol::Client::GetServerInfo::Request request;
+    Protocol::Client::GetServerInfo::Response response;
     int bad = 255;
     OpCode unassigned = static_cast<OpCode>(bad);
-    EXPECT_DEATH({init();
-                  call(unassigned, request, response);},
-                 "request.*invalid");
+    LogCabin::Core::Debug::setLogPolicy({ // expect warning
+        {"Server/ClientService.cc", "ERROR"},
+        {"", "WARNING"},
+    });
+    RPC::ClientRPC rpc(session,
+                       Protocol::Common::ServiceId::CLIENT_SERVICE,
+                       1, unassigned, request);
+    EXPECT_EQ(Status::INVALID_REQUEST, rpc.waitForReply(&response, NULL,
+                                                        TimePoint::max()))
+        << rpc.getErrorMessage();
 }
 
 ////////// Tests for individual RPCs //////////
 
-TEST_F(ServerClientServiceTest, getSupportedRPCVersions) {
+TEST_F(ServerClientServiceTest, verifyRecipient) {
     init();
-    Protocol::Client::GetSupportedRPCVersions::Request request;
-    Protocol::Client::GetSupportedRPCVersions::Response response;
-    call(OpCode::GET_SUPPORTED_RPC_VERSIONS, request, response);
-    EXPECT_EQ("min_version: 1"
-              "max_version: 1", response);
+    globals->clusterUUID.clear();
+    Protocol::Client::VerifyRecipient::Request request;
+    Protocol::Client::VerifyRecipient::Response response;
+
+    call(OpCode::VERIFY_RECIPIENT, request, response);
+    EXPECT_EQ("server_id: 1 "
+              "ok: true ",
+              response);
+
+    request.set_cluster_uuid("myfirstcluster");
+    request.set_server_id(1);
+    call(OpCode::VERIFY_RECIPIENT, request, response);
+    EXPECT_EQ("cluster_uuid: 'myfirstcluster' "
+              "server_id: 1 "
+              "ok: true ",
+              response);
+
+    request.set_cluster_uuid("mysecondcluster");
+    call(OpCode::VERIFY_RECIPIENT, request, response);
+    EXPECT_TRUE(Core::StringUtil::startsWith(response.error(),
+                                             "Mismatched cluster UUIDs"));
+    response.clear_error();
+    EXPECT_EQ("cluster_uuid: 'myfirstcluster' "
+              "server_id: 1 "
+              "ok: false ",
+              response);
+
+    request.set_cluster_uuid("myfirstcluster");
+    request.set_server_id(2);
+    call(OpCode::VERIFY_RECIPIENT, request, response);
+    EXPECT_TRUE(Core::StringUtil::startsWith(response.error(),
+                                             "Mismatched server IDs"));
+    response.clear_error();
+    EXPECT_EQ("cluster_uuid: 'myfirstcluster' "
+              "server_id: 1 "
+              "ok: false ",
+              response);
 }
 
 } // namespace LogCabin::Server::<anonymous>

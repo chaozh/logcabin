@@ -39,22 +39,29 @@ class MyServerHandler : public OpaqueServer::Handler {
         : lastRequest()
         , nextResponse()
         , currentRPC()
+        , needsReply(false)
         , autoReply(true)
     {
     }
     void handleRPC(OpaqueServerRPC serverRPC) {
+        needsReply = true;
         currentRPC = std::move(serverRPC);
         lastRequest = std::move(currentRPC.request);
         if (autoReply)
-            reply();
+            replyOrLater();
     }
-    void reply() {
-        currentRPC.response = std::move(nextResponse);
-        currentRPC.sendReply();
+    void replyOrLater() {
+        if (needsReply) {
+            currentRPC.response = std::move(nextResponse);
+            currentRPC.sendReply();
+        } else {
+            autoReply = true;
+        }
     }
     Core::Buffer lastRequest;
     Core::Buffer nextResponse;
     OpaqueServerRPC currentRPC;
+    bool needsReply;
     bool autoReply;
 };
 
@@ -154,7 +161,8 @@ TEST_F(RPCClientRPCTest, waitForReply_timeout) {
                                ClientRPC::Clock::now() +
                                std::chrono::milliseconds(1)));
     makeServerRPC().reply(payload);
-    rpcHandler.reply();
+    // if request came in, reply now. else autoreply later.
+    rpcHandler.replyOrLater();
     EXPECT_EQ(ClientRPC::Status::OK,
               rpc.waitForReply(NULL, NULL,
                                ClientRPC::Clock::now() +
@@ -216,19 +224,21 @@ TEST_F(RPCClientRPCTest, waitForReply_invalidVersion) {
 TEST_F(RPCClientRPCTest, waitForReply_invalidService) {
     makeServerRPC().rejectInvalidService();
     ClientRPC rpc(session, 2, 3, 4, payload);
-    deinit();
-    EXPECT_DEATH({childDeathInit();
-                  rpc.waitForReply(NULL, NULL, TimePoint::max());
-                 }, "not running the requested service");
+    EXPECT_EQ(ClientRPC::Status::INVALID_SERVICE,
+              rpc.waitForReply(NULL, NULL, TimePoint::max()));
+    // should be able to call waitForReply multiple times
+    EXPECT_EQ(ClientRPC::Status::INVALID_SERVICE,
+              rpc.waitForReply(NULL, NULL, TimePoint::max()));
 }
 
 TEST_F(RPCClientRPCTest, waitForReply_invalidRequest) {
     makeServerRPC().rejectInvalidRequest();
     ClientRPC rpc(session, 2, 3, 4, payload);
-    deinit();
-    EXPECT_DEATH({childDeathInit();
-                  rpc.waitForReply(NULL, NULL, TimePoint::max());
-                 }, "request.*invalid");
+    EXPECT_EQ(ClientRPC::Status::INVALID_REQUEST,
+              rpc.waitForReply(NULL, NULL, TimePoint::max()));
+    // should be able to call waitForReply multiple times
+    EXPECT_EQ(ClientRPC::Status::INVALID_REQUEST,
+              rpc.waitForReply(NULL, NULL, TimePoint::max()));
 }
 
 TEST_F(RPCClientRPCTest, waitForReply_unknownStatus) {

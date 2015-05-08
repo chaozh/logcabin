@@ -3,6 +3,8 @@
  * Copyright (c) 2011 Facebook
  *    startsWith() and endsWith() functions
  *
+ * Copyright (c) 2015 Diego Ongaro
+ *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
  * copyright notice and this permission notice appear in all copies.
@@ -18,8 +20,11 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cstdarg>
 #include <cstring>
+#include <functional>
+#include <locale>
 #include <sstream>
 
 #include "Core/StringUtil.h"
@@ -41,6 +46,24 @@ display(char c)
 }
 
 } // anonymous namespace
+
+std::string
+flags(int value,
+      std::initializer_list<std::pair<int, const char*>> flags)
+{
+    if (value == 0)
+        return "0";
+    std::vector<std::string> strings;
+    for (auto it = flags.begin(); it != flags.end(); ++it) {
+        if (value & it->first) {
+            strings.push_back(it->second);
+            value &= ~it->first;
+        }
+    }
+    if (value)
+        strings.push_back(format("0x%x", value));
+    return join(strings, "|");
+}
 
 // This comes from the RAMCloud project.
 std::string
@@ -87,6 +110,18 @@ isPrintable(const void* data, size_t length)
             std::all_of(begin, end, display));
 }
 
+std::string
+join(const std::vector<std::string>& components, const std::string& glue)
+{
+    std::string r;
+    for (uint64_t i = 0; i < components.size(); ++i) {
+        r += components.at(i);
+        if (i < components.size() - 1)
+            r += glue;
+    }
+    return r;
+}
+
 void
 replaceAll(std::string& haystack,
            const std::string& needle,
@@ -127,6 +162,27 @@ endsWith(const std::string& haystack, const std::string& needle)
     return (haystack.compare(haystack.length() - needle.length(),
                              needle.length(), needle) == 0);
 }
+
+std::string
+trim(const std::string& original)
+{
+    // The black magic is from https://stackoverflow.com/a/217605
+    std::string s = original;
+
+    // trim whitespace at end of string
+    s.erase(std::find_if(s.rbegin(), s.rend(),
+                         std::not1(std::ptr_fun<int, int>(std::isspace)))
+                .base(),
+            s.end());
+
+    // trim whitespace at beginning of string
+    s.erase(s.begin(),
+            std::find_if(s.begin(), s.end(),
+                         std::not1(std::ptr_fun<int, int>(std::isspace))));
+
+    return s;
+}
+
 
 } // namespace LogCabin::Core::StringUtil
 } // namespace LogCabin::Core

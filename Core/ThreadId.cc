@@ -14,7 +14,6 @@
  */
 
 #include <mutex>
-#include <sys/prctl.h>
 #include <unordered_map>
 
 #include "Core/ThreadId.h"
@@ -55,7 +54,7 @@ std::unordered_map<uint64_t, std::string> threadNames;
 void
 assign()
 {
-    std::unique_lock<std::mutex> lockGuard(mutex);
+    std::lock_guard<std::mutex> lockGuard(mutex);
     id = nextId;
     ++nextId;
 }
@@ -82,14 +81,11 @@ setName(const std::string& name)
 {
     // get the thread ID before locking to avoid deadlock
     uint64_t id = getId();
-    std::unique_lock<std::mutex> lockGuard(Internal::mutex);
+    std::lock_guard<std::mutex> lockGuard(Internal::mutex);
     if (name.empty())
         Internal::threadNames.erase(id);
     else
         Internal::threadNames[id] = name;
-    // set system thread name, useful for gdb
-    // name is truncated at first 16 characters
-    prctl(PR_SET_NAME, name.c_str(), 0, 0, 0);
 }
 
 std::string
@@ -97,7 +93,7 @@ getName()
 {
     // get the thread ID before locking to avoid deadlock
     uint64_t id = getId();
-    std::unique_lock<std::mutex> lockGuard(Internal::mutex);
+    std::lock_guard<std::mutex> lockGuard(Internal::mutex);
     auto it = Internal::threadNames.find(id);
     if (it == Internal::threadNames.end())
         return StringUtil::format("thread %lu", id);

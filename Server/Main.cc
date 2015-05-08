@@ -21,9 +21,11 @@
 #include <string>
 
 #include "Core/Debug.h"
+#include "Core/StringUtil.h"
 #include "Core/ThreadId.h"
 #include "Server/Globals.h"
 #include "Server/RaftConsensus.h"
+#include "include/LogCabin/Debug.h"
 
 namespace {
 
@@ -40,7 +42,6 @@ class OptionParser {
         , daemon(false)
         , debugLogFilename() // empty for default
         , pidFilename() // empty for none
-        , serverId(1)
         , testConfig(false)
     {
         while (true) {
@@ -49,13 +50,12 @@ class OptionParser {
                {"config",  required_argument, NULL, 'c'},
                {"daemon",  no_argument, NULL, 'd'},
                {"help",  no_argument, NULL, 'h'},
-               {"id",  required_argument, NULL, 'i'},
                {"log",  required_argument, NULL, 'l'},
                {"pidfile",  required_argument, NULL, 'p'},
                {"test",  no_argument, NULL, 't'},
                {0, 0, 0, 0}
             };
-            int c = getopt_long(argc, argv, "bc:dhi:l:p:t", longOptions, NULL);
+            int c = getopt_long(argc, argv, "bc:dhl:p:t", longOptions, NULL);
 
             // Detect the end of the options.
             if (c == -1)
@@ -73,9 +73,6 @@ class OptionParser {
                     break;
                 case 'd':
                     daemon = true;
-                    break;
-                case 'i':
-                    serverId = uint64_t(atol(optarg));
                     break;
                 case 'l':
                     debugLogFilename = optarg;
@@ -102,34 +99,60 @@ class OptionParser {
     }
 
     void usage() {
-        std::cout << "Usage: " << argv[0] << " [options]" << std::endl;
-        std::cout << "Options: " << std::endl;
-        std::cout << "  -h, --help            "
-                  << "Print this usage information" << std::endl;
-        std::cout << "  --bootstrap           "
-                  << "Write a cluster configuration into the very first "
-                  << "server's log and exit. This should only be run once "
-                  << "ever in each cluster" << std::endl;
-        std::cout << "  -c, --config <file>   "
-                  << "Specify the configuration file "
-                  << "(default: logcabin.conf)" << std::endl;
-        std::cout << "  -d, --daemon          "
-                  << "Detach and run in the background (requires --log)"
-                  << std::endl;
-        std::cout << "  -i, --id <id>         "
-                  << "Set server id to <id> "
-                  << "(default: index of first bindable address + 1)"
-                  << std::endl;
-        std::cout << "  -l, --log <file>      "
-                  << "Write debug logs to <file> "
-                  << "(default: stderr)"
-                  << std::endl;
-        std::cout << "  -p, --pidfile <file>  "
-                  << "Write process ID to <file>"
-                  << std::endl;
-        std::cout << "  -t, --test            "
-                  << "Check the configuration file for (basic) errors and exit"
-                  << std::endl;
+        std::cout
+            << "Runs a LogCabin server."
+            << std::endl
+            << std::endl
+
+            << "Usage: " << argv[0] << " [options]"
+            << std::endl
+            << std::endl
+
+            << "Options:"
+            << std::endl
+
+            << "  --bootstrap                  "
+            << "Write a cluster configuration into the very"
+            << std::endl
+            << "                               "
+            << "first server's log and exit. This must only"
+            << std::endl
+            << "                               "
+            << "be run once on a single server in each cluster."
+            << std::endl
+
+            << "  -c <file>, --config=<file>   "
+            << "Set the path to the configuration file"
+            << std::endl
+            << "                               "
+            << "[default: logcabin.conf]"
+            << std::endl
+
+            << "  -d, --daemon                 "
+            << "Detach and run in the background"
+            << std::endl
+            << "                               "
+            << "(requires --log)"
+            << std::endl
+
+            << "  -h, --help                   "
+            << "Print this usage information"
+            << std::endl
+
+            << "  -l <file>, --log=<file>      "
+            << "Write debug logs to <file> instead of stderr"
+            << std::endl
+
+            << "  -p <file>, --pidfile=<file>  "
+            << "Write process ID to <file>"
+            << std::endl
+
+            << "  -t, --test                   "
+            << "Check the configuration file for basic errors"
+            << std::endl
+            << "                               "
+            << "and exit"
+            << std::endl;
     }
 
     int& argc;
@@ -139,7 +162,6 @@ class OptionParser {
     bool daemon;
     std::string debugLogFilename;
     std::string pidFilename;
-    uint64_t serverId;
     bool testConfig;
 };
 
@@ -244,6 +266,10 @@ main(int argc, char** argv)
     if (options.testConfig) {
         Server::Globals globals;
         globals.config.readFile(options.configFilename.c_str());
+        // The following settings are required, and Config::read() throws an
+        // exception with an OK error message if they aren't found:
+        globals.config.read<uint64_t>("serverId");
+        globals.config.read<std::string>("listenAddresses");
         return 0;
     }
 
@@ -287,11 +313,17 @@ main(int argc, char** argv)
         // Initialize and run Globals.
         Server::Globals globals;
         globals.config.readFile(options.configFilename.c_str());
-        globals.init(options.serverId);
+        NOTICE("Config file settings:\n"
+               "# begin config\n"
+               "%s"
+               "# end config",
+               Core::StringUtil::toString(globals.config).c_str());
+        globals.init();
         if (options.bootstrap) {
             globals.raft->bootstrapConfiguration();
             NOTICE("Done bootstrapping configuration. Exiting.");
         } else {
+            globals.leaveSignalsBlocked();
             globals.run();
         }
     }

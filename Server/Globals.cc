@@ -1,4 +1,5 @@
 /* Copyright (c) 2012 Stanford University
+ * Copyright (c) 2015 Diego Ongaro
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -56,6 +57,8 @@ Globals::Globals()
     , sigTermHandler(eventLoop, SIGTERM)
     , sigTermMonitor(eventLoop, sigTermHandler)
     , serverStats(*this)
+    , clusterUUID()
+    , serverId(~0UL)
     , raft()
     , stateMachine()
     , raftService()
@@ -66,21 +69,23 @@ Globals::Globals()
 
 Globals::~Globals()
 {
-    // LogManager assumes it and its logs have no active users when it is
-    // destroyed. Currently, the only user is clientService, and this is
-    // guaranteed by clientService's destructor.
 }
 
 void
-Globals::init(uint64_t serverId)
+Globals::init()
 {
+    std::string uuid = config.read("clusterUUID", std::string(""));
+    if (!uuid.empty())
+        clusterUUID.set(uuid);
+    serverId = config.read<uint64_t>("serverId");
+    Core::Debug::processName = Core::StringUtil::format("%lu", serverId);
     {
         ServerStats::Lock serverStatsLock(serverStats);
         serverStatsLock->set_server_id(serverId);
-        // TODO(ongaro): write entire 'config' into serverStats
     }
     if (!raft) {
         raft.reset(new RaftConsensus(*this));
+        raft->serverId = serverId;
     }
 
     if (!raftService) {
@@ -103,43 +108,34 @@ Globals::init(uint64_t serverId)
                                    clientService,
                                    maxThreads);
 
-
-        std::string configServers = config.read<std::string>("servers", "");
+        std::string listenAddressesStr =
+            config.read<std::string>("listenAddresses");
+        {
+            ServerStats::Lock serverStatsLock(serverStats);
+            serverStatsLock->set_server_id(serverId);
+            serverStatsLock->set_addresses(listenAddressesStr);
+        }
         std::vector<std::string> listenAddresses =
-            Core::StringUtil::split(configServers, ';');
+            Core::StringUtil::split(listenAddressesStr, ',');
         if (listenAddresses.empty()) {
-            PANIC("No server addresses specified to listen on. "
-                  "You must set the 'servers' configuration option.");
+            PANIC("No server addresses specified to listen on");
         }
-        std::string error = "Server ID has no matching address";
-        for (uint32_t i = 0; i < listenAddresses.size(); ++i) {
-            if (serverId != 0 && serverId != i + 1)
-                continue;
-            RPC::Address address(listenAddresses[i],
-                                 Protocol::Common::DEFAULT_PORT);
+        for (auto it = listenAddresses.begin();
+             it != listenAddresses.end();
+             ++it) {
+            RPC::Address address(*it, Protocol::Common::DEFAULT_PORT);
             address.refresh(RPC::Address::TimePoint::max());
-            error = rpcServer->bind(address);
-            if (error.empty()) {
-                NOTICE("Serving on %s", address.toString().c_str());
-                raft->serverId = i + 1;
-                raft->serverAddress = listenAddresses[i];
-                {
-                    ServerStats::Lock serverStatsLock(serverStats);
-                    serverStatsLock->set_server_id(raft->serverId);
-                    serverStatsLock->set_address(raft->serverAddress);
-                }
-                Core::Debug::processName =
-                    Core::StringUtil::format("%lu", raft->serverId);
-                raft->init();
-                break;
+            std::string error = rpcServer->bind(address);
+            if (!error.empty()) {
+                PANIC("Could not listen on address %s: %s",
+                      address.toString().c_str(),
+                      error.c_str());
             }
+            NOTICE("Serving on %s",
+                   address.toString().c_str());
         }
-        if (!error.empty()) {
-            PANIC("Could not bind to any server address in: %s. "
-                  "Last error was: %s",
-                  configServers.c_str(),
-                  error.c_str());
-        }
+        raft->serverAddresses = listenAddressesStr;
+        raft->init();
     }
 
     if (!stateMachine) {
@@ -147,6 +143,14 @@ Globals::init(uint64_t serverId)
     }
 
     serverStats.enable();
+}
+
+void
+Globals::leaveSignalsBlocked()
+{
+    sigIntBlocker.leaveBlocked();
+    sigTermBlocker.leaveBlocked();
+    sigUsr1Blocker.leaveBlocked();
 }
 
 void

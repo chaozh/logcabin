@@ -1,5 +1,5 @@
 /* Copyright (c) 2011-2012 Stanford University
- * Copyright (c) 2014 Diego Ongaro
+ * Copyright (c) 2014-2015 Diego Ongaro
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -23,14 +23,85 @@
 #include <strings.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <unordered_map>
 
 #include "Core/Debug.h"
 #include "Core/StringUtil.h"
 #include "Core/ThreadId.h"
+#include "include/LogCabin/Debug.h"
 
 namespace LogCabin {
 namespace Core {
 namespace Debug {
+
+DebugMessage::DebugMessage()
+    : filename()
+    , linenum()
+    , function()
+    , logLevel()
+    , logLevelString()
+    , processName()
+    , threadName()
+    , message()
+{
+}
+
+DebugMessage::DebugMessage(const DebugMessage& other)
+    : filename(other.filename)
+    , linenum(other.linenum)
+    , function(other.function)
+    , logLevel(other.logLevel)
+    , logLevelString(other.logLevelString)
+    , processName(other.processName)
+    , threadName(other.threadName)
+    , message(other.message)
+{
+}
+
+DebugMessage::DebugMessage(DebugMessage&& other)
+    : filename(other.filename)
+    , linenum(other.linenum)
+    , function(other.function)
+    , logLevel(other.logLevel)
+    , logLevelString(other.logLevelString)
+    , processName(std::move(other.processName))
+    , threadName(std::move(other.threadName))
+    , message(std::move(other.message))
+{
+}
+
+DebugMessage::~DebugMessage()
+{
+}
+
+DebugMessage&
+DebugMessage::operator=(const DebugMessage& other)
+{
+    filename = other.filename;
+    linenum = other.linenum;
+    function = other.function;
+    logLevel = other.logLevel;
+    logLevelString = other.logLevelString;
+    processName = processName;
+    threadName = threadName;
+    message = other.message;
+    return *this;
+}
+
+DebugMessage&
+DebugMessage::operator=(DebugMessage&& other)
+{
+    filename = other.filename;
+    linenum = other.linenum;
+    function = other.function;
+    logLevel = other.logLevel;
+    logLevelString = other.logLevelString;
+    processName = std::move(processName);
+    threadName = std::move(threadName);
+    message = std::move(other.message);
+    return *this;
+}
+
 
 std::string processName = Core::StringUtil::format("%u", getpid());
 
@@ -78,9 +149,16 @@ std::vector<std::pair<std::string, std::string>> policy;
 std::unordered_map<const char*, LogLevel> isLoggingCache;
 
 /**
- * Where log messages go.
+ * Where log messages go (unless logHandler is set).
  */
 FILE* stream = stderr;
+
+/**
+ * If set, a callback that takes log messages instead of the normal log file
+ * (stream). This is exposed to client applications so they can integrate with
+ * their own logging mechanism.
+ */
+std::function<void(DebugMessage)> logHandler;
 
 /**
  * Convert a string to a log level.
@@ -165,9 +243,18 @@ using namespace Internal; // NOLINT
 FILE*
 setLogFile(FILE* newFile)
 {
-    std::unique_lock<std::mutex> lockGuard(mutex);
+    std::lock_guard<std::mutex> lockGuard(mutex);
     FILE* old = stream;
     stream = newFile;
+    return old;
+}
+
+std::function<void(DebugMessage)>
+setLogHandler(std::function<void(DebugMessage)> handler)
+{
+    std::lock_guard<std::mutex> lockGuard(mutex);
+    std::function<void(DebugMessage)> old = logHandler;
+    logHandler = handler;
     return old;
 }
 
@@ -175,7 +262,7 @@ void
 setLogPolicy(const std::vector<std::pair<std::string,
                                          std::string>>& newPolicy)
 {
-    std::unique_lock<std::mutex> lockGuard(mutex);
+    std::lock_guard<std::mutex> lockGuard(mutex);
     policy = newPolicy;
     isLoggingCache.clear();
 }
@@ -198,7 +285,7 @@ operator<<(std::ostream& ostream, LogLevel level)
 bool
 isLogging(LogLevel level, const char* fileName)
 {
-    std::unique_lock<std::mutex> lockGuard(mutex);
+    std::lock_guard<std::mutex> lockGuard(mutex);
     LogLevel verbosity;
     auto it = isLoggingCache.find(fileName);
     if (it == isLoggingCache.end()) {
@@ -216,16 +303,73 @@ log(LogLevel level,
     const char* format, ...)
 {
     va_list ap;
+
+    if (logHandler) {
+        DebugMessage d;
+        d.filename = relativeFileName(fileName);
+        d.linenum = lineNum;
+        d.function = functionName;
+        d.logLevel = int(level);
+        d.logLevelString = logLevelToString[uint32_t(level)];
+        d.processName = processName;
+        d.threadName = ThreadId::getName();
+
+        // this part is copied from Core::StringUtil::toString.
+        va_start(ap, format);
+        // We're not really sure how big of a buffer will be necessary.
+        // Try 1K, if not the return value will tell us how much is necessary.
+        int bufSize = 1024;
+        while (true) {
+            char buf[bufSize];
+            // vsnprintf trashes the va_list, so copy it first
+            va_list aq;
+            __va_copy(aq, ap);
+            int r = vsnprintf(buf, bufSize, format, aq);
+            assert(r >= 0); // old glibc versions returned -1
+            if (r < bufSize) {
+                buf[r - 1] = '\0'; // strip off "\n" added by LOG macro
+                d.message = buf; // copy string
+                break;
+            }
+            bufSize = r + 1;
+        }
+        va_end(ap);
+        (logHandler)(d);
+        return;
+    }
+
+    // Don't use Core::Time here since it could potentially call PANIC.
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
+
+    // Failures are a little annoying here, since we can't exactly log
+    // errors that come up.
+    char formattedSeconds[64]; // a human-readable string now.tv_sec
+    bool ok = false;
+    { // First, try gmtime and strftime.
+        struct tm calendarTime;
+        if (gmtime_r(&now.tv_sec, &calendarTime) != NULL) {
+            ok = (strftime(formattedSeconds,
+                           sizeof(formattedSeconds),
+                           "%F %T",
+                           &calendarTime) > 0);
+        }
+    }
+    if (!ok) { // If that failed, use the raw number.
+        snprintf(formattedSeconds,
+                 sizeof(formattedSeconds),
+                 "%010lu",
+                 now.tv_sec);
+        formattedSeconds[sizeof(formattedSeconds) - 1] = '\0';
+    }
 
     // This ensures that output on stderr won't be interspersed with other
     // output. This normally happens automatically for a single call to
     // fprintf, but must be explicit since we're using two calls here.
     flockfile(stream);
 
-    fprintf(stream, "%010lu.%06lu %s:%d in %s() %s[%s:%s]: ",
-            now.tv_sec, now.tv_nsec / 1000,
+    fprintf(stream, "%s.%06lu %s:%d in %s() %s[%s:%s]: ",
+            formattedSeconds, now.tv_nsec / 1000,
             relativeFileName(fileName), lineNum, functionName,
             logLevelToString[uint32_t(level)],
             processName.c_str(), ThreadId::getName().c_str());

@@ -38,6 +38,9 @@ operator<<(std::ostream& os, const LeaderRPCBase::Status& status)
         case LeaderRPCBase::Status::TIMEOUT:
             os << "Status::TIMEOUT";
             break;
+        case LeaderRPCBase::Status::INVALID_REQUEST:
+            os << "Status::INVALID_REQUEST";
+            break;
     }
     return os;
 }
@@ -54,6 +57,9 @@ operator<<(std::ostream& os, const LeaderRPCBase::Call::Status& status)
             break;
         case LeaderRPCBase::Call::Status::TIMEOUT:
             os << "Status::TIMEOUT";
+            break;
+        case LeaderRPCBase::Call::Status::INVALID_REQUEST:
+            os << "Status::INVALID_REQUEST";
             break;
     }
     return os;
@@ -110,21 +116,19 @@ LeaderRPC::Call::wait(google::protobuf::Message& response,
                 case Protocol::Client::Error::NOT_LEADER:
                     // The server we tried is not the current cluster leader.
                     if (error.has_leader_hint()) {
-                        VERBOSE("Will try suggested %s as new leader "
-                                "(was using %s)",
-                                error.leader_hint().c_str(),
-                                cachedSession->toString().c_str());
+                        NOTICE("Will try suggested %s as new leader "
+                               "(was using %s)",
+                               error.leader_hint().c_str(),
+                               cachedSession->toString().c_str());
                         leaderRPC.reportRedirect(cachedSession,
                                                  error.leader_hint());
                     } else {
-                        VERBOSE("Will try random host as new leader "
-                                "(was using %s)",
-                                cachedSession->toString().c_str());
+                        NOTICE("Will try random host as new leader "
+                               "(was using %s)",
+                               cachedSession->toString().c_str());
                         leaderRPC.reportFailure(cachedSession);
                     }
                     break;
-                case Protocol::Client::Error::SESSION_EXPIRED:
-                    PANIC("Session expired");
                 default:
                     // Hmm, we don't know what this server is trying to tell
                     // us, but something is wrong. The server shouldn't reply
@@ -137,12 +141,17 @@ LeaderRPC::Call::wait(google::protobuf::Message& response,
             }
             break;
         case RPCStatus::RPC_FAILED:
+            NOTICE("RPC failed: %s", cachedSession->toString().c_str());
             leaderRPC.reportFailure(cachedSession);
             break;
         case RPCStatus::RPC_CANCELED:
             break;
         case RPCStatus::TIMEOUT:
             return Call::Status::TIMEOUT;
+        case RPCStatus::INVALID_SERVICE:
+            PANIC("The server isn't running the ClientService");
+        case RPCStatus::INVALID_REQUEST:
+            return Call::Status::INVALID_REQUEST;
     }
     if (timeout < Clock::now())
         return Call::Status::TIMEOUT;
@@ -155,11 +164,13 @@ LeaderRPC::Call::wait(google::protobuf::Message& response,
 
 LeaderRPC::LeaderRPC(const RPC::Address& hosts,
                      Event::Loop& eventLoop,
+                     SessionManager::ClusterUUID& clusterUUID,
                      Backoff& sessionCreationBackoff,
-                     const Core::Config& config)
+                     SessionManager& sessionManager)
     : eventLoop(eventLoop)
+    , clusterUUID(clusterUUID)
     , sessionCreationBackoff(sessionCreationBackoff)
-    , config(config)
+    , sessionManager(sessionManager)
     , mutex()
     , hosts(hosts)
     , leaderHint()
@@ -189,6 +200,8 @@ LeaderRPC::call(OpCode opCode,
                 return Status::TIMEOUT;
             case Call::Status::RETRY:
                 break;
+            case Call::Status::INVALID_REQUEST:
+                return Status::INVALID_REQUEST;
         }
     }
 }
@@ -202,7 +215,7 @@ LeaderRPC::makeCall()
 std::shared_ptr<RPC::ClientSession>
 LeaderRPC::getSession(TimePoint timeout)
 {
-    std::unique_lock<std::mutex> lockGuard(mutex);
+    std::lock_guard<std::mutex> lockGuard(mutex);
     if (leaderSession)
         return leaderSession;
 
@@ -220,20 +233,16 @@ LeaderRPC::getSession(TimePoint timeout)
         address.refresh(timeout);
         leaderHint.clear();
     }
-    leaderSession = RPC::ClientSession::makeSession(
-                        eventLoop,
-                        address,
-                        Protocol::Common::MAX_MESSAGE_LENGTH,
-                        timeout,
-                        config);
-
+    NOTICE("Connecting to: %s", address.toString().c_str());
+    leaderSession = sessionManager.createSession(
+        address, timeout, &clusterUUID);
     return leaderSession;
 }
 
 void
 LeaderRPC::reportFailure(std::shared_ptr<RPC::ClientSession> cachedSession)
 {
-    std::unique_lock<std::mutex> lockGuard(mutex);
+    std::lock_guard<std::mutex> lockGuard(mutex);
     if (cachedSession == leaderSession)
         leaderSession.reset();
 }
@@ -242,7 +251,7 @@ void
 LeaderRPC::reportRedirect(std::shared_ptr<RPC::ClientSession> cachedSession,
                           const std::string& host)
 {
-    std::unique_lock<std::mutex> lockGuard(mutex);
+    std::lock_guard<std::mutex> lockGuard(mutex);
     if (cachedSession == leaderSession) {
         leaderSession.reset();
         leaderHint = host;

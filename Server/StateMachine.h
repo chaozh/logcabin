@@ -1,4 +1,5 @@
 /* Copyright (c) 2012-2014 Stanford University
+ * Copyright (c) 2015 Diego Ongaro
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -19,8 +20,10 @@
 #include <unordered_map>
 
 #include "build/Protocol/Client.pb.h"
+#include "build/Server/SnapshotStateMachine.pb.h"
 #include "Core/ConditionVariable.h"
 #include "Core/Config.h"
+#include "Core/Time.h"
 #include "Tree/Tree.h"
 
 #ifndef LOGCABIN_SERVER_STATEMACHINE_H
@@ -38,39 +41,74 @@ class RaftConsensus;
  */
 class StateMachine {
   public:
+    typedef Protocol::Client::StateMachineCommand Command;
+    typedef Protocol::Client::StateMachineQuery Query;
+
+    enum {
+        /**
+         * This state machine code can behave like all versions between
+         * MIN_SUPPORTED_VERSION and MAX_SUPPORTED_VERSION, inclusive.
+         */
+        MIN_SUPPORTED_VERSION = 1,
+        /**
+         * This state machine code can behave like all versions between
+         * MIN_SUPPORTED_VERSION and MAX_SUPPORTED_VERSION, inclusive.
+         */
+        MAX_SUPPORTED_VERSION = 1,
+    };
+
+
     StateMachine(std::shared_ptr<RaftConsensus> consensus,
                  Core::Config& config);
     ~StateMachine();
 
     /**
-     * Called by ClientService to get a response for a read-write operation on
-     * the Tree.
+     * Called by ClientService to execute read-only queries on the state
+     * machine.
      * \warning
      *      Be sure to wait() first!
      */
-    bool getResponse(const Protocol::Client::ExactlyOnceRPCInfo& rpcInfo,
-                     Protocol::Client::CommandResponse& response) const;
+    bool query(const Query::Request& request,
+               Query::Response& response) const;
 
     /**
-     * Called by ClientService to execute read-only operations on the Tree.
+     * Add information about the state machine state to the given structure.
      */
-    void readOnlyTreeRPC(
-                const Protocol::Client::ReadOnlyTree::Request& request,
-                Protocol::Client::ReadOnlyTree::Response& response) const;
+    void updateServerStats(Protocol::ServerStats& serverStats) const;
 
     /**
      * Return once the state machine has applied at least the given entry.
      */
-    void wait(uint64_t entryId) const;
+    void wait(uint64_t index) const;
+
+    /**
+     * Called by ClientService to get a response for a read-write command on
+     * the state machine.
+     * \param logIndex
+     *      The index in the log where the command was committed.
+     * \param command
+     *      The request.
+     * \param[out] response
+     *      If the return value is true, the response will be filled in here.
+     *      Otherwise, this will be unmodified.
+     */
+    bool waitForResponse(uint64_t logIndex,
+                         const Command::Request& command,
+                         Command::Response& response) const;
 
   private:
     // forward declaration
     struct Session;
 
+    /// Clock used by watchdog timer thread.
+    typedef Core::Time::SteadyClock Clock;
+    /// Point in time of Clock.
+    typedef Clock::time_point TimePoint;
+
     /**
      * Invoked once per committed entry from the Raft log.
      */
-    void apply(uint64_t entryId, const std::string& data);
+    void apply(const RaftConsensus::Entry& entry);
 
     /**
      * Main function for thread that waits for new commands from Raft.
@@ -78,10 +116,10 @@ class StateMachine {
     void applyThreadMain();
 
     /**
-     * Write the #sessions table to a snapshot file.
+     * Return the #sessions table as a protobuf message for writing into a
+     * snapshot.
      */
-    void dumpSessionSnapshot(
-                google::protobuf::io::CodedOutputStream& stream) const;
+    void serializeSessions(SnapshotStateMachine::Header& header) const;
 
     /**
      * Update the session and clean up unnecessary responses.
@@ -94,17 +132,46 @@ class StateMachine {
 
     /**
      * Remove old sessions.
-     * \param nanosecondsSinceEpoch
-     *      Sessions that have not been used since this (leader) time are
-     *      removed.
+     * \param clusterTime
+     *      Sessions are kept if they have been modified during the last
+     *      timeout period going backwards from the given time.
      */
-    void expireSessions(uint64_t nanosecondsSinceEpoch);
+    void expireSessions(uint64_t clusterTime);
 
     /**
-     * Read the #sessions table from a snapshot file.
+     * Return the version of the state machine behavior as of the given log
+     * index. Note that this is based on versionHistory internally, so if
+     * you're changing that variable at the given index, update it first.
      */
-    void loadSessionSnapshot(
-                google::protobuf::io::CodedInputStream& stream);
+    uint16_t getVersion(uint64_t logIndex) const;
+
+    /**
+     * If there is a current snapshot process, send it a SIGHUP and return
+     * immediately.
+     */
+    void killSnapshotProcess(Core::HoldingMutex holdingMutex);
+
+    /**
+     * Restore the #sessions table from a snapshot.
+     */
+    void loadSessions(const SnapshotStateMachine::Header& header);
+
+    /**
+     * Read all of the state machine state from a snapshot file
+     * (including version, sessions, and tree).
+     */
+    void loadSnapshot(Core::ProtoBuf::InputStream& stream);
+
+    /**
+     * Restore the #versionHistory table from a snapshot.
+     */
+    void loadVersionHistory(const SnapshotStateMachine::Header& header);
+
+    /**
+     * Return the #versionHistory table as a protobuf message for writing into
+     * a snapshot.
+     */
+    void serializeVersionHistory(SnapshotStateMachine::Header& header) const;
 
     /**
      * Return true if it is time to create a new snapshot.
@@ -119,12 +186,35 @@ class StateMachine {
     void snapshotThreadMain();
 
     /**
+     * Main function for thread that checks the progress of the child process.
+     */
+    void snapshotWatchdogThreadMain();
+
+    /**
      * Called by snapshotThreadMain to actually take the snapshot.
      */
     void takeSnapshot(uint64_t lastIncludedIndex,
                       std::unique_lock<std::mutex>& lockGuard);
 
+    /**
+     * Called to log a debug message if appropriate when the state machine
+     * encounters a query or command that is not understood by the current
+     * running version.
+     */
+    void warnUnknownRequest(const google::protobuf::Message& request) const;
+
+    /**
+     * Consensus module from which this state machine pulls commands and
+     * snapshots.
+     */
     std::shared_ptr<RaftConsensus> consensus;
+
+    /**
+     * Used for testing the snapshot watchdog thread. The probability that a
+     * snapshotting process will deadlock on purpose before starting, as a
+     * percentage.
+     */
+    uint64_t snapshotBlockPercentage;
 
     /**
      * Size in bytes of smallest log to snapshot.
@@ -138,10 +228,25 @@ class StateMachine {
     uint64_t snapshotRatio;
 
     /**
+     * After this much time has elapsed without any progress, the snapshot
+     * watchdog thread will kill the snapshotting process. A special value of 0
+     * disables the watchdog entirely.
+     */
+    std::chrono::nanoseconds snapshotWatchdogInterval;
+
+    /**
      * The time interval after which to remove an inactive client session, in
-     * nanoseconds of leader time.
+     * nanoseconds of cluster time.
      */
     uint64_t sessionTimeoutNanos;
+
+    /**
+     * The state machine logs messages when it receives a command or query that
+     * is not understood in the current running version. This controls the
+     * minimum interval between such messages to prevent spamming the debug
+     * log.
+     */
+    std::chrono::milliseconds unknownRequestMessageBackoff;
 
     /**
      * Protects against concurrent access for all members of this class (except
@@ -150,18 +255,26 @@ class StateMachine {
     mutable std::mutex mutex;
 
     /**
-     * Notified when lastEntryId changes after some entry got applied.
+     * Notified when lastIndex changes after some entry got applied.
      * Also notified upon exiting.
      * This is used for client threads to wait; see wait().
      */
     mutable Core::ConditionVariable entriesApplied;
 
     /**
-     * Notified when shouldTakeSnapshot(lastEntryId) becomes true.
+     * Notified when shouldTakeSnapshot(lastIndex) becomes true.
      * Also notified upon exiting.
      * This is used for snapshotThread to wake up only when necessary.
      */
     mutable Core::ConditionVariable snapshotSuggested;
+
+    /**
+     * Notified when a snapshot process is forked.
+     * Also notified upon exiting.
+     * This is used so that the watchdog thread knows to begin checking the
+     * progress of the child process.
+     */
+    mutable Core::ConditionVariable snapshotStarted;
 
     /**
      * applyThread sets this to true to signal that the server is shutting
@@ -172,16 +285,71 @@ class StateMachine {
     /**
      * The PID of snapshotThread's child process, if any. This is used by
      * applyThread to signal exits: if applyThread is exiting, it sends SIGHUP
-     * to this child process.
+     * to this child process. A childPid of 0 indicates that there is no child
+     * process.
      */
     pid_t childPid;
 
     /**
      * The index of the last log entry that this state machine has applied.
      * This variable is only written to by applyThread, so applyThread is free
-     * to access this variable without holding 'mutex'.
+     * to access this variable without holding 'mutex'. Other readers must hold
+     * 'mutex'.
      */
-    uint64_t lastEntryId;
+    uint64_t lastIndex;
+
+    /**
+     * The time when warnUnknownRequest() last printed a debug message. Used to
+     * prevent spamming the debug log.
+     */
+    mutable TimePoint lastUnknownRequestMessage;
+
+    /**
+     * The number of debug messages suppressed by warnUnknownRequest() since
+     * lastUnknownRequestMessage. Used to prevent spamming the debug log.
+     */
+    mutable uint64_t numUnknownRequestsSinceLastMessage;
+
+    /**
+     * The number of times a snapshot has been started.
+     * In addition to being a useful stat, the watchdog thread uses this to
+     * know whether it's been watching the same snapshot or whether a new one
+     * has been started.
+     */
+    uint64_t numSnapshotsAttempted;
+
+    /**
+     * The number of times a snapshot child process has failed to exit cleanly.
+     */
+    uint64_t numSnapshotsFailed;
+
+    /**
+     * The number of times a log entry was processed to advance the state
+     * machine's running version, but the state machine was already at that
+     * version.
+     */
+    uint64_t numRedundantAdvanceVersionEntries;
+
+    /**
+     * The number of times a log entry was processed to advance the state
+     * machine's running version, but the state machine was already at a larger
+     * version.
+     */
+    uint64_t numRejectedAdvanceVersionEntries;
+
+    /**
+     * The number of times a log entry was processed to successfully advance
+     * the state machine's running version, where the state machine was
+     * previously at a smaller version.
+     */
+    uint64_t numSuccessfulAdvanceVersionEntries;
+
+    /**
+     * The number of times any log entry to advance the state machine's running
+     * version was processed. Should be the sum of redundant, rejected, and
+     * successful counts.
+     */
+    uint64_t numTotalAdvanceVersionEntries;
 
     /**
      * Tracks state for a particular client.
@@ -195,8 +363,9 @@ class StateMachine {
         {
         }
         /**
-         * When the session was last active, measured in leader time
-         * nanoseconds since the Unix epoch.
+         * When the session was last active, measured in cluster time
+         * (roughly the number of nanoseconds that the cluster has maintained a
+         * leader).
          */
         uint64_t lastModified;
         /**
@@ -208,7 +377,8 @@ class StateMachine {
          * Responses for RPCs numbered less that firstOutstandingRPC are
          * discarded from this map.
          */
-        std::unordered_map<uint64_t, Protocol::Client::CommandResponse>
+        std::unordered_map<uint64_t,
+                           Protocol::Client::StateMachineCommand::Response>
             responses;
     };
 
@@ -224,6 +394,27 @@ class StateMachine {
     Tree::Tree tree;
 
     /**
+     * The log position when the state machine was updated to each new version.
+     * First component: log index. Second component: version number.
+     * Used to evolve state machine over time.
+     *
+     * This is used by getResponse() to determine the running version at a
+     * given log index (to determine whether a command would have been
+     * applied), and it's used elsewhere to determine the state machine's
+     * current running version.
+     *
+     * Invariant: the pair (index 0, version 1) is always present.
+     */
+    std::map<uint64_t, uint16_t> versionHistory;
+
+    /**
+     * The file that the snapshot is being written into. Also used by to track
+     * the progress of the child process for the watchdog thread.
+     * This is non-empty if and only if childPid > 0.
+     */
+    std::unique_ptr<Storage::SnapshotFile::Writer> writer;
+
+    /**
      * Repeatedly calls into the consensus module to get commands to process
      * and applies them.
      */
@@ -233,6 +424,15 @@ class StateMachine {
      * Takes snapshots with the help of a child process.
      */
     std::thread snapshotThread;
+
+    /**
+     * Watches the child process to make sure it's writing to #writer, and
+     * kills it otherwise. This is to detect any possible deadlock that might
+     * occur if a thread in the parent at the time of the fork held a lock that
+     * the child process then tried to access.
+     * See https://github.com/logcabin/logcabin/issues/121 for more rationale.
+     */
+    std::thread snapshotWatchdogThread;
 };
 
 } // namespace LogCabin::Server

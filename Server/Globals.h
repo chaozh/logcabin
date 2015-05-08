@@ -1,4 +1,5 @@
 /* Copyright (c) 2012 Stanford University
+ * Copyright (c) 2015 Diego Ongaro
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -15,6 +16,7 @@
 
 #include <memory>
 
+#include "Client/SessionManager.h"
 #include "Core/Config.h"
 #include "Core/Mutex.h"
 #include "Event/Loop.h"
@@ -72,7 +74,23 @@ class Globals {
      * Finish initializing this object.
      * This should be called after #config has been filled in.
      */
-    void init(uint64_t serverId = 0);
+    void init();
+
+    /**
+     * Leave the signals blocked when this object is destroyed.
+     * This is used in Server/Main.cc for the long-running daemon; it's not
+     * used in unit tests.
+     *
+     * This was added to work around a specific problem: when running the
+     * servers under valgrind through cluster.py, the servers would receive
+     * SIGTERM, start to shut down, then the instant the SIGTERM signal was
+     * unmasked, the server would appear to exit with a 0 status, yet it
+     * wouldn't finish the shutdown process. I couldn't reproduce this outside
+     * of cluster.py. As there's no reason to unblock the signals before
+     * exiting the daemon, this seems like the safer bet for now.
+     * -Diego 2015-04-29
+     */
+    void leaveSignalsBlocked();
 
     /**
      * Run the event loop until SIGINT, SIGTERM, or someone calls
@@ -138,6 +156,18 @@ class Globals {
      * diagnostics.
      */
     Server::ServerStats serverStats;
+
+    /**
+     * A unique ID for the cluster that this server may connect to. This is
+     * initialized to a value from the config file. If it's not set then, it
+     * may be set later as a result of learning a UUID from some other server.
+     */
+    Client::SessionManager::ClusterUUID clusterUUID;
+
+    /**
+     * Unique ID for this server. Set from config file.
+     */
+    uint64_t serverId;
 
     /**
      * Consensus module.

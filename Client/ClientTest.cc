@@ -63,12 +63,8 @@ class ClientClusterTest : public ::testing::Test {
         Client::ClientImpl* client =
             dynamic_cast<Client::ClientImpl*>(cluster->clientImpl.get());
         mockRPC = new Client::LeaderRPCMock();
-        mockRPC->expect(OpCode::GET_SUPPORTED_RPC_VERSIONS,
-            fromString<Protocol::Client::GetSupportedRPCVersions::Response>(
-                        "min_version: 1, max_version: 1"));
         client->leaderRPC = std::unique_ptr<Client::LeaderRPCBase>(mockRPC);
         cluster->clientImpl->init("127.0.0.1:0");
-        mockRPC->popRequest();
 
         client->exactlyOnceRPCHelper.client = NULL;
     }
@@ -94,7 +90,7 @@ TEST_F(ClientClusterTest, constructor) {
 class ClientTreeTest : public ::testing::Test {
   public:
     ClientTreeTest()
-        : cluster(Client::Cluster::FOR_TESTING)
+        : cluster(std::make_shared<Client::TestingCallbacks>())
         , tree(cluster.getTree())
     {
     }
@@ -115,7 +111,8 @@ using Client::Status;
 TEST_F(ClientTreeTest, assignment)
 {
     Client::Tree tree2 =
-        Client::Cluster(Client::Cluster::FOR_TESTING).getTree();
+        Client::Cluster(std::make_shared<Client::TestingCallbacks>())
+        .getTree();
     tree2.setWorkingDirectory("/foo/bar");
     tree2 = tree;
     EXPECT_EQ("/", tree2.getWorkingDirectory());

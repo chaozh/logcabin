@@ -22,6 +22,7 @@
 #include "include/LogCabin/Client.h"
 #include "Client/Backoff.h"
 #include "Client/LeaderRPC.h"
+#include "Client/SessionManager.h"
 #include "Core/ConditionVariable.h"
 #include "Core/Config.h"
 #include "Core/Mutex.h"
@@ -66,7 +67,7 @@ class ClientImpl {
      * \param hosts
      *      A string describing the hosts in the cluster. This should be of the
      *      form host:port, where host is usually a DNS name that resolves to
-     *      multiple IP addresses, or a semicolon-delimited list.
+     *      multiple IP addresses, or a comma-delimited list.
      */
     void init(const std::string& hosts);
 
@@ -80,6 +81,11 @@ class ClientImpl {
     ConfigurationResult setConfiguration(
                             uint64_t oldId,
                             const Configuration& newConfiguration);
+
+    /// See Cluster::getServerInfo.
+    Result getServerInfo(const std::string& host,
+                         TimePoint timeout,
+                         Server& info);
 
     /// See Cluster::getServerStats.
     Result getServerStats(const std::string& host,
@@ -143,13 +149,6 @@ class ClientImpl {
   protected:
 
     /**
-     * Asks the cluster leader for the range of supported RPC protocol
-     * versions, and select the best one. This is used to make sure the client
-     * and server are speaking the same version of the RPC protocol.
-     */
-    uint32_t negotiateRPCVersion();
-
-    /**
      * Options/settings.
      */
     const Core::Config config;
@@ -158,6 +157,19 @@ class ClientImpl {
      * The Event::Loop used to drive the underlying RPC mechanism.
      */
     Event::Loop eventLoop;
+
+    /**
+     * A unique ID for the cluster that this client may connect to. This is
+     * initialized to a value from the options map passed to the
+     * Client::Cluster constructor. If it's not set then, it may be set later
+     * as a result of learning a UUID from some server.
+     */
+    SessionManager::ClusterUUID clusterUUID;
+
+    /**
+     * Used to create new sessions.
+     */
+    SessionManager sessionManager;
 
     /**
      * Used to rate-limit the creation of ClientSession objects (TCP
@@ -174,12 +186,6 @@ class ClientImpl {
      * Used to send RPCs to the leader of the LogCabin cluster.
      */
     std::unique_ptr<LeaderRPCBase> leaderRPC;
-
-    /**
-     * The version of the RPC protocol to use when speaking to the cluster
-     * leader. (This is the result of negotiateRPCVersion().)
-     */
-    uint32_t rpcProtocolVersion;
 
     /**
      * This class helps with providing exactly-once semantics for read-write
@@ -227,13 +233,13 @@ class ClientImpl {
          * Internal version of getRPCInfo() to avoid deadlock with self.
          */
         Protocol::Client::ExactlyOnceRPCInfo getRPCInfo(
-            std::unique_lock<Core::Mutex>& lockGuard,
+            Core::HoldingMutex holdingMutex,
             TimePoint timeout);
         /**
          * Internal version of doneWithRPC() to avoid deadlock with self.
          */
         void doneWithRPC(const Protocol::Client::ExactlyOnceRPCInfo&,
-                         std::unique_lock<Core::Mutex>& lockGuard);
+                         Core::HoldingMutex holdingMutex);
         /**
          * Main function for keep-alive thread. Periodically makes
          * requests to the cluster to keep the client's session active.

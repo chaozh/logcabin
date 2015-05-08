@@ -1,5 +1,5 @@
 /* Copyright (c) 2012-2014 Stanford University
- * Copyright (c) 2014 Diego Ongaro
+ * Copyright (c) 2014-2015 Diego Ongaro
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -82,14 +82,14 @@ ClientSession::MessageSocketHandler::handleReceivedMessage(
         MessageId messageId,
         Core::Buffer message)
 {
-    std::unique_lock<std::mutex> mutexGuard(session.mutex);
+    std::lock_guard<std::mutex> mutexGuard(session.mutex);
 
     if (messageId == Protocol::Common::PING_MESSAGE_ID) {
         if (session.numActiveRPCs > 0 && session.activePing) {
             // The server has shown that it is alive for now.
-            // Let's get suspicious again in another PING_TIMEOUT_MS.
+            // Let's get suspicious again in another PING_TIMEOUT_NS.
             session.activePing = false;
-            session.timer.schedule(session.PING_TIMEOUT_MS * 1000 * 1000);
+            session.timer.schedule(session.PING_TIMEOUT_NS);
         } else {
             VERBOSE("Received an unexpected ping response. This can happen "
                     "for a number of reasons and is no cause for alarm. For "
@@ -124,7 +124,7 @@ ClientSession::MessageSocketHandler::handleReceivedMessage(
     if (session.numActiveRPCs == 0)
         session.timer.deschedule();
     else
-        session.timer.schedule(session.PING_TIMEOUT_MS * 1000 * 1000);
+        session.timer.schedule(session.PING_TIMEOUT_NS);
 
     // Fill in the response
     response.status = Response::HAS_REPLY;
@@ -137,7 +137,7 @@ ClientSession::MessageSocketHandler::handleDisconnect()
 {
     VERBOSE("Disconnected from server %s",
             session.address.toString().c_str());
-    std::unique_lock<std::mutex> mutexGuard(session.mutex);
+    std::lock_guard<std::mutex> mutexGuard(session.mutex);
     if (session.errorMessage.empty()) {
         // Fail all current and future RPCs.
         session.errorMessage = ("Disconnected from server " +
@@ -173,7 +173,7 @@ ClientSession::Timer::Timer(ClientSession& session)
 void
 ClientSession::Timer::handleTimerEvent()
 {
-    std::unique_lock<std::mutex> mutexGuard(session.mutex);
+    std::lock_guard<std::mutex> mutexGuard(session.mutex);
 
     // Handle "spurious" wake-ups.
     if (!session.messageSocket ||
@@ -188,7 +188,7 @@ ClientSession::Timer::handleTimerEvent()
         session.activePing = true;
         session.messageSocket->sendMessage(Protocol::Common::PING_MESSAGE_ID,
                                            Core::Buffer());
-        schedule(session.PING_TIMEOUT_MS * 1000 * 1000);
+        schedule(session.PING_TIMEOUT_NS);
     } else {
         VERBOSE("ClientSession to %s timed out.",
                 session.address.toString().c_str());
@@ -219,14 +219,14 @@ ClientSession::ClientSession(Event::Loop& eventLoop,
                              TimePoint timeout,
                              const Core::Config& config)
     : self() // makeSession will fill this in shortly
-    , PING_TIMEOUT_MS(config.read<uint64_t>(
-        "tcpHeartbeatTimeoutMilliseconds", 200) / 2)
+    , PING_TIMEOUT_NS(config.read<uint64_t>(
+        "tcpHeartbeatTimeoutMilliseconds", 500) * 1000 * 1000)
     , eventLoop(eventLoop)
     , address(address)
     , messageSocketHandler(*this)
     , timer(*this)
     , mutex()
-    , nextMessageId(1) // 0 is reserved for PING_MESSAGE_ID
+    , nextMessageId(0)
     , responses()
     , errorMessage()
     , numActiveRPCs(0)
@@ -234,9 +234,6 @@ ClientSession::ClientSession(Event::Loop& eventLoop,
     , messageSocket()
     , timerMonitor(eventLoop, timer)
 {
-    static_assert(1 > Protocol::Common::PING_MESSAGE_ID,
-                  "PING_MESSAGE_ID changed?");
-
     // Be careful not to pass a sockaddr of length 0 to conect(). Although it
     // should return -1 EINVAL, on some systems (e.g., RHEL6) it instead
     // returns OK but leaves the socket unconnected! See
@@ -247,8 +244,13 @@ ClientSession::ClientSession(Event::Loop& eventLoop,
     }
 
     // Some TCP connection timeouts appear to be ridiculously long in the wild.
-    // Limit this to 10 seconds, after which you'd most likely want to retry.
-    timeout = std::min(timeout, Clock::now() + std::chrono::seconds(10));
+    // Limit this to 1 second by default, after which you'd most likely want to
+    // retry.
+    timeout = std::min(timeout,
+                       (Clock::now() +
+                        std::chrono::milliseconds(
+                            config.read<uint64_t>(
+                                "tcpConnectTimeoutMilliseconds", 1000))));
 
     // Setting NONBLOCK here makes connect return right away with EINPROGRESS.
     // Then we can monitor the fd until it's writable to know when it's done,
@@ -341,6 +343,23 @@ ClientSession::makeSession(Event::Loop& eventLoop,
     return session;
 }
 
+std::shared_ptr<ClientSession>
+ClientSession::makeErrorSession(Event::Loop& eventLoop,
+                                const std::string& errorMessage)
+{
+    Core::Config config;
+    std::shared_ptr<ClientSession> session(
+        new ClientSession(eventLoop,
+                          Address(),
+                          0,
+                          TimePoint::min(),
+                          config));
+    session->self = session;
+    session->errorMessage = errorMessage;
+    return session;
+}
+
+
 
 ClientSession::~ClientSession()
 {
@@ -355,7 +374,7 @@ ClientSession::sendRequest(Core::Buffer request)
 {
     MessageSocket::MessageId messageId;
     {
-        std::unique_lock<std::mutex> mutexGuard(mutex);
+        std::lock_guard<std::mutex> mutexGuard(mutex);
         messageId = nextMessageId;
         ++nextMessageId;
         responses[messageId] = new Response();
@@ -364,7 +383,7 @@ ClientSession::sendRequest(Core::Buffer request)
         if (numActiveRPCs == 1) {
             // activePing's value was undefined while numActiveRPCs = 0
             activePing = false;
-            timer.schedule(PING_TIMEOUT_MS * 1000 * 1000);
+            timer.schedule(PING_TIMEOUT_NS);
         }
     }
     // Release the mutex before sending so that receives can be processed
@@ -380,7 +399,7 @@ ClientSession::sendRequest(Core::Buffer request)
 std::string
 ClientSession::getErrorMessage() const
 {
-    std::unique_lock<std::mutex> mutexGuard(mutex);
+    std::lock_guard<std::mutex> mutexGuard(mutex);
     return errorMessage;
 }
 
@@ -396,6 +415,8 @@ ClientSession::toString() const
     }
 }
 
+////////// ClientSession private methods //////////
+
 void
 ClientSession::cancel(OpaqueClientRPC& rpc)
 {
@@ -409,7 +430,7 @@ ClientSession::cancel(OpaqueClientRPC& rpc)
     //    the Response's status as CANCELED, and wait() will delete it later.
     // 2. If there's no thread currently blocked in wait(), the Response is
     //    deleted entirely.
-    std::unique_lock<std::mutex> mutexGuard(mutex);
+    std::lock_guard<std::mutex> mutexGuard(mutex);
     auto it = responses.find(rpc.responseToken);
     if (it == responses.end())
         return;
@@ -437,7 +458,7 @@ ClientSession::update(OpaqueClientRPC& rpc)
     // we return from this method. It must be the first line in this method.
     std::shared_ptr<ClientSession> selfGuard(self.lock());
 
-    std::unique_lock<std::mutex> mutexGuard(mutex);
+    std::lock_guard<std::mutex> mutexGuard(mutex);
     auto it = responses.find(rpc.responseToken);
     if (it == responses.end()) {
         // RPC was cancelled, fields set already

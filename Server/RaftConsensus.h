@@ -14,11 +14,6 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#if __GNUC__ >= 4 && __GNUC_MINOR__ >= 5
-#include <atomic>
-#else
-#include <cstdatomic>
-#endif
 #include <chrono>
 #include <deque>
 #include <functional>
@@ -26,13 +21,17 @@
 #include <thread>
 #include <unordered_map>
 
+#include "build/Protocol/Client.pb.h"
 #include "build/Protocol/Raft.pb.h"
 #include "build/Protocol/ServerStats.pb.h"
 #include "build/Server/SnapshotStats.pb.h"
-#include "Core/Mutex.h"
+#include "Client/SessionManager.h"
+#include "Core/CompatAtomic.h"
 #include "Core/ConditionVariable.h"
+#include "Core/Mutex.h"
 #include "Core/Time.h"
 #include "RPC/ClientRPC.h"
+#include "Storage/Layout.h"
 #include "Storage/Log.h"
 #include "Storage/SnapshotFile.h"
 
@@ -189,9 +188,26 @@ class Server {
      */
     const uint64_t serverId;
     /**
-     * The network address at which this server may be available.
+     * The network addresses at which this server may be available
+     * (comma-delimited)
      */
-    std::string address;
+    std::string addresses;
+
+    /**
+     * If true, minStateMachineVersion and maxStateMachineVersion are set
+     * (although they may be stale).
+     */
+    bool haveStateMachineSupportedVersions;
+    /**
+     * If haveStateMachineSupportedVersions is true, the smallest version of
+     * the state machine commands/behavior that the server can support.
+     */
+    uint16_t minStateMachineVersion;
+    /**
+     * If haveStateMachineSupportedVersions is true, the largest version of
+     * the state machine commands/behavior that the server can support.
+     */
+    uint16_t maxStateMachineVersion;
 
     /**
      * Used internally by Configuration for garbage collection.
@@ -263,6 +279,26 @@ class Peer : public Server {
     void scheduleHeartbeat();
 
     /**
+     * Returned by callRPC().
+     */
+    enum class CallStatus {
+        /**
+         * The RPC succeeded and the response was filled in.
+         */
+        OK,
+        /**
+         * No reply was received from the server. Maybe the connection was
+         * dropped; maybe the RPC was canceled.
+         */
+        FAILED,
+        /**
+         * The server does not support this RPC or didn't like the arguments
+         * given.
+         */
+        INVALID_REQUEST,
+    };
+
+    /**
      * Execute a remote procedure call on the server's RaftService. As this
      * operation might take a while, it should be called without RaftConsensus
      * lock.
@@ -271,15 +307,14 @@ class Peer : public Server {
      * \param[in] request
      *      The request that was received from the other server.
      * \param[out] response
-     *      Where the reply should be placed.
+     *      Where the reply should be placed, if status is OK.
      * \param[in] lockGuard
      *      The Raft lock, which is released internally to allow for I/O
      *      concurrency.
      * \return
-     *      True if the RPC succeeded and the response was filled in; false
-     *      otherwise.
+     *      See CallStatus.
      */
-    bool
+    CallStatus
     callRPC(Protocol::Raft::OpCode opCode,
             const google::protobuf::Message& request,
             google::protobuf::Message& response,
@@ -322,7 +357,7 @@ class Peer : public Server {
     Event::Loop& eventLoop;
 
     /**
-     * Set to true when #thread should exit.
+     * Set to true when thread should exit.
      */
     bool exiting;
 
@@ -428,11 +463,6 @@ class Peer : public Server {
      */
     RPC::ClientRPC rpc;
 
-    /**
-     * A thread that is used to send RPCs to the follower.
-     */
-    std::thread thread;
-
     // Peer is not copyable.
     Peer(const Peer&) = delete;
     Peer& operator=(const Peer&) = delete;
@@ -518,7 +548,8 @@ class Configuration {
     bool hasVote(ServerRef server) const;
 
     /**
-     * Lookup the network address for a particular server.
+     * Lookup the network addresses for a particular server
+     * (comma-delimited).
      * Returns empty string if not found.
      */
     std::string lookupAddress(uint64_t serverId) const;
@@ -769,6 +800,69 @@ class ConfigurationManager {
 };
 
 /**
+ * This is the rough equivalent of a SteadyClock that can be shared across the
+ * network with other Raft servers. The cluster time approximately tracks how
+ * long the cluster has been available with a working leader.
+ *
+ * Cluster time is measured in nanoseconds and progresses at about the same
+ * rate as a normal clock when the cluster is operational. While there's a
+ * stable leader, the nanoseconds increase according to that leader's
+ * SteadyClock. When a new leader takes over, it starts ticking from cluster
+ * time value it finds in its last entry/snapshot, so some cluster time may be
+ * unaccounted for between the last leader replicating its final entry and then
+ * losing leadership.
+ *
+ * The StateMachine uses cluster time to expire client sessions. Cluster times
+ * in committed log entries monotonically increase, so the state machine will
+ * see cluster times monotonically increase.
+ *
+ * Before cluster time, client sessions were expired based on the SystemClock.
+ * That meant that if the SystemClock jumped forwards drastically, all clients
+ * would expire. That's undesirable, so cluster time was introduced in #90
+ * ("make client session timeout use monotonic clock") to address this.
+ */
+class ClusterClock {
+  public:
+    /// Default constructor.
+    ClusterClock();
+
+    /**
+     * Reset to the given cluster time, assuming it's the current time right
+     * now. This is used, for example, when a follower gets a new log entry
+     * (which includes a cluster time) from the leader.
+     */
+    void newEpoch(uint64_t clusterTime);
+
+    /**
+     * Called by leaders to generate a new cluster time for a new log entry.
+     * This is equivalent to the following but slightly more efficient:
+     *   uint64_t now = c.interpolate();
+     *   c.newEpoch(now);
+     *   return now;
+     */
+    uint64_t leaderStamp();
+
+    /**
+     * Return the best approximation of the current cluster time, assuming
+     * there's been a leader all along.
+     */
+    uint64_t interpolate() const;
+
+    /**
+     * Invariant: this is equal to the cluster time in:
+     * - the last log entry, if any, or
+     * - the last snapshot, if any, or
+     * - 0.
+     */
+    uint64_t clusterTimeAtEpoch;
+
+    /**
+     * The local SteadyClock time when clusterTimeAtEpoch was set.
+     */
+    Core::Time::SteadyClock::time_point localTimeAtEpoch;
+};
+
+/**
  * An implementation of the Raft consensus algorithm. The algorithm is
  * described at https://raftconsensus.github.io
  * . In brief, Raft divides time into terms and elects a leader at the
@@ -792,11 +886,11 @@ class RaftConsensus {
         ~Entry();
 
         /**
-         * The entry ID for this entry (or the last one a snapshot covers).
-         * Pass this as the lastEntryId argument to the next call to
+         * The Raft log index for this entry (or the last one a snapshot
+         * covers). Pass this as the lastIndex argument to the next call to
          * getNextEntry().
          */
-        uint64_t entryId;
+        uint64_t index;
 
         /**
          * The type of the entry.
@@ -830,12 +924,18 @@ class RaftConsensus {
         /**
          * The client request for entries of type 'DATA'.
          */
-        std::string data;
+        Core::Buffer command;
 
         /**
          * A handle to the snapshot file for entries of type 'SNAPSHOT'.
          */
         std::unique_ptr<Storage::SnapshotFile::Reader> snapshotReader;
+
+        /**
+         * Cluster time when leader created entry/snapshot. This is valid for
+         * entries of all types.
+         */
+        uint64_t clusterTime;
 
         // copy and assign not allowed
         Entry(const Entry&) = delete;
@@ -843,9 +943,25 @@ class RaftConsensus {
     };
 
     enum class ClientResult {
+        /**
+         * Request completed successfully.
+         */
         SUCCESS,
+        /**
+         * Returned by setConfiguration() if the configuration could not be
+         * set because the previous configuration was unsuitable or because the
+         * new servers could not be caught up.
+         */
         FAIL,
+        /**
+         * Returned by getConfiguration() if the configuration is not stable or
+         * is not committed. The client should wait and retry later.
+         */
         RETRY,
+        /**
+         * Cannot process the request because this server is not leader or
+         * temporarily lost its leadership.
+         */
         NOT_LEADER,
     };
 
@@ -888,7 +1004,7 @@ class RaftConsensus {
      * replicated log. This is used to provide non-stale reads to the state
      * machine.
      */
-    std::pair<ClientResult, uint64_t> getLastCommittedId() const;
+    std::pair<ClientResult, uint64_t> getLastCommitIndex() const;
 
     /**
      * Return the network address for a recent leader, if known,
@@ -897,17 +1013,17 @@ class RaftConsensus {
     std::string getLeaderHint() const;
 
     /**
-     * This returns the entry following lastEntryId in the replicated log. Some
+     * This returns the entry following lastIndex in the replicated log. Some
      * entries may be used internally by the consensus module. These will have
      * Entry.hasData set to false. The reason these are exposed to the state
      * machine is that the state machine waits to be caught up to the latest
-     * committed entry ID in the replicated log; sometimes, but that entry
-     * would otherwise never reach the state machine if it was for internal
-     * use.
+     * committed entry in the replicated log sometimes, but if that entry
+     * was for internal use, it would would otherwise never reach the state
+     * machine.
      * \throw Core::Util::ThreadInterruptedException
      *      Thread should exit.
      */
-    Entry getNextEntry(uint64_t lastEntryId) const;
+    Entry getNextEntry(uint64_t lastIndex) const;
 
     /**
      * Return statistics that may be useful in deciding when to snapshot.
@@ -926,16 +1042,16 @@ class RaftConsensus {
                 Protocol::Raft::AppendEntries::Response& response);
 
     /**
-     * Process an AppendSnapshotChunk RPC from another server. Called by
+     * Process an InstallSnapshot RPC from another server. Called by
      * RaftService.
      * \param[in] request
      *      The request that was received from the other server.
      * \param[out] response
      *      Where the reply should be placed.
      */
-    void handleAppendSnapshotChunk(
-                const Protocol::Raft::AppendSnapshotChunk::Request& request,
-                Protocol::Raft::AppendSnapshotChunk::Response& response);
+    void handleInstallSnapshot(
+                const Protocol::Raft::InstallSnapshot::Request& request,
+                Protocol::Raft::InstallSnapshot::Response& response);
 
     /**
      * Process a RequestVote RPC from another server. Called by RaftService.
@@ -952,22 +1068,39 @@ class RaftConsensus {
      * \param operation
      *      If the cluster accepts this operation, then it will be added to the
      *      log and the state machine will eventually apply it.
+     * \return
+     *      First component is status code. If SUCCESS, second component is the
+     *      log index at which the entry has been committed to the replicated
+     *      log.
      */
-    std::pair<ClientResult, uint64_t> replicate(const std::string& operation);
+    std::pair<ClientResult, uint64_t> replicate(const Core::Buffer& operation);
 
     /**
      * Change the cluster's configuration.
-     * Returns once operation completed and old servers are no longer needed.
-     * \param id
-     *      Identifies a cluster configuration previously returned by
-     *      getConfiguration().
-     * \param newConfiguration
-     *      Servers in new config, only use new_servers() part.
+     * Returns successfully once operation completed and old servers are no
+     * longer needed.
+     * \return
+     *      NOT_LEADER, or other code with response filled in.
      */
     ClientResult
     setConfiguration(
-            uint64_t id,
-            const Protocol::Raft::SimpleConfiguration& newConfiguration);
+            const Protocol::Client::SetConfiguration::Request& request,
+            Protocol::Client::SetConfiguration::Response& response);
+
+    /**
+     * Register which versions of client commands/behavior the local state
+     * machine supports. Invoked just once on boot (though calling this
+     * multiple times is safe). This information is used to support upgrades to
+     * the running replicated state machine version, and it is transmitted to
+     * other servers as needed. See #stateMachineUpdaterThreadMain.
+     * \param minSupported
+     *      The smallest version the local state machine can support.
+     * \param maxSupported
+     *      The largest version the local state machine can support.
+     */
+    void
+    setSupportedStateMachineVersions(uint16_t minSupported,
+                                     uint16_t maxSupported);
 
     /**
      * Start taking a snapshot. Called by the state machine when it wants to
@@ -1064,6 +1197,12 @@ class RaftConsensus {
     void peerThreadMain(std::shared_ptr<Peer> peer);
 
     /**
+     * Append advance state machine version entries to the log as leader once
+     * all servers can support a new state machine version.
+     */
+    void stateMachineUpdaterThreadMain();
+
+    /**
      * Return to follower state when, as leader, this server is not able to
      * communicate with a quorum. This helps two things in cases where a quorum
      * is not available to this leader but clients can still communicate with
@@ -1091,9 +1230,8 @@ class RaftConsensus {
      *
      * \pre
      *      state is LEADER.
-     * TODO(ongaro): rename to advanceCommitIndex
      */
-    void advanceCommittedId();
+    void advanceCommitIndex();
 
     /**
      * Append entries to the log, set the configuration if this contains a
@@ -1114,7 +1252,7 @@ class RaftConsensus {
     void appendEntries(std::unique_lock<Mutex>& lockGuard, Peer& peer);
 
     /**
-     * Send an AppendSnapshotChunk RPC to the server (containing part of a
+     * Send an InstallSnapshot RPC to the server (containing part of a
      * snapshot file to replicate).
      * \param lockGuard
      *      Used to temporarily release the lock while invoking the RPC, so as
@@ -1123,7 +1261,7 @@ class RaftConsensus {
      *      State used in communicating with the follower, building the RPC
      *      request, and processing its result.
      */
-    void appendSnapshotChunk(std::unique_lock<Mutex>& lockGuard, Peer& peer);
+    void installSnapshot(std::unique_lock<Mutex>& lockGuard, Peer& peer);
 
     /**
      * Transition to being a leader. This is called when a candidate has
@@ -1180,6 +1318,12 @@ class RaftConsensus {
      *      request, and processing its result.
      */
     void requestVote(std::unique_lock<Mutex>& lockGuard, Peer& peer);
+
+    /**
+     * Dumps serverId, currentTerm, state, leaderId, and votedFor to the debug
+     * log. This is intended to be easy to grep and parse.
+     */
+    void printElectionState() const;
 
     /**
      * Set the timer to start a new election and notify #stateChanged.
@@ -1253,6 +1397,16 @@ class RaftConsensus {
     const uint64_t RPC_FAILURE_BACKOFF_MS;
 
     /**
+     * How long the state machine updater thread should sleep if:
+     * - The servers do not currently support a common version, or
+     * - This server has not yet received version information from all other
+     *   servers, or
+     * - An advance state machine entry failed to commit (probably due to lost
+     *   leadership).
+     */
+    const std::chrono::milliseconds STATE_MACHINE_UPDATER_BACKOFF;
+
+    /**
      * Prefer to keep RPC requests under this size.
      * Const except for unit tests.
      */
@@ -1265,10 +1419,10 @@ class RaftConsensus {
     uint64_t serverId;
 
     /**
-     * The address that this server is listening on. Not available until init()
-     * is called.
+     * The addresses that this server is listening on. Not available until
+     * init() is called.
      */
-    std::string serverAddress;
+    std::string serverAddresses;
 
   private:
 
@@ -1280,7 +1434,12 @@ class RaftConsensus {
     /**
      * Where the files for the log and snapshots are stored.
      */
-    Storage::FilesystemUtil::File storageDirectory;
+    Storage::Layout storageLayout;
+
+    /**
+     * Used to create new sessions.
+     */
+    Client::SessionManager sessionManager;
 
     /**
      * This class behaves mostly like a monitor. This protects all the state in
@@ -1391,6 +1550,12 @@ class RaftConsensus {
     uint64_t lastSnapshotTerm;
 
     /**
+     * The cluster time of the last entry covered by the latest good snapshot,
+     * or 0 if we have no snapshot.
+     */
+    uint64_t lastSnapshotClusterTime;
+
+    /**
      * The size of the latest good snapshot in bytes, or 0 if we have no
      * snapshot.
      */
@@ -1405,7 +1570,7 @@ class RaftConsensus {
     mutable std::unique_ptr<Storage::SnapshotFile::Reader> snapshotReader;
 
     /**
-     * This is used in handleAppendSnapshotChunk when receiving a snapshot from
+     * This is used in handleInstallSnapshot when receiving a snapshot from
      * the current leader. The leader is assumed to send at most one snapshot
      * at a time, and any partial snapshots here are discarded when the term
      * changes.
@@ -1442,6 +1607,11 @@ class RaftConsensus {
      */
     // TODO(ongaro): rename, explain more
     mutable uint64_t currentEpoch;
+
+    /**
+     * Tracks the passage of "cluster time". See ClusterClock.
+     */
+    ClusterClock clusterClock;
 
     /**
      * The earliest time at which #timerThread should begin a new election
@@ -1481,6 +1651,12 @@ class RaftConsensus {
      * after periods of inactivity.
      */
     std::thread timerThread;
+
+    /**
+     * The thread that executes stateMachineUpdaterThreadMain() to append
+     * advance state machine version entries to the log on leaders.
+     */
+    std::thread stateMachineUpdaterThread;
 
     /**
      * The thread that executes stepDownThreadMain() to return to the follower

@@ -25,10 +25,9 @@ package LogCabin.Protocol.Raft;
  */
 enum OpCode {
     // Keep these numbers dense.
-    GET_SUPPORTED_RPC_VERSIONS = 0;
     REQUEST_VOTE = 1;
     APPEND_ENTRIES = 2;
-    APPEND_SNAPSHOT_CHUNK = 3;
+    INSTALL_SNAPSHOT = 3;
 };
 
 /**
@@ -50,9 +49,9 @@ message Server {
      */
     required uint64 server_id = 1;
     /**
-     * The network address of the server.
+     * The network address(es) of the server (comma-delimited).
      */
-    required string address = 2;
+    required string addresses = 2;
 }
 
 /**
@@ -83,6 +82,13 @@ message Configuration {
  */
 enum EntryType {
     /**
+     * This must be the first value in the enum and is never assigned
+     * explicitly. If new values are added, old code will see them as set
+     * and equal to this value (though they will still serialize to the
+     * correct value).
+     */
+    UNKNOWN = 0;
+    /**
      * Stores a 'Configuration', to be used internally by the consensus module.
      */
     CONFIGURATION = 1;
@@ -109,10 +115,18 @@ message Entry {
      * because some storage backends might want to use it.
      */
     optional uint64 index = 5;
+
+    /**
+     * Roughly the number of nanoseconds the cluster has had a leader. This
+     * gets passed onto state machines, where it's used for cleaning up client
+     * sessions. See ClusterClock for more details.
+    */
+    required uint64 cluster_time = 6;
+
     /**
      * See EntryType.
      */
-    required EntryType type = 2;
+    optional EntryType type = 2;
     // the following are mutually exclusive, depending on 'type'
     /**
      * A Configuration to be used internally by the consensus module.
@@ -135,10 +149,6 @@ message RequestVote {
          * callee, the server will respond granted.
          */
         required uint64 server_id = 1;
-        /**
-         * ID of the intended callee.
-         */
-        required uint64 recipient_id = 5;
         /**
          * Caller's term.
          */
@@ -164,6 +174,15 @@ message RequestVote {
          * otherwise.
          */
         required bool granted = 2;
+        /**
+         * Set to true if the caller's log is as up-to-date as the recipient's.
+         * This isn't presently used, but it's easy to return and might be
+         * useful later. In the Pre-Vote extension to Raft described in Section
+         * 9.6 "Preventing disruptions when a server rejoins the cluster" of
+         * Diego Ongaro's PhD dissertation, a server needs to know if its log
+         * is sufficient to get elected before actually starting an election.
+         */
+        optional bool log_ok = 3;
     }
 }
 
@@ -176,10 +195,6 @@ message AppendEntries {
          * ID of leader (caller), so the follower can redirect clients.
          */
         required uint64 server_id = 1;
-        /**
-         * ID of the intended callee.
-         */
-        required uint64 recipient_id = 7;
         /**
          * Caller's term.
          */
@@ -212,22 +227,43 @@ message AppendEntries {
          * True if new entries were added to the log.
          */
         required bool success = 2;
+        /**
+         * The recipient's last log index (after it's applied this RPC's
+         * changes to the log), which might be useful later to speed up finding
+         * where the leader and a behind follower have diverged.
+         */
+        optional uint64 last_log_index = 3;
+
+        message ServerCapabilities {
+            /**
+             * The server's state machine can behave like all state machine
+             * versions between min_supported_state_machine_version and
+             * max_supported_state_machine_version, inclusive.
+             */
+            optional uint32 min_supported_state_machine_version = 1;
+            /**
+             * The server's state machine can behave like all state machine
+             * versions between min_supported_state_machine_version and
+             * max_supported_state_machine_version, inclusive.
+             */
+            optional uint32 max_supported_state_machine_version = 2;
+        }
+        /**
+         * Sent back to inform leader of what code the recipient is running.
+         */
+        optional ServerCapabilities server_capabilities = 4;
     }
 }
 
 /**
- * AppendSnapshotChunk RPC: replicate part of a snapshot file to a follower.
+ * InstallSnapshot RPC: replicate part of a snapshot file to a follower.
  */
-message AppendSnapshotChunk {
+message InstallSnapshot {
     message Request {
         /**
          * ID of leader (caller), so the follower can redirect clients.
          */
         required uint64 server_id = 1;
-        /**
-         * ID of the intended callee.
-         */
-        required uint64 recipient_id = 2;
         /**
          * Caller's term.
          */

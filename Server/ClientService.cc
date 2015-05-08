@@ -29,6 +29,8 @@
 namespace LogCabin {
 namespace Server {
 
+typedef RaftConsensus::ClientResult Result;
+
 ClientService::ClientService(Globals& globals)
     : globals(globals)
 {
@@ -45,11 +47,14 @@ ClientService::handleRPC(RPC::ServerRPC rpc)
 
     // Call the appropriate RPC handler based on the request's opCode.
     switch (rpc.getOpCode()) {
+        case OpCode::GET_SERVER_INFO:
+            getServerInfo(std::move(rpc));
+            break;
         case OpCode::GET_SERVER_STATS:
             getServerStats(std::move(rpc));
             break;
-        case OpCode::GET_SUPPORTED_RPC_VERSIONS:
-            getSupportedRPCVersions(std::move(rpc));
+        case OpCode::VERIFY_RECIPIENT:
+            verifyRecipient(std::move(rpc));
             break;
         case OpCode::GET_CONFIGURATION:
             getConfiguration(std::move(rpc));
@@ -57,14 +62,11 @@ ClientService::handleRPC(RPC::ServerRPC rpc)
         case OpCode::SET_CONFIGURATION:
             setConfiguration(std::move(rpc));
             break;
-        case OpCode::OPEN_SESSION:
-            openSession(std::move(rpc));
+        case OpCode::STATE_MACHINE_COMMAND:
+            stateMachineCommand(std::move(rpc));
             break;
-        case OpCode::READ_ONLY_TREE:
-            readOnlyTreeRPC(std::move(rpc));
-            break;
-        case OpCode::READ_WRITE_TREE:
-            readWriteTreeRPC(std::move(rpc));
+        case OpCode::STATE_MACHINE_QUERY:
+            stateMachineQuery(std::move(rpc));
             break;
         default:
             WARNING("Received RPC request with unknown opcode %u: "
@@ -96,92 +98,20 @@ ClientService::getName() const
 
 
 void
+ClientService::getServerInfo(RPC::ServerRPC rpc)
+{
+    PRELUDE(GetServerInfo);
+    Protocol::Client::Server& info = *response.mutable_server_info();
+    info.set_server_id(globals.raft->serverId);
+    info.set_addresses(globals.raft->serverAddresses);
+    rpc.reply(response);
+}
+
+void
 ClientService::getServerStats(RPC::ServerRPC rpc)
 {
     PRELUDE(GetServerStats);
     *response.mutable_server_stats() = globals.serverStats.getCurrent();
-    rpc.reply(response);
-}
-
-void
-ClientService::getSupportedRPCVersions(RPC::ServerRPC rpc)
-{
-    PRELUDE(GetSupportedRPCVersions);
-    response.set_min_version(1);
-    response.set_max_version(1);
-    rpc.reply(response);
-}
-
-
-typedef RaftConsensus::ClientResult Result;
-typedef Protocol::Client::Command Command;
-typedef Protocol::Client::CommandResponse CommandResponse;
-
-
-std::pair<Result, uint64_t>
-ClientService::submit(RPC::ServerRPC& rpc,
-                      const google::protobuf::Message& command)
-{
-    // TODO(ongaro): Switch from string to binary format. This is probably
-    // really slow to serialize.
-    std::string cmdStr = Core::ProtoBuf::dumpString(command);
-    std::pair<Result, uint64_t> result = globals.raft->replicate(cmdStr);
-    if (result.first == Result::RETRY || result.first == Result::NOT_LEADER) {
-        Protocol::Client::Error error;
-        error.set_error_code(Protocol::Client::Error::NOT_LEADER);
-        std::string leaderHint = globals.raft->getLeaderHint();
-        if (!leaderHint.empty())
-            error.set_leader_hint(leaderHint);
-        rpc.returnError(error);
-    }
-    return result;
-}
-
-Result
-ClientService::catchUpStateMachine(RPC::ServerRPC& rpc)
-{
-    std::pair<Result, uint64_t> result = globals.raft->getLastCommittedId();
-    if (result.first == Result::RETRY || result.first == Result::NOT_LEADER) {
-        Protocol::Client::Error error;
-        error.set_error_code(Protocol::Client::Error::NOT_LEADER);
-        std::string leaderHint = globals.raft->getLeaderHint();
-        if (!leaderHint.empty())
-            error.set_leader_hint(leaderHint);
-        rpc.returnError(error);
-        return result.first;
-    }
-    globals.stateMachine->wait(result.second);
-    return result.first;
-}
-
-bool
-ClientService::getResponse(RPC::ServerRPC& rpc,
-                           uint64_t entryId,
-                           const Protocol::Client::ExactlyOnceRPCInfo& rpcInfo,
-                           Protocol::Client::CommandResponse& response)
-{
-    globals.stateMachine->wait(entryId);
-    bool ok = globals.stateMachine->getResponse(rpcInfo, response);
-    if (!ok) {
-        Protocol::Client::Error error;
-        error.set_error_code(Protocol::Client::Error::SESSION_EXPIRED);
-        rpc.returnError(error);
-        return false;
-    }
-    return true;
-}
-
-void
-ClientService::openSession(RPC::ServerRPC rpc)
-{
-    PRELUDE(OpenSession);
-    Command command;
-    command.set_nanoseconds_since_epoch(Core::Time::getTimeNanos());
-    *command.mutable_open_session() = request;
-    std::pair<Result, uint64_t> result = submit(rpc, command);
-    if (result.first != Result::SUCCESS)
-        return;
-    response.set_client_id(result.second);
     rpc.reply(response);
 }
 
@@ -207,7 +137,7 @@ ClientService::getConfiguration(RPC::ServerRPC rpc)
          ++it) {
         Protocol::Client::Server* server = response.add_servers();
         server->set_server_id(it->server_id());
-        server->set_address(it->address());
+        server->set_addresses(it->addresses());
     }
     rpc.reply(response);
 }
@@ -216,20 +146,8 @@ void
 ClientService::setConfiguration(RPC::ServerRPC rpc)
 {
     PRELUDE(SetConfiguration);
-    Protocol::Raft::SimpleConfiguration newConfiguration;
-    for (auto it = request.new_servers().begin();
-         it != request.new_servers().end();
-         ++it) {
-        Protocol::Raft::Server* s = newConfiguration.add_servers();
-        s->set_server_id(it->server_id());
-        s->set_address(it->address());
-    }
-    Result result = globals.raft->setConfiguration(
-                        request.old_id(),
-                        newConfiguration);
-    if (result == Result::SUCCESS) {
-        response.mutable_ok();
-    } else if (result == Result::RETRY || result == Result::NOT_LEADER) {
+    Result result = globals.raft->setConfiguration(request, response);
+    if (result == Result::RETRY || result == Result::NOT_LEADER) {
         Protocol::Client::Error error;
         error.set_error_code(Protocol::Client::Error::NOT_LEADER);
         std::string leaderHint = globals.raft->getLeaderHint();
@@ -237,42 +155,100 @@ ClientService::setConfiguration(RPC::ServerRPC rpc)
             error.set_leader_hint(leaderHint);
         rpc.returnError(error);
         return;
-    } else if (result == Result::FAIL) {
-        // TODO(ongaro): can't distinguish changed from bad
-        response.mutable_configuration_changed();
     }
     rpc.reply(response);
 }
 
 void
-ClientService::readOnlyTreeRPC(RPC::ServerRPC rpc)
+ClientService::stateMachineCommand(RPC::ServerRPC rpc)
 {
-    PRELUDE(ReadOnlyTree);
-    if (catchUpStateMachine(rpc) != Result::SUCCESS)
+    PRELUDE(StateMachineCommand);
+    Core::Buffer cmdBuffer;
+    rpc.getRequest(cmdBuffer);
+    std::pair<Result, uint64_t> result = globals.raft->replicate(cmdBuffer);
+    if (result.first == Result::RETRY || result.first == Result::NOT_LEADER) {
+        Protocol::Client::Error error;
+        error.set_error_code(Protocol::Client::Error::NOT_LEADER);
+        std::string leaderHint = globals.raft->getLeaderHint();
+        if (!leaderHint.empty())
+            error.set_leader_hint(leaderHint);
+        rpc.returnError(error);
         return;
-    globals.stateMachine->readOnlyTreeRPC(request, response);
+    }
+    assert(result.first == Result::SUCCESS);
+    uint64_t logIndex = result.second;
+    if (!globals.stateMachine->waitForResponse(logIndex, request, response)) {
+        rpc.rejectInvalidRequest();
+        return;
+    }
     rpc.reply(response);
 }
 
 void
-ClientService::readWriteTreeRPC(RPC::ServerRPC rpc)
+ClientService::stateMachineQuery(RPC::ServerRPC rpc)
 {
-    PRELUDE(ReadWriteTree);
-    Command command;
-    command.set_nanoseconds_since_epoch(Core::Time::getTimeNanos());
-    *command.mutable_tree() = request;
-    std::pair<Result, uint64_t> result = submit(rpc, command);
-    if (result.first != Result::SUCCESS)
-        return;
-    CommandResponse commandResponse;
-    if (!getResponse(rpc, result.second, request.exactly_once(),
-                     commandResponse)) {
+    PRELUDE(StateMachineQuery);
+    std::pair<Result, uint64_t> result = globals.raft->getLastCommitIndex();
+    if (result.first == Result::RETRY || result.first == Result::NOT_LEADER) {
+        Protocol::Client::Error error;
+        error.set_error_code(Protocol::Client::Error::NOT_LEADER);
+        std::string leaderHint = globals.raft->getLeaderHint();
+        if (!leaderHint.empty())
+            error.set_leader_hint(leaderHint);
+        rpc.returnError(error);
         return;
     }
-    rpc.reply(commandResponse.tree());
+    assert(result.first == Result::SUCCESS);
+    uint64_t logIndex = result.second;
+    globals.stateMachine->wait(logIndex);
+    if (!globals.stateMachine->query(request, response))
+        rpc.rejectInvalidRequest();
+    rpc.reply(response);
 }
 
+void
+ClientService::verifyRecipient(RPC::ServerRPC rpc)
+{
+    PRELUDE(VerifyRecipient);
 
+    std::string clusterUUID = globals.clusterUUID.getOrDefault();
+    uint64_t serverId = globals.serverId;
+
+    if (!clusterUUID.empty())
+        response.set_cluster_uuid(clusterUUID);
+    response.set_server_id(serverId);
+
+    if (request.has_cluster_uuid() &&
+        !request.cluster_uuid().empty() &&
+        !clusterUUID.empty() &&
+        clusterUUID != request.cluster_uuid()) {
+        response.set_ok(false);
+        response.set_error(Core::StringUtil::format(
+           "Mismatched cluster UUIDs: request intended for %s, "
+           "but this server is in %s",
+           request.cluster_uuid().c_str(),
+           clusterUUID.c_str()));
+    } else if (request.has_server_id() &&
+               serverId != request.server_id()) {
+        response.set_ok(false);
+        response.set_error(Core::StringUtil::format(
+           "Mismatched server IDs: request intended for %lu, "
+           "but this server is %lu",
+           request.server_id(),
+           serverId));
+    } else {
+        response.set_ok(true);
+        if (clusterUUID.empty() &&
+            request.has_cluster_uuid() &&
+            !request.cluster_uuid().empty()) {
+            NOTICE("Adopting cluster UUID %s",
+                   request.cluster_uuid().c_str());
+            globals.clusterUUID.set(request.cluster_uuid());
+            response.set_cluster_uuid(request.cluster_uuid());
+        }
+    }
+    rpc.reply(response);
+}
 
 } // namespace LogCabin::Server
 } // namespace LogCabin

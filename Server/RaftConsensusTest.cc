@@ -1,4 +1,5 @@
 /* Copyright (c) 2012 Stanford University
+ * Copyright (c) 2015 Diego Ongaro
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -31,6 +32,7 @@
 #include "Server/Globals.h"
 #include "Storage/MemoryLog.h"
 #include "Storage/SnapshotFile.h"
+#include "include/LogCabin/Debug.h"
 
 namespace LogCabin {
 namespace Server {
@@ -61,7 +63,7 @@ void
 setAddr(Server& server)
 {
     using Core::StringUtil::format;
-    server.address = format("server%lu", server.serverId);
+    server.addresses = format("server%lu", server.serverId);
 }
 
 uint64_t
@@ -167,9 +169,9 @@ TEST_F(ServerRaftConsensusSimpleConfigurationTest, contains) {
 TEST_F(ServerRaftConsensusSimpleConfigurationTest, forEach) {
     cfg.forEach(setAddr);
     emptyCfg.forEach(setAddr);
-    EXPECT_EQ("server1", cfg.servers.at(0)->address);
-    EXPECT_EQ("server2", cfg.servers.at(1)->address);
-    EXPECT_EQ("server3", cfg.servers.at(2)->address);
+    EXPECT_EQ("server1", cfg.servers.at(0)->addresses);
+    EXPECT_EQ("server2", cfg.servers.at(1)->addresses);
+    EXPECT_EQ("server3", cfg.servers.at(2)->addresses);
 }
 
 TEST_F(ServerRaftConsensusSimpleConfigurationTest, min) {
@@ -205,7 +207,7 @@ class ServerRaftConsensusConfigurationTest
 
 TEST_F(ServerRaftConsensusConfigurationTest, forEach) {
     cfg.forEach(setAddr);
-    EXPECT_EQ("server1", cfg.localServer->address);
+    EXPECT_EQ("server1", cfg.localServer->addresses);
 }
 
 TEST_F(ServerRaftConsensusConfigurationTest, hasVote) {
@@ -237,38 +239,40 @@ TEST_F(ServerRaftConsensusConfigurationTest, quorumMin) {
 
 const char* d =
     "prev_configuration {"
-    "    servers { server_id: 1, address: '127.0.0.1:61023' }"
+    "    servers { server_id: 1, addresses: '127.0.0.1:5254' }"
     "}";
 
 const char* d2 =
     "prev_configuration {"
-    "    servers { server_id: 1, address: '127.0.0.1:61023' }"
+    "    servers { server_id: 1, addresses: '127.0.0.1:5254' }"
     "}"
     "next_configuration {"
-        "servers { server_id: 1, address: '127.0.0.1:61025' }"
+        "servers { server_id: 1, addresses: '127.0.0.1:5256' }"
     "}";
 
 const char* d3 =
     "prev_configuration {"
-    "    servers { server_id: 1, address: '127.0.0.1:61023' }"
-    "    servers { server_id: 2, address: '127.0.0.1:61024' }"
+    "    servers { server_id: 1, addresses: '127.0.0.1:5254' }"
+    "    servers { server_id: 2, addresses: '127.0.0.1:5255' }"
     "}";
 
 const char* d4 =
     "prev_configuration {"
-    "    servers { server_id: 1, address: '127.0.0.1:61023' }"
+    "    servers { server_id: 1, addresses: '127.0.0.1:5254' }"
     "}"
     "next_configuration {"
-        "servers { server_id: 2, address: '127.0.0.1:61024' }"
+        "servers { server_id: 2, addresses: '127.0.0.1:5255' }"
     "}";
 
 TEST_F(ServerRaftConsensusConfigurationTest, reset) {
     std::string expected = Core::StringUtil::toString(cfg);
-    cfg.setConfiguration(1, desc(d2));
+    cfg.setConfiguration(1, desc(d4));
+    std::shared_ptr<Server> s2 = cfg.getServer(2);
     cfg.reset();
     EXPECT_EQ(expected, Core::StringUtil::toString(cfg));
     EXPECT_EQ(0U, cfg.oldServers.servers.size());
     EXPECT_EQ(0U, cfg.newServers.servers.size());
+    EXPECT_TRUE(dynamic_cast<Peer*>(s2.get())->exiting);
 }
 
 TEST_F(ServerRaftConsensusConfigurationTest, setConfiguration) {
@@ -278,7 +282,7 @@ TEST_F(ServerRaftConsensusConfigurationTest, setConfiguration) {
     EXPECT_EQ(d, cfg.description);
     EXPECT_EQ(1U, cfg.oldServers.servers.size());
     EXPECT_EQ(0U, cfg.newServers.servers.size());
-    EXPECT_EQ("127.0.0.1:61023", cfg.oldServers.servers.at(0)->address);
+    EXPECT_EQ("127.0.0.1:5254", cfg.oldServers.servers.at(0)->addresses);
     EXPECT_EQ(1U, cfg.knownServers.size());
 
     cfg.setConfiguration(2, desc(d2));
@@ -287,31 +291,31 @@ TEST_F(ServerRaftConsensusConfigurationTest, setConfiguration) {
     EXPECT_EQ(d2, cfg.description);
     EXPECT_EQ(1U, cfg.oldServers.servers.size());
     EXPECT_EQ(1U, cfg.newServers.servers.size());
-    EXPECT_EQ("127.0.0.1:61025", cfg.oldServers.servers.at(0)->address);
-    EXPECT_EQ("127.0.0.1:61025", cfg.newServers.servers.at(0)->address);
+    EXPECT_EQ("127.0.0.1:5256", cfg.oldServers.servers.at(0)->addresses);
+    EXPECT_EQ("127.0.0.1:5256", cfg.newServers.servers.at(0)->addresses);
     EXPECT_EQ(1U, cfg.knownServers.size());
 }
 
 TEST_F(ServerRaftConsensusConfigurationTest, setStagingServers) {
     cfg.setConfiguration(1, desc(
         "prev_configuration {"
-        "    servers { server_id: 1, address: '127.0.0.1:61023' }"
+        "    servers { server_id: 1, addresses: '127.0.0.1:5254' }"
         "}"));
     cfg.setStagingServers(sdesc(
-        "servers { server_id: 1, address: '127.0.0.1:61025' }"
-        "servers { server_id: 2, address: '127.0.0.1:61027' }"));
+        "servers { server_id: 1, addresses: '127.0.0.1:5256' }"
+        "servers { server_id: 2, addresses: '127.0.0.1:5258' }"));
     EXPECT_EQ(Configuration::State::STAGING, cfg.state);
     EXPECT_EQ(2U, cfg.newServers.servers.size());
     EXPECT_EQ(1U, cfg.newServers.servers.at(0)->serverId);
     EXPECT_EQ(2U, cfg.newServers.servers.at(1)->serverId);
-    EXPECT_EQ("127.0.0.1:61025", cfg.newServers.servers.at(0)->address);
-    EXPECT_EQ("127.0.0.1:61027", cfg.newServers.servers.at(1)->address);
+    EXPECT_EQ("127.0.0.1:5256", cfg.newServers.servers.at(0)->addresses);
+    EXPECT_EQ("127.0.0.1:5258", cfg.newServers.servers.at(1)->addresses);
     EXPECT_EQ(cfg.localServer, cfg.newServers.servers.at(0));
 
     cfg.resetStagingServers();
     EXPECT_EQ(Configuration::State::STABLE, cfg.state);
     EXPECT_EQ(0U, cfg.newServers.servers.size());
-    EXPECT_EQ("127.0.0.1:61023", cfg.localServer->address);
+    EXPECT_EQ("127.0.0.1:5254", cfg.localServer->addresses);
     EXPECT_EQ(1U, cfg.knownServers.size());
 
     // TODO(ongaro): test the gc code at the end of the function
@@ -417,7 +421,7 @@ TEST_F(ServerRaftConsensusConfigurationManagerTest, restoreInvariants) {
 void drainDiskQueue(RaftConsensus& consensus)
 {
     assert(consensus.state == State::LEADER);
-    // This is a while loop since advanceCommittedId can append, causing
+    // This is a while loop since advanceCommitIndex can append, causing
     // logSyncQueued to go true again.
     while (consensus.logSyncQueued) {
         std::unique_ptr<Log::Sync> sync = consensus.log->takeSync();
@@ -425,14 +429,27 @@ void drainDiskQueue(RaftConsensus& consensus)
         sync->wait();
         consensus.configuration->localServer->lastSyncedIndex =
                     sync->lastIndex;
-        consensus.advanceCommittedId();
+        consensus.advanceCommitIndex();
         consensus.log->syncComplete(std::move(sync));
     }
 }
 
+TEST(ServerRaftConsensusClusterClockTest, basics) {
+    Clock::Mocker clockMocker;
+    ClusterClock clock;
+    clock.newEpoch(1000);
+    EXPECT_EQ(1000U, clock.interpolate());
+    Clock::mockValue += std::chrono::nanoseconds(10);
+    EXPECT_EQ(1010U, clock.interpolate());
+    Clock::mockValue += std::chrono::nanoseconds(10);
+    EXPECT_EQ(1020U, clock.leaderStamp());
+}
+
 class ServerRaftConsensusTest : public ::testing::Test {
     ServerRaftConsensusTest()
-        : globals()
+        : storageLayout()
+        , globals()
+        , clockMocker()
         , consensus()
         , entry1()
         , entry2()
@@ -443,39 +460,40 @@ class ServerRaftConsensusTest : public ::testing::Test {
         globals.config.set("electionTimeoutMilliseconds", 5000);
         globals.config.set("heartbeatPeriodMilliseconds", 2500);
         globals.config.set("rpcFailureBackoffMilliseconds", 3000);
+        globals.config.set("use-temporary-storage", "true");
+        globals.config.set("raftDebug", "true");
+        globals.config.set("stateMachineUpdaterBackoffMilliseconds", 0);
+
         startThreads = false;
         consensus.reset(new RaftConsensus(globals));
         consensus->SOFT_RPC_SIZE_LIMIT = 1024;
         consensus->serverId = 1;
-        consensus->serverAddress = "127.0.0.1:61023";
-        Clock::useMockValue = true;
-        Clock::mockValue = Clock::now();
+        consensus->serverAddresses = "127.0.0.1:5254";
 
         entry1.set_term(1);
+        entry1.set_cluster_time(0);
         entry1.set_type(Protocol::Raft::EntryType::CONFIGURATION);
         *entry1.mutable_configuration() = desc(d);
 
         entry2.set_term(2);
+        entry2.set_cluster_time(0);
         entry2.set_type(Protocol::Raft::EntryType::DATA);
         entry2.set_data("hello");
 
         entry3.set_term(3);
+        entry3.set_cluster_time(0);
         entry3.set_type(Protocol::Raft::EntryType::CONFIGURATION);
         *entry3.mutable_configuration() = desc(d2);
 
         entry4.set_term(4);
+        entry4.set_cluster_time(0);
         entry4.set_type(Protocol::Raft::EntryType::DATA);
         entry4.set_data("goodbye");
 
         entry5.set_term(5);
+        entry5.set_cluster_time(0);
         entry5.set_type(Protocol::Raft::EntryType::CONFIGURATION);
         *entry5.mutable_configuration() = desc(d3);
-
-        std::string path = Storage::FilesystemUtil::mkdtemp();
-        consensus->storageDirectory =
-            Storage::FilesystemUtil::File(open(path.c_str(),
-                                               O_RDONLY|O_DIRECTORY),
-                                          path);
     }
     void init() {
         consensus->log.reset(new Storage::MemoryLog());
@@ -486,8 +504,7 @@ class ServerRaftConsensusTest : public ::testing::Test {
         consensus->invariants.checkAll();
         EXPECT_EQ(0U, consensus->invariants.errors);
         startThreads = true;
-        Clock::useMockValue = false;
-        Storage::FilesystemUtil::remove(consensus->storageDirectory.path);
+        consensus.reset();
     }
 
     Peer* getPeer(uint64_t serverId) {
@@ -502,7 +519,9 @@ class ServerRaftConsensusTest : public ::testing::Test {
         return std::dynamic_pointer_cast<Peer>(server);
     }
 
+    Storage::Layout storageLayout;
     Globals globals;
+    Clock::Mocker clockMocker;
     std::unique_ptr<RaftConsensus> consensus;
     Log::Entry entry1;
     Log::Entry entry2;
@@ -520,10 +539,11 @@ class ServerRaftConsensusPTest : public ServerRaftConsensusTest {
         , peerServer()
         , eventLoopThread()
     {
+        consensus->sessionManager.skipVerify = true;
         peerService = std::make_shared<RPC::ServiceMock>();
         peerServer.reset(new RPC::Server(globals.eventLoop,
                                      Protocol::Common::MAX_MESSAGE_LENGTH));
-        RPC::Address address("127.0.0.1:61024", 0);
+        RPC::Address address("127.0.0.1:5255", 0);
         address.refresh(RPC::Address::TimePoint::max());
         EXPECT_EQ("", peerServer->bind(address));
         peerServer->registerService(
@@ -554,6 +574,8 @@ TEST_F(ServerRaftConsensusTest, init_blanklog)
     EXPECT_EQ(Configuration::State::BLANK, consensus->configuration->state);
     EXPECT_EQ(0U, consensus->configuration->id);
     EXPECT_EQ(0U, consensus->commitIndex);
+    EXPECT_EQ(0U, consensus->clusterClock.clusterTimeAtEpoch);
+    EXPECT_EQ(Clock::mockValue, consensus->clusterClock.localTimeAtEpoch);
     EXPECT_LT(Clock::mockValue, consensus->startElectionAt);
     EXPECT_GT(Clock::mockValue +
               milliseconds(consensus->ELECTION_TIMEOUT_MS * 2),
@@ -570,15 +592,18 @@ TEST_F(ServerRaftConsensusTest, init_nonblanklog)
     entry.set_term(1);
     entry.set_type(Protocol::Raft::EntryType::CONFIGURATION);
     *entry.mutable_configuration() = desc(d);
+    entry.set_cluster_time(20);
     log.append({&entry});
 
     Log::Entry entry2;
     entry2.set_term(2);
     entry2.set_type(Protocol::Raft::EntryType::DATA);
     entry2.set_data("hello, world");
+    entry2.set_cluster_time(30);
     log.append({&entry2});
 
     entry.set_term(2);
+    entry.set_cluster_time(40);
     log.append({&entry}); // append configuration entry again
 
     consensus->init();
@@ -586,42 +611,50 @@ TEST_F(ServerRaftConsensusTest, init_nonblanklog)
     EXPECT_EQ(30U, consensus->currentTerm);
     EXPECT_EQ(63U, consensus->votedFor);
     EXPECT_EQ(1U, consensus->configuration->localServer->serverId);
-    EXPECT_EQ("127.0.0.1:61023",
-              consensus->configuration->localServer->address);
+    EXPECT_EQ("127.0.0.1:5254",
+              consensus->configuration->localServer->addresses);
     EXPECT_EQ(Configuration::State::STABLE, consensus->configuration->state);
     EXPECT_EQ(3U, consensus->configuration->id);
     EXPECT_EQ(State::FOLLOWER, consensus->state);
     EXPECT_EQ((std::vector<uint64_t>{1, 3}),
               Core::STLUtil::getKeys(consensus->configurationManager->
                                                     descriptions));
+    EXPECT_EQ(40U, consensus->clusterClock.clusterTimeAtEpoch);
+    EXPECT_EQ(Clock::mockValue, consensus->clusterClock.localTimeAtEpoch);
 }
 
 TEST_F(ServerRaftConsensusTest, init_withsnapshot)
 {
     { // write snapshot
         RaftConsensus c1(globals);
-        c1.storageDirectory =
-            Storage::FilesystemUtil::dup(consensus->storageDirectory);
+        c1.storageLayout = std::move(consensus->storageLayout);
         c1.log.reset(new Storage::MemoryLog());
         c1.serverId = 1;
         c1.init();
         c1.currentTerm = 1;
-        c1.append({&entry1});
-        c1.startNewElection();
+        entry1.set_cluster_time(20);
+        c1.clusterClock.newEpoch(20);
+        c1.append({&entry1}); // index 1
+        c1.startNewElection(); // creates noop entry
         entry1.set_term(2);
-        c1.append({&entry1});
+        entry1.set_cluster_time(30);
+        c1.clusterClock.newEpoch(30);
+        c1.append({&entry1}); // index 2
         drainDiskQueue(c1);
         EXPECT_EQ(3U, c1.commitIndex);
 
         std::unique_ptr<Storage::SnapshotFile::Writer> writer =
             c1.beginSnapshot(2);
-        writer->getStream().WriteLittleEndian32(0xdeadbeef);
+        uint32_t d = 0xdeadbeef;
+        writer->writeRaw(&d, sizeof(d));
         c1.snapshotDone(2, std::move(writer));
+        consensus->storageLayout = std::move(c1.storageLayout);
     }
 
     consensus->log.reset(new Storage::MemoryLog());
     // the log should be discarded when the snapshot is read
-    consensus->log->append({&entry3});
+    entry3.set_cluster_time(50);
+    consensus->log->append({&entry3}); // index 1, term 3
     consensus->init();
     EXPECT_EQ(2U, consensus->lastSnapshotIndex);
     EXPECT_EQ(2U, consensus->lastSnapshotTerm);
@@ -629,6 +662,8 @@ TEST_F(ServerRaftConsensusTest, init_withsnapshot)
     EXPECT_EQ(2U, consensus->log->getLastLogIndex());
     EXPECT_EQ(1U, consensus->configuration->id);
     EXPECT_EQ(d, consensus->configuration->description);
+    EXPECT_EQ(20U, consensus->clusterClock.clusterTimeAtEpoch);
+    EXPECT_EQ(Clock::mockValue, consensus->clusterClock.localTimeAtEpoch);
 }
 
 // TODO(ongaro): low-priority test: exit
@@ -639,10 +674,11 @@ TEST_F(ServerRaftConsensusTest, bootstrapConfiguration)
     consensus->bootstrapConfiguration();
     EXPECT_EQ(1U, consensus->log->getLastLogIndex());
     EXPECT_EQ("term: 1 "
+              "cluster_time: 0 "
               "type: CONFIGURATION "
               "configuration { "
               "  prev_configuration { "
-              "    servers { server_id: 1 address: '127.0.0.1:61023' } "
+              "    servers { server_id: 1 addresses: '127.0.0.1:5254' } "
               "  } "
               "} ",
               consensus->log->getEntry(1));
@@ -696,53 +732,71 @@ TEST_F(ServerRaftConsensusTest, getConfiguration_ok)
     Protocol::Raft::SimpleConfiguration c;
     uint64_t id;
     EXPECT_EQ(ClientResult::SUCCESS, consensus->getConfiguration(c, id));
-    EXPECT_EQ("servers { server_id: 1, address: '127.0.0.1:61023' }", c);
+    EXPECT_EQ("servers { server_id: 1, addresses: '127.0.0.1:5254' }", c);
     EXPECT_EQ(1U, id);
 }
 
-// TODO(ongaro): getLastCommittedId: low-priority test
+// TODO(ongaro): getLastCommitIndex: low-priority test
 
 TEST_F(ServerRaftConsensusTest, getNextEntry)
 {
     init();
+    entry1.set_cluster_time(10);
     consensus->append({&entry1});
+    entry2.set_cluster_time(20);
     consensus->append({&entry2});
+    entry3.set_cluster_time(30);
     consensus->append({&entry3});
+    entry4.set_cluster_time(40);
     consensus->append({&entry4});
+    consensus->clusterClock.newEpoch(40);
     consensus->stepDown(5);
     consensus->commitIndex = 4;
     consensus->stateChanged.callback = std::bind(&RaftConsensus::exit,
                                                  consensus.get());
     RaftConsensus::Entry e1 = consensus->getNextEntry(0);
-    EXPECT_EQ(1U, e1.entryId);
+    EXPECT_EQ(1U, e1.index);
     EXPECT_EQ(RaftConsensus::Entry::SKIP, e1.type);
-    RaftConsensus::Entry e2 = consensus->getNextEntry(e1.entryId);
-    EXPECT_EQ(2U, e2.entryId);
+    EXPECT_EQ(10U, e1.clusterTime);
+    RaftConsensus::Entry e2 = consensus->getNextEntry(e1.index);
+    EXPECT_EQ(2U, e2.index);
     EXPECT_EQ(RaftConsensus::Entry::DATA, e2.type);
-    EXPECT_EQ("hello", e2.data);
-    RaftConsensus::Entry e3 = consensus->getNextEntry(e2.entryId);
-    EXPECT_EQ(3U, e3.entryId);
+    EXPECT_EQ(20U, e2.clusterTime);
+    EXPECT_EQ("hello",
+              std::string(static_cast<const char*>(e2.command.getData()),
+                          e2.command.getLength()));
+    RaftConsensus::Entry e3 = consensus->getNextEntry(e2.index);
+    EXPECT_EQ(3U, e3.index);
     EXPECT_EQ(RaftConsensus::Entry::SKIP, e3.type);
-    RaftConsensus::Entry e4 = consensus->getNextEntry(e3.entryId);
-    EXPECT_EQ(4U, e4.entryId);
+    EXPECT_EQ(30U, e3.clusterTime);
+    RaftConsensus::Entry e4 = consensus->getNextEntry(e3.index);
+    EXPECT_EQ(4U, e4.index);
     EXPECT_EQ(RaftConsensus::Entry::DATA, e4.type);
-    EXPECT_EQ("goodbye", e4.data);
-    EXPECT_THROW(consensus->getNextEntry(e4.entryId),
+    EXPECT_EQ("goodbye",
+              std::string(static_cast<const char*>(e4.command.getData()),
+                          e4.command.getLength()));
+    EXPECT_EQ(40U, e4.clusterTime);
+    EXPECT_THROW(consensus->getNextEntry(e4.index),
                  Core::Util::ThreadInterruptedException);
 }
 
 TEST_F(ServerRaftConsensusTest, getNextEntry_snapshot)
 {
     init();
+    entry1.set_cluster_time(10);
     consensus->append({&entry1});
+    consensus->clusterClock.newEpoch(10);
     consensus->startNewElection();
+    entry1.set_cluster_time(20);
     consensus->append({&entry1});
+    consensus->clusterClock.newEpoch(20);
     drainDiskQueue(*consensus);
     EXPECT_EQ(3U, consensus->commitIndex);
 
     std::unique_ptr<Storage::SnapshotFile::Writer> writer =
         consensus->beginSnapshot(2);
-    writer->getStream().WriteLittleEndian32(0xdeadbeef);
+    uint32_t d = 0xdeadbeef;
+    writer->writeRaw(&d, sizeof(d));
     consensus->snapshotDone(2, std::move(writer));
     consensus->log->truncatePrefix(2);
 
@@ -751,13 +805,17 @@ TEST_F(ServerRaftConsensusTest, getNextEntry_snapshot)
         {"Server/RaftConsensus.cc", "ERROR"}
     });
     RaftConsensus::Entry e1 = consensus->getNextEntry(0);
-    EXPECT_EQ(2U, e1.entryId);
+    EXPECT_EQ(2U, e1.index);
     EXPECT_EQ(RaftConsensus::Entry::SNAPSHOT, e1.type);
+    EXPECT_EQ(10U, e1.clusterTime);
     uint32_t x;
-    EXPECT_TRUE(e1.snapshotReader->getStream().ReadLittleEndian32(&x));
+    EXPECT_EQ(sizeof(x),
+              e1.snapshotReader->readRaw(&x, sizeof(x)));
     EXPECT_EQ(0xdeadbeef, x);
 
-    EXPECT_EQ(3U, consensus->getNextEntry(2).entryId);
+    RaftConsensus::Entry e2 = consensus->getNextEntry(2);
+    EXPECT_EQ(3U, e2.index);
+    EXPECT_EQ(20U, e2.clusterTime);
 }
 
 TEST_F(ServerRaftConsensusTest, getSnapshotStats)
@@ -804,13 +862,16 @@ TEST_F(ServerRaftConsensusTest, handleAppendEntries_callerStale)
     consensus->stepDown(11);
     consensus->handleAppendEntries(request, response);
     EXPECT_EQ("term: 11 "
-              "success: false ",
+              "success: false "
+              "last_log_index: 0"
+              "server_capabilities: {}",
               response);
 }
 
 // this tests the callee stale and leaderId == 0 branches, setElectionTimer(),
-// and heartbeat
-TEST_F(ServerRaftConsensusTest, handleAppendEntries_newLeaderAndCommittedId)
+// and heartbeat.
+// It also makes sure the state machine capabilities are set.
+TEST_F(ServerRaftConsensusTest, handleAppendEntries_newLeaderAndCommitIndex)
 {
     init();
     Protocol::Raft::AppendEntries::Request request;
@@ -827,6 +888,7 @@ TEST_F(ServerRaftConsensusTest, handleAppendEntries_newLeaderAndCommittedId)
     EXPECT_EQ(9U, consensus->currentTerm);
     EXPECT_EQ(0U, consensus->commitIndex);
     Clock::mockValue += milliseconds(10000);
+    consensus->setSupportedStateMachineVersions(10, 20);
     consensus->handleAppendEntries(request, response);
     EXPECT_EQ(3U, consensus->leaderId);
     EXPECT_EQ(State::FOLLOWER, consensus->state);
@@ -838,7 +900,12 @@ TEST_F(ServerRaftConsensusTest, handleAppendEntries_newLeaderAndCommittedId)
               consensus->startElectionAt);
     EXPECT_EQ(1U, consensus->commitIndex);
     EXPECT_EQ("term: 10 "
-              "success: true ",
+              "success: true "
+              "last_log_index: 1"
+              "server_capabilities: { "
+              "  min_supported_state_machine_version: 10 "
+              "  max_supported_state_machine_version: 20 "
+              "}",
               response);
 }
 
@@ -855,7 +922,9 @@ TEST_F(ServerRaftConsensusTest, handleAppendEntries_rejectGap)
     consensus->stepDown(10);
     consensus->handleAppendEntries(request, response);
     EXPECT_EQ("term: 10 "
-              "success: false ",
+              "success: false "
+              "last_log_index: 0"
+              "server_capabilities: {}",
               response);
     EXPECT_EQ(0U, consensus->commitIndex);
     EXPECT_EQ(0U, consensus->log->getLastLogIndex());
@@ -875,7 +944,9 @@ TEST_F(ServerRaftConsensusTest, handleAppendEntries_rejectPrevLogTerm)
     consensus->stepDown(10);
     consensus->handleAppendEntries(request, response);
     EXPECT_EQ("term: 10 "
-              "success: false ",
+              "success: false "
+              "last_log_index: 1"
+              "server_capabilities: {}",
               response);
     EXPECT_EQ(0U, consensus->commitIndex);
     EXPECT_EQ(1U, consensus->log->getLastLogIndex());
@@ -896,14 +967,18 @@ TEST_F(ServerRaftConsensusTest, handleAppendEntries_append)
     e1->set_term(4);
     e1->set_type(Protocol::Raft::EntryType::CONFIGURATION);
     *e1->mutable_configuration() = desc(d3);
+    e1->set_cluster_time(20);
     Protocol::Raft::Entry* e2 = request.add_entries();
     e2->set_term(5);
     e2->set_type(Protocol::Raft::EntryType::DATA);
+    e2->set_cluster_time(30);
     e2->set_data("hello");
     consensus->stepDown(10);
     consensus->handleAppendEntries(request, response);
     EXPECT_EQ("term: 10 "
-              "success: true ",
+              "success: true "
+              "last_log_index: 2"
+              "server_capabilities: {}",
               response);
     EXPECT_EQ(1U, consensus->commitIndex);
     EXPECT_EQ(2U, consensus->log->getLastLogIndex());
@@ -916,6 +991,8 @@ TEST_F(ServerRaftConsensusTest, handleAppendEntries_append)
     EXPECT_EQ(5U, l2.term());
     EXPECT_EQ(Protocol::Raft::EntryType::DATA, l2.type());
     EXPECT_EQ("hello", l2.data());
+    EXPECT_EQ(30U, consensus->clusterClock.clusterTimeAtEpoch);
+    EXPECT_EQ(Clock::mockValue, consensus->clusterClock.localTimeAtEpoch);
 }
 
 TEST_F(ServerRaftConsensusTest, handleAppendEntries_truncate)
@@ -935,7 +1012,9 @@ TEST_F(ServerRaftConsensusTest, handleAppendEntries_truncate)
     consensus->append({&entry1});
     drainDiskQueue(*consensus);
     entry5.set_term(2);
+    entry5.set_cluster_time(80);
     consensus->append({&entry5});
+    consensus->clusterClock.newEpoch(80);
     drainDiskQueue(*consensus); // shouldn't do anything
     EXPECT_EQ(3U, consensus->commitIndex);
 
@@ -954,13 +1033,16 @@ TEST_F(ServerRaftConsensusTest, handleAppendEntries_truncate)
     e2->set_term(3);
     e2->set_type(Protocol::Raft::EntryType::DATA);
     e2->set_data("bar");
+    e2->set_cluster_time(60);
     EXPECT_EQ((std::vector<uint64_t>{1, 3, 4}),
               Core::STLUtil::getKeys(consensus->configurationManager->
                                                             descriptions));
 
     consensus->handleAppendEntries(request, response);
     EXPECT_EQ("term: 3 "
-              "success: true ",
+              "success: true "
+              "last_log_index: 4"
+              "server_capabilities: {}",
               response);
     EXPECT_EQ(3U, consensus->commitIndex);
     EXPECT_EQ(4U, consensus->log->getLastLogIndex());
@@ -977,6 +1059,8 @@ TEST_F(ServerRaftConsensusTest, handleAppendEntries_truncate)
     EXPECT_EQ((std::vector<uint64_t>{1, 3}),
               Core::STLUtil::getKeys(consensus->configurationManager->
                                                             descriptions));
+    EXPECT_EQ(60U, consensus->clusterClock.clusterTimeAtEpoch);
+    EXPECT_EQ(Clock::mockValue, consensus->clusterClock.localTimeAtEpoch);
 }
 
 TEST_F(ServerRaftConsensusTest, handleAppendEntries_duplicate)
@@ -997,7 +1081,9 @@ TEST_F(ServerRaftConsensusTest, handleAppendEntries_duplicate)
     e1->set_data("hello");
     consensus->handleAppendEntries(request, response);
     EXPECT_EQ("term: 10 "
-              "success: true ",
+              "success: true "
+              "last_log_index: 1"
+              "server_capabilities: {}",
               response);
     EXPECT_EQ(1U, consensus->log->getLastLogIndex());
     const Log::Entry& l1 = consensus->log->getEntry(1);
@@ -1006,6 +1092,7 @@ TEST_F(ServerRaftConsensusTest, handleAppendEntries_duplicate)
     EXPECT_EQ("", l1.data());
 }
 
+// entry is part of existing snapshot
 TEST_F(ServerRaftConsensusTest, handleAppendEntries_appendSnapshotOk)
 {
     init();
@@ -1029,7 +1116,9 @@ TEST_F(ServerRaftConsensusTest, handleAppendEntries_appendSnapshotOk)
 
     consensus->handleAppendEntries(request, response);
     EXPECT_EQ("term: 10 "
-              "success: true ",
+              "success: true "
+              "last_log_index: 5"
+              "server_capabilities: {}",
               response);
     EXPECT_EQ(5U, consensus->log->getLastLogIndex());
 }
@@ -1044,11 +1133,11 @@ readEntireFileAsString(const Storage::FilesystemUtil::File& parentDir,
                        f.getFileLength());
 }
 
-TEST_F(ServerRaftConsensusTest, handleAppendSnapshotChunk_callerStale)
+TEST_F(ServerRaftConsensusTest, handleInstallSnapshot_callerStale)
 {
     init();
-    Protocol::Raft::AppendSnapshotChunk::Request request;
-    Protocol::Raft::AppendSnapshotChunk::Response response;
+    Protocol::Raft::InstallSnapshot::Request request;
+    Protocol::Raft::InstallSnapshot::Response response;
     request.set_server_id(3);
     request.set_term(10);
     request.set_last_snapshot_index(1);
@@ -1056,7 +1145,7 @@ TEST_F(ServerRaftConsensusTest, handleAppendSnapshotChunk_callerStale)
     request.set_data("hello");
     request.set_done(false);
     consensus->stepDown(11);
-    consensus->handleAppendSnapshotChunk(request, response);
+    consensus->handleInstallSnapshot(request, response);
     EXPECT_EQ("term: 11 ", response);
 }
 
@@ -1065,8 +1154,8 @@ TEST_F(ServerRaftConsensusTest, handleAppendSnapshotChunk_callerStale)
 TEST_F(ServerRaftConsensusTest, handleSnapshotChunk_newLeader)
 {
     init();
-    Protocol::Raft::AppendSnapshotChunk::Request request;
-    Protocol::Raft::AppendSnapshotChunk::Response response;
+    Protocol::Raft::InstallSnapshot::Request request;
+    Protocol::Raft::InstallSnapshot::Response response;
     request.set_server_id(3);
     request.set_term(10);
     request.set_last_snapshot_index(1);
@@ -1079,7 +1168,7 @@ TEST_F(ServerRaftConsensusTest, handleSnapshotChunk_newLeader)
     EXPECT_EQ(State::CANDIDATE, consensus->state);
     EXPECT_EQ(9U, consensus->currentTerm);
     Clock::mockValue += milliseconds(10000);
-    consensus->handleAppendSnapshotChunk(request, response);
+    consensus->handleInstallSnapshot(request, response);
     EXPECT_EQ(3U, consensus->leaderId);
     EXPECT_EQ(State::FOLLOWER, consensus->state);
     EXPECT_EQ(0U, consensus->votedFor);
@@ -1092,7 +1181,7 @@ TEST_F(ServerRaftConsensusTest, handleSnapshotChunk_newLeader)
     consensus->snapshotWriter->discard();
 }
 
-TEST_F(ServerRaftConsensusTest, handleAppendSnapshotChunk)
+TEST_F(ServerRaftConsensusTest, handleInstallSnapshot)
 {
     init();
     consensus->stepDown(10);
@@ -1105,10 +1194,11 @@ TEST_F(ServerRaftConsensusTest, handleAppendSnapshotChunk)
         consensus->beginSnapshot(1);
     writer->save();
     std::string snapshotContents =
-        readEntireFileAsString(consensus->storageDirectory, "snapshot");
+        readEntireFileAsString(consensus->storageLayout.snapshotDir,
+                               "snapshot");
 
-    Protocol::Raft::AppendSnapshotChunk::Request request;
-    Protocol::Raft::AppendSnapshotChunk::Response response;
+    Protocol::Raft::InstallSnapshot::Request request;
+    Protocol::Raft::InstallSnapshot::Response response;
     request.set_server_id(3);
     request.set_term(10);
     request.set_last_snapshot_index(1);
@@ -1117,7 +1207,7 @@ TEST_F(ServerRaftConsensusTest, handleAppendSnapshotChunk)
     request.set_done(false);
 
     // useful data, but not done yet
-    consensus->handleAppendSnapshotChunk(request, response);
+    consensus->handleInstallSnapshot(request, response);
     EXPECT_EQ("term: 10 ", response);
     EXPECT_EQ(0U, consensus->lastSnapshotIndex);
     EXPECT_TRUE(bool(consensus->snapshotWriter));
@@ -1126,7 +1216,7 @@ TEST_F(ServerRaftConsensusTest, handleAppendSnapshotChunk)
     LogCabin::Core::Debug::setLogPolicy({
         {"Server/RaftConsensus.cc", "ERROR"}
     });
-    consensus->handleAppendSnapshotChunk(request, response);
+    consensus->handleInstallSnapshot(request, response);
     LogCabin::Core::Debug::setLogPolicy({
         {"Server/RaftConsensus.cc", "WARNING"}
     });
@@ -1138,15 +1228,16 @@ TEST_F(ServerRaftConsensusTest, handleAppendSnapshotChunk)
     request.set_byte_offset(snapshotContents.size());
     request.set_data("hello world!");
     request.set_done(true);
-    consensus->handleAppendSnapshotChunk(request, response);
+    consensus->handleInstallSnapshot(request, response);
     EXPECT_EQ("term: 10 ", response);
     EXPECT_EQ(1U, consensus->lastSnapshotIndex);
     EXPECT_FALSE(bool(consensus->snapshotWriter));
-    std::string helloWorld;
-    EXPECT_TRUE(consensus->snapshotReader->getStream()
-                  .ReadString(&helloWorld,
-                              int(strlen("hello world!"))));
-    EXPECT_EQ("hello world!", helloWorld);
+    char helloWorld[13];
+    EXPECT_EQ(sizeof(helloWorld) - 1,
+              consensus->snapshotReader->readRaw(helloWorld,
+                                                 sizeof(helloWorld) - 1));
+    helloWorld[sizeof(helloWorld) - 1] = '\0';
+    EXPECT_STREQ("hello world!", helloWorld);
 
     // TODO(ongaro): Test that the configuration is update accordingly
 }
@@ -1168,7 +1259,8 @@ TEST_F(ServerRaftConsensusTest, handleRequestVote)
     EXPECT_EQ(State::LEADER, consensus->state);
     consensus->handleRequestVote(request, response);
     EXPECT_EQ("term: 1 "
-              "granted: false ",
+              "granted: false "
+              "log_ok: true",
               response);
     EXPECT_EQ(State::LEADER, consensus->state);
     EXPECT_EQ(1U, consensus->currentTerm);
@@ -1183,7 +1275,8 @@ TEST_F(ServerRaftConsensusTest, handleRequestVote)
     Clock::mockValue += milliseconds(2);
     consensus->handleRequestVote(request, response);
     EXPECT_EQ("term: 12 "
-              "granted: false ",
+              "granted: false "
+              "log_ok: false",
               response);
     EXPECT_EQ(State::FOLLOWER, consensus->state);
     // check that the election timer was not reset
@@ -1195,7 +1288,8 @@ TEST_F(ServerRaftConsensusTest, handleRequestVote)
     consensus->handleRequestVote(request, response);
     EXPECT_EQ(State::FOLLOWER, consensus->state);
     EXPECT_EQ("term: 12 "
-              "granted: true ",
+              "granted: true "
+              "log_ok: true",
               response);
     EXPECT_EQ(3U, consensus->votedFor);
 }
@@ -1212,7 +1306,8 @@ TEST_F(ServerRaftConsensusTest, handleRequestVote_termStale)
     consensus->stepDown(11);
     consensus->handleRequestVote(request, response);
     EXPECT_EQ("term: 11 "
-              "granted: false ",
+              "granted: false "
+              "log_ok: true",
               response);
     Clock::mockValue += milliseconds(100000);
     // don't hand out vote, don't reset follower timer
@@ -1225,8 +1320,11 @@ TEST_F(ServerRaftConsensusTest, handleRequestVote_termStale)
 TEST_F(ServerRaftConsensusTest, setConfiguration_notLeader)
 {
     init();
-    Protocol::Raft::SimpleConfiguration c;
-    EXPECT_EQ(ClientResult::NOT_LEADER, consensus->setConfiguration(1, c));
+    Protocol::Client::SetConfiguration::Request request;
+    Protocol::Client::SetConfiguration::Response response;
+    request.set_old_id(1);
+    EXPECT_EQ(ClientResult::NOT_LEADER,
+              consensus->setConfiguration(request, response));
 }
 
 TEST_F(ServerRaftConsensusTest, setConfiguration_changed)
@@ -1235,12 +1333,22 @@ TEST_F(ServerRaftConsensusTest, setConfiguration_changed)
     consensus->append({&entry1});
     consensus->startNewElection();
     drainDiskQueue(*consensus);
-    Protocol::Raft::SimpleConfiguration c;
-    EXPECT_EQ(ClientResult::FAIL, consensus->setConfiguration(0, c));
+
+    Protocol::Client::SetConfiguration::Request request;
+    Protocol::Client::SetConfiguration::Response response;
+    request.set_old_id(0);
+    EXPECT_EQ(ClientResult::FAIL,
+              consensus->setConfiguration(request, response));
+    EXPECT_TRUE(response.has_configuration_changed());
+
     consensus->configuration->setStagingServers(sdesc(""));
     consensus->stateChanged.notify_all();
     EXPECT_EQ(Configuration::State::STAGING, consensus->configuration->state);
-    EXPECT_EQ(ClientResult::FAIL, consensus->setConfiguration(1, c));
+
+    response.Clear();
+    EXPECT_EQ(ClientResult::FAIL,
+              consensus->setConfiguration(request, response));
+    EXPECT_TRUE(response.has_configuration_changed());
 }
 
 void
@@ -1260,11 +1368,25 @@ TEST_F(ServerRaftConsensusTest, setConfiguration_catchupFail)
     consensus->append({&entry1});
     consensus->startNewElection();
     drainDiskQueue(*consensus);
-    Protocol::Raft::SimpleConfiguration c = sdesc(
-        "servers { server_id: 2, address: '127.0.0.1:61024' }");
     consensus->stateChanged.callback = std::bind(setConfigurationHelper,
                                                  consensus.get());
-    EXPECT_EQ(ClientResult::FAIL, consensus->setConfiguration(1, c));
+
+    Protocol::Client::SetConfiguration::Request request;
+    Protocol::Client::SetConfiguration::Response response;
+    request = Core::ProtoBuf::fromString<
+        Protocol::Client::SetConfiguration::Request>(
+        "old_id: 1 "
+        "new_servers { server_id: 2, addresses: '127.0.0.1:5255' }");
+
+    EXPECT_EQ(ClientResult::FAIL,
+              consensus->setConfiguration(request, response));
+    EXPECT_EQ("configuration_bad { "
+                  "bad_servers { "
+                      "server_id: 2 "
+                      "addresses: '127.0.0.1:5255' "
+                  "}"
+              "}",
+              response);
 }
 
 void
@@ -1283,20 +1405,27 @@ TEST_F(ServerRaftConsensusTest, setConfiguration_replicateFail)
     consensus->append({&entry1});
     consensus->stepDown(1);
     consensus->startNewElection();
-    Protocol::Raft::SimpleConfiguration c = sdesc(
-        "servers { server_id: 2, address: '127.0.0.1:61024' }");
     consensus->stateChanged.callback = std::bind(setConfigurationHelper2,
                                                  consensus.get());
-    EXPECT_EQ(ClientResult::NOT_LEADER, consensus->setConfiguration(1, c));
+    Protocol::Client::SetConfiguration::Request request;
+    Protocol::Client::SetConfiguration::Response response;
+    request = Core::ProtoBuf::fromString<
+        Protocol::Client::SetConfiguration::Request>(
+        "old_id: 1 "
+        "new_servers { server_id: 2, addresses: '127.0.0.1:5255' }");
+
+    EXPECT_EQ(ClientResult::NOT_LEADER,
+              consensus->setConfiguration(request, response));
+
     // 1: entry1, 2: no-op, 3: transitional
     EXPECT_EQ(3U, consensus->log->getLastLogIndex());
     const Log::Entry& l2 = consensus->log->getEntry(3);
     EXPECT_EQ(Protocol::Raft::EntryType::CONFIGURATION, l2.type());
     EXPECT_EQ("prev_configuration {"
-                  "servers { server_id: 1, address: '127.0.0.1:61023' }"
+                  "servers { server_id: 1, addresses: '127.0.0.1:5254' }"
               "}"
               "next_configuration {"
-                  "servers { server_id: 2, address: '127.0.0.1:61024' }"
+                  "servers { server_id: 2, addresses: '127.0.0.1:5255' }"
               "}",
               l2.configuration());
 }
@@ -1309,15 +1438,22 @@ TEST_F(ServerRaftConsensusTest, setConfiguration_replicateOkJustUs)
     consensus->startNewElection();
     consensus->leaderDiskThread =
         std::thread(&RaftConsensus::leaderDiskThreadMain, consensus.get());
-    Protocol::Raft::SimpleConfiguration c = sdesc(
-        "servers { server_id: 1, address: '127.0.0.1:61024' }");
-    EXPECT_EQ(ClientResult::SUCCESS, consensus->setConfiguration(1, c));
+    Protocol::Client::SetConfiguration::Request request;
+    Protocol::Client::SetConfiguration::Response response;
+    request = Core::ProtoBuf::fromString<
+        Protocol::Client::SetConfiguration::Request>(
+        "old_id: 1 "
+        "new_servers { server_id: 1, addresses: '127.0.0.1:5255' }");
+
+    EXPECT_EQ(ClientResult::SUCCESS,
+              consensus->setConfiguration(request, response));
+
     // 1: entry1, 2: no-op, 3: transitional, 4: new config
     EXPECT_EQ(4U, consensus->log->getLastLogIndex());
     const Log::Entry& l3 = consensus->log->getEntry(4);
     EXPECT_EQ(Protocol::Raft::EntryType::CONFIGURATION, l3.type());
     EXPECT_EQ("prev_configuration {"
-                  "servers { server_id: 1, address: '127.0.0.1:61024' }"
+                  "servers { server_id: 1, addresses: '127.0.0.1:5255' }"
               "}",
               l3.configuration());
 }
@@ -1337,15 +1473,15 @@ class SetConfigurationHelper3 {
         } else if (iter == 2) { // no-op entry
             drainDiskQueue(*consensus);
             peer->lastAgreeIndex = 2;
-            consensus->advanceCommittedId();
+            consensus->advanceCommitIndex();
         } else if (iter == 3) { // transitional entry
             drainDiskQueue(*consensus);
             peer->lastAgreeIndex = 3;
-            consensus->advanceCommittedId();
+            consensus->advanceCommitIndex();
         } else if (iter == 4) { // new configuration entry
             drainDiskQueue(*consensus);
             peer->lastAgreeIndex = 4;
-            consensus->advanceCommittedId();
+            consensus->advanceCommitIndex();
         } else {
             FAIL();
         }
@@ -1367,12 +1503,49 @@ TEST_F(ServerRaftConsensusTest, setConfiguration_replicateOkNontrivial)
     consensus->stepDown(1);
     consensus->startNewElection();
     drainDiskQueue(*consensus);
-    Protocol::Raft::SimpleConfiguration c = sdesc(
-        "servers { server_id: 2, address: '127.0.0.1:61024' }");
     consensus->stateChanged.callback =
         SetConfigurationHelper3(consensus.get());
-    EXPECT_EQ(ClientResult::SUCCESS, consensus->setConfiguration(1, c));
+    Protocol::Client::SetConfiguration::Request request;
+    Protocol::Client::SetConfiguration::Response response;
+    request = Core::ProtoBuf::fromString<
+        Protocol::Client::SetConfiguration::Request>(
+        "old_id: 1 "
+        "new_servers { server_id: 2, addresses: '127.0.0.1:5255' }");
+    EXPECT_EQ(ClientResult::SUCCESS,
+              consensus->setConfiguration(request, response));
     EXPECT_EQ(4U, consensus->log->getLastLogIndex());
+}
+
+TEST_F(ServerRaftConsensusTest, setSupportedStateMachineVersions)
+{
+    init();
+    auto& s = *consensus->configuration->localServer;
+    EXPECT_FALSE(s.haveStateMachineSupportedVersions);
+    consensus->stateChanged.notificationCount = 0;
+
+    consensus->setSupportedStateMachineVersions(10, 20);
+    EXPECT_TRUE(s.haveStateMachineSupportedVersions);
+    EXPECT_EQ(10U, s.minStateMachineVersion);
+    EXPECT_EQ(20U, s.maxStateMachineVersion);
+    EXPECT_EQ(1U, consensus->stateChanged.notificationCount);
+
+    consensus->setSupportedStateMachineVersions(10, 20);
+    EXPECT_TRUE(s.haveStateMachineSupportedVersions);
+    EXPECT_EQ(10U, s.minStateMachineVersion);
+    EXPECT_EQ(20U, s.maxStateMachineVersion);
+    EXPECT_EQ(1U, consensus->stateChanged.notificationCount);
+
+    consensus->setSupportedStateMachineVersions(10, 21);
+    EXPECT_TRUE(s.haveStateMachineSupportedVersions);
+    EXPECT_EQ(10U, s.minStateMachineVersion);
+    EXPECT_EQ(21U, s.maxStateMachineVersion);
+    EXPECT_EQ(2U, consensus->stateChanged.notificationCount);
+
+    consensus->setSupportedStateMachineVersions(11, 21);
+    EXPECT_TRUE(s.haveStateMachineSupportedVersions);
+    EXPECT_EQ(11U, s.minStateMachineVersion);
+    EXPECT_EQ(21U, s.maxStateMachineVersion);
+    EXPECT_EQ(3U, consensus->stateChanged.notificationCount);
 }
 
 TEST_F(ServerRaftConsensusTest, beginSnapshot)
@@ -1387,11 +1560,17 @@ TEST_F(ServerRaftConsensusTest, beginSnapshot)
 
     // satisfy commitIndex >= lastSnapshotIndex invariant
     consensus->currentTerm = 1;
+    entry1.set_cluster_time(10);
+    consensus->clusterClock.newEpoch(10);
     consensus->append({&entry1});
     consensus->startNewElection();
+    entry2.set_cluster_time(30);
+    consensus->clusterClock.newEpoch(30);
     consensus->append({&entry2});
     drainDiskQueue(*consensus);
     entry5.set_term(2);
+    entry5.set_cluster_time(40);
+    consensus->clusterClock.newEpoch(40);
     consensus->append({&entry5});
     drainDiskQueue(*consensus);
     EXPECT_EQ(3U, consensus->commitIndex);
@@ -1399,7 +1578,8 @@ TEST_F(ServerRaftConsensusTest, beginSnapshot)
     // call beginSnapshot
     std::unique_ptr<Storage::SnapshotFile::Writer> writer =
         consensus->beginSnapshot(3);
-    writer->getStream().WriteLittleEndian32(0xdeadbeef);
+    uint32_t d = 0xdeadbeef;
+    writer->writeRaw(&d, sizeof(d));
     writer->save();
 
     // make sure it had the right side-effects
@@ -1411,8 +1591,10 @@ TEST_F(ServerRaftConsensusTest, beginSnapshot)
     consensus->readSnapshot();
     EXPECT_EQ(3U, consensus->lastSnapshotIndex);
     EXPECT_EQ(2U, consensus->lastSnapshotTerm);
+    EXPECT_EQ(30U, consensus->lastSnapshotClusterTime);
     uint32_t x = 0;
-    EXPECT_TRUE(consensus->snapshotReader->getStream().ReadLittleEndian32(&x));
+    EXPECT_EQ(sizeof(x),
+              consensus->snapshotReader->readRaw(&x, sizeof(x)));
     EXPECT_EQ(0xdeadbeef, x);
     EXPECT_EQ((std::vector<uint64_t>{1, 4}),
               Core::STLUtil::getKeys(consensus->configurationManager->
@@ -1425,8 +1607,12 @@ TEST_F(ServerRaftConsensusTest, snapshotDone)
 
     // satisfy commitIndex >= lastSnapshotIndex invariant
     consensus->currentTerm = 1;
+    entry1.set_cluster_time(60);
+    consensus->clusterClock.newEpoch(60);
     consensus->append({&entry1});
     consensus->startNewElection();
+    entry2.set_cluster_time(80);
+    consensus->clusterClock.newEpoch(80);
     consensus->append({&entry2});
     drainDiskQueue(*consensus);
     EXPECT_EQ(3U, consensus->commitIndex);
@@ -1441,6 +1627,7 @@ TEST_F(ServerRaftConsensusTest, snapshotDone)
     consensus->snapshotDone(3, std::move(saveWriter));
     EXPECT_EQ(3U, consensus->lastSnapshotIndex);
     EXPECT_EQ(2U, consensus->lastSnapshotTerm);
+    EXPECT_EQ(80U, consensus->lastSnapshotClusterTime);
     // Don't really know exactly how big the snapshot will be in bytes, but
     // between 10 and 1K seems reasonable.
     EXPECT_LT(10U, consensus->lastSnapshotBytes);
@@ -1451,7 +1638,116 @@ TEST_F(ServerRaftConsensusTest, snapshotDone)
     consensus->snapshotDone(2, std::move(discardWriter));
     EXPECT_EQ(3U, consensus->lastSnapshotIndex);
     EXPECT_EQ(2U, consensus->lastSnapshotTerm);
+    EXPECT_EQ(80U, consensus->lastSnapshotClusterTime);
     EXPECT_EQ(1U, consensus->configuration->id);
+}
+
+class StateMachineUpdaterThreadMainHelper {
+    StateMachineUpdaterThreadMainHelper(
+            RaftConsensus& consensus,
+            Peer& peer)
+        : consensus(consensus)
+        , iter(1)
+        , peer(peer)
+    {
+    }
+    void operator()() {
+        NOTICE("iter: %lu", iter);
+        // not leader: go to sleep
+        if (iter == 1) {
+            consensus.startNewElection();
+            consensus.becomeLeader();
+        // leader but missing info from peer: go to sleep
+        } else if (iter == 2) {
+            EXPECT_EQ(RaftConsensus::State::LEADER, consensus.state);
+            peer.haveStateMachineSupportedVersions = true;
+            peer.minStateMachineVersion = 4;
+            peer.maxStateMachineVersion = 9;
+            LogCabin::Core::Debug::setLogPolicy({
+                {"", "SILENT"}
+            });
+        // leader and all info but servers don't overlap: go to sleep
+        } else if (iter == 3) {
+            LogCabin::Core::Debug::setLogPolicy({
+                {"", "WARNING"}
+            });
+            consensus.setSupportedStateMachineVersions(1, 4);
+            EXPECT_EQ(2U, consensus.log->getLastLogIndex());
+        // leader and all info and servers overlap on new version: append
+        // entry. the next wait is in replicateEntry
+        } else if (iter == 4) {
+            std::string commandString = consensus.log->getEntry(3).data();
+            Core::Buffer commandBuffer(
+                const_cast<char*>(commandString.data()),
+                commandString.length(),
+                NULL);
+            Protocol::Client::StateMachineCommand::Request command;
+            EXPECT_TRUE(Core::ProtoBuf::parse(commandBuffer, command));
+            EXPECT_EQ("advance_version { "
+                      "  requested_version: 4 "
+                      "}", command);
+            consensus.stepDown(7);
+            LogCabin::Core::Debug::setLogPolicy({
+                {"", "ERROR"}
+            });
+        // replicateEntry failed because lost leadership: issue warning
+        } else if (iter == 5) {
+            LogCabin::Core::Debug::setLogPolicy({
+                {"", "WARNING"}
+            });
+            EXPECT_EQ(3U, consensus.log->getLastLogIndex());
+            consensus.startNewElection();
+            consensus.becomeLeader();
+        // leader and all info and servers overlap on new version: append
+        // another entry for v4. the next wait is in replicateEntry
+        } else if (iter == 6) {
+            std::string commandString = consensus.log->getEntry(5).data();
+            Core::Buffer commandBuffer(
+                const_cast<char*>(commandString.data()),
+                commandString.length(),
+                NULL);
+            Protocol::Client::StateMachineCommand::Request command;
+            EXPECT_TRUE(Core::ProtoBuf::parse(commandBuffer, command));
+            EXPECT_EQ("advance_version { "
+                      "  requested_version: 4 "
+                      "}", command);
+            peer.lastAgreeIndex = 5;
+            consensus.commitIndex = 5;
+            consensus.stateChanged.notify_all(); // to satisfy RaftInvariants
+        // leader and all info and servers overlap on current version: go to
+        // sleep
+        } else if (iter == 7) {
+            EXPECT_EQ(5U, consensus.log->getLastLogIndex());
+            consensus.exit();
+        }
+        ++iter;
+    }
+    RaftConsensus& consensus;
+    uint64_t iter;
+    Peer& peer;
+};
+
+TEST_F(ServerRaftConsensusTest, stateMachineUpdaterThreadMain)
+{
+    // Log:
+    // 1,t5: cfg { server 1:5254, server 2:5255 }
+    // After iter1:
+    // 2,t6: no op
+    // After iter3:
+    // 3,t6: data { advance state machine to version 4 }
+    // After iter5:
+    // 4,t7: no op
+    // 5,t7: data { advance state machine to version 4 }
+    init();
+    consensus->stepDown(5);
+    *entry5.mutable_configuration() = desc(d3);
+    consensus->append({&entry5});
+    consensus->setSupportedStateMachineVersions(1, 3);
+    std::shared_ptr<Peer> peer = getPeerRef(2);
+    StateMachineUpdaterThreadMainHelper helper(*consensus, *peer);
+    consensus->stateChanged.callback = std::ref(helper);
+    consensus->stateMachineUpdaterThreadMain();
+    EXPECT_EQ(8U, helper.iter);
 }
 
 class BumpTermSync : public Log::Sync {
@@ -1520,7 +1816,7 @@ TEST_F(ServerRaftConsensusTest, leaderDiskThreadMain)
     // iter 5: exit
 
     // Log:
-    // 1,t1: cfg { server 1:61023 }
+    // 1,t1: cfg { server 1:5254 }
     // 2,t6: no op
 
     init();
@@ -1563,7 +1859,6 @@ TEST_F(ServerRaftConsensusTest, timerThreadMain)
 {
     init();
     Clock::mockValue = consensus->startElectionAt - milliseconds(1);
-    Clock::useMockValue = true;
     consensus->stepDown(5);
     consensus->append({&entry1});
     consensus->append({&entry5});
@@ -1647,11 +1942,11 @@ TEST_F(ServerRaftConsensusPTest, peerThreadMain)
     consensus->stepDown(5);
     *entry5.mutable_configuration() = desc(
         "prev_configuration {"
-        "    servers { server_id: 1, address: '127.0.0.1:61023' }"
-        "    servers { server_id: 2, address: '127.0.0.1:61024' }"
-        "    servers { server_id: 3, address: '127.0.0.1:61024' }"
-        "    servers { server_id: 4, address: '127.0.0.1:61024' }"
-        "    servers { server_id: 5, address: '127.0.0.1:61024' }"
+        "    servers { server_id: 1, addresses: '127.0.0.1:5254' }"
+        "    servers { server_id: 2, addresses: '127.0.0.1:5255' }"
+        "    servers { server_id: 3, addresses: '127.0.0.1:5255' }"
+        "    servers { server_id: 4, addresses: '127.0.0.1:5255' }"
+        "    servers { server_id: 5, addresses: '127.0.0.1:5255' }"
         "}");
     consensus->append({&entry5});
     std::shared_ptr<Peer> peer = getPeerRef(2);
@@ -1662,7 +1957,6 @@ TEST_F(ServerRaftConsensusPTest, peerThreadMain)
     // first requestVote RPC succeeds
     Protocol::Raft::RequestVote::Request vrequest;
     vrequest.set_server_id(1);
-    vrequest.set_recipient_id(2);
     vrequest.set_term(6);
     vrequest.set_last_log_term(5);
     vrequest.set_last_log_index(1);
@@ -1675,7 +1969,6 @@ TEST_F(ServerRaftConsensusPTest, peerThreadMain)
     // first appendEntries sends heartbeat (accept it)
     Protocol::Raft::AppendEntries::Request arequest;
     arequest.set_server_id(1);
-    arequest.set_recipient_id(2);
     arequest.set_term(6);
     arequest.set_prev_log_term(6);
     arequest.set_prev_log_index(2);
@@ -1769,7 +2062,7 @@ TEST_F(ServerRaftConsensusTest, stepDownThreadMain_twoServers)
     consensus->stepDownThreadMain();
 }
 
-TEST_F(ServerRaftConsensusTest, advanceCommittedId_noAdvanceMissingQuorum)
+TEST_F(ServerRaftConsensusTest, advanceCommitIndex_noAdvanceMissingQuorum)
 {
     init();
     consensus->append({&entry1});
@@ -1777,14 +2070,14 @@ TEST_F(ServerRaftConsensusTest, advanceCommittedId_noAdvanceMissingQuorum)
     consensus->stepDown(5);
     consensus->startNewElection();
     consensus->becomeLeader();
-    consensus->advanceCommittedId();
+    consensus->advanceCommitIndex();
     drainDiskQueue(*consensus);
     EXPECT_EQ(State::LEADER, consensus->state);
     EXPECT_EQ(0U, consensus->commitIndex);
 }
 
 TEST_F(ServerRaftConsensusTest,
-       advanceCommittedId_noAdvanceNoEntryFromCurrentTerm)
+       advanceCommitIndex_noAdvanceNoEntryFromCurrentTerm)
 {
     init();
     consensus->append({&entry1});
@@ -1794,15 +2087,15 @@ TEST_F(ServerRaftConsensusTest,
     consensus->becomeLeader();
     drainDiskQueue(*consensus);
     getPeer(2)->lastAgreeIndex = 2;
-    consensus->advanceCommittedId();
+    consensus->advanceCommitIndex();
     EXPECT_EQ(State::LEADER, consensus->state);
     EXPECT_EQ(0U, consensus->commitIndex);
     getPeer(2)->lastAgreeIndex = 3;
-    consensus->advanceCommittedId();
+    consensus->advanceCommitIndex();
     EXPECT_EQ(3U, consensus->commitIndex);
 }
 
-TEST_F(ServerRaftConsensusTest, advanceCommittedId_commitCfgWithoutSelf)
+TEST_F(ServerRaftConsensusTest, advanceCommitIndex_commitCfgWithoutSelf)
 {
     // Log:
     // 1,t1: cfg { server 1 }
@@ -1816,32 +2109,32 @@ TEST_F(ServerRaftConsensusTest, advanceCommittedId_commitCfgWithoutSelf)
     entry1.set_term(6);
     *entry1.mutable_configuration() = desc(
         "prev_configuration {"
-        "    servers { server_id: 1, address: '127.0.0.1:61023' }"
+        "    servers { server_id: 1, addresses: '127.0.0.1:5254' }"
         "}"
         "next_configuration {"
-            "servers { server_id: 2, address: '127.0.0.1:61024' }"
+            "servers { server_id: 2, addresses: '127.0.0.1:5255' }"
         "}");
     consensus->append({&entry1});
     drainDiskQueue(*consensus);
     getPeer(2)->lastAgreeIndex = 3;
-    consensus->advanceCommittedId();
+    consensus->advanceCommitIndex();
     EXPECT_EQ(3U, consensus->commitIndex);
     EXPECT_EQ(4U, consensus->log->getLastLogIndex());
     EXPECT_EQ(State::LEADER, consensus->state);
 
     getPeer(2)->lastAgreeIndex = 4;
-    consensus->advanceCommittedId();
+    consensus->advanceCommitIndex();
     EXPECT_EQ(4U, consensus->commitIndex);
     EXPECT_EQ(State::FOLLOWER, consensus->state);
 }
 
-TEST_F(ServerRaftConsensusTest, advanceCommittedId_commitTransitionToSelf)
+TEST_F(ServerRaftConsensusTest, advanceCommitIndex_commitTransitionToSelf)
 {
     // Log:
-    // 1,t1: cfg { server 1:61023 }
+    // 1,t1: cfg { server 1:5254 }
     // 2,t6: no op
-    // 3,t6: transitional cfg { server 1:61023 } -> { server 1:61025 }
-    // 4,t6: cfg { server 1:61025 }
+    // 3,t6: transitional cfg { server 1:5254 } -> { server 1:5256 }
+    // 4,t6: cfg { server 1:5256 }
     init();
     consensus->stepDown(5);
     consensus->append({&entry1});
@@ -1856,7 +2149,7 @@ TEST_F(ServerRaftConsensusTest, advanceCommittedId_commitTransitionToSelf)
     const Log::Entry& l3 = consensus->log->getEntry(4);
     EXPECT_EQ(Protocol::Raft::EntryType::CONFIGURATION, l3.type());
     EXPECT_EQ("prev_configuration {"
-                  "servers { server_id: 1, address: '127.0.0.1:61025' }"
+                  "servers { server_id: 1, addresses: '127.0.0.1:5256' }"
               "}",
               l3.configuration());
 }
@@ -1917,24 +2210,27 @@ class ServerRaftConsensusPATest : public ServerRaftConsensusPTest {
         peer->forceHeartbeat = false;
 
         request.set_server_id(1);
-        request.set_recipient_id(2);
         request.set_term(6);
         request.set_prev_log_term(0);
         request.set_prev_log_index(0);
         request.set_commit_index(3);
         Protocol::Raft::Entry* e1 = request.add_entries();
         e1->set_term(1);
+        e1->set_cluster_time(0);
         e1->set_type(Protocol::Raft::EntryType::CONFIGURATION);
         *e1->mutable_configuration() = entry1.configuration();
         Protocol::Raft::Entry* e2 = request.add_entries();
         e2->set_term(2);
+        e2->set_cluster_time(0);
         e2->set_type(Protocol::Raft::EntryType::DATA);
         e2->set_data(entry2.data());
         Protocol::Raft::Entry* enop = request.add_entries();
         enop->set_term(6);
+        enop->set_cluster_time(0);
         enop->set_type(Protocol::Raft::EntryType::NOOP);
         Protocol::Raft::Entry* e3 = request.add_entries();
         e3->set_term(6);
+        e3->set_cluster_time(0);
         e3->set_type(Protocol::Raft::EntryType::CONFIGURATION);
         *e3->mutable_configuration() = entry5.configuration();
 
@@ -2028,7 +2324,21 @@ TEST_F(ServerRaftConsensusPATest, appendEntries_ok)
     // TODO(ongaro): test catchup code
 }
 
-// test that appendSnapshotChunk gets called
+TEST_F(ServerRaftConsensusPATest, appendEntries_serverCapabilities)
+{
+    auto& cap = *response.mutable_server_capabilities();
+    cap.set_min_supported_state_machine_version(10);
+    cap.set_max_supported_state_machine_version(20);
+    peerService->reply(Protocol::Raft::OpCode::APPEND_ENTRIES,
+                       request, response);
+    std::unique_lock<Mutex> lockGuard(consensus->mutex);
+    consensus->appendEntries(lockGuard, *peer);
+    EXPECT_TRUE(peer->haveStateMachineSupportedVersions);
+    EXPECT_EQ(10U, peer->minStateMachineVersion);
+    EXPECT_EQ(20U, peer->maxStateMachineVersion);
+}
+
+// test that installSnapshot gets called
 TEST_F(ServerRaftConsensusPATest, appendEntries_snapshot)
 {
     std::unique_lock<Mutex> lockGuard(consensus->mutex);
@@ -2049,7 +2359,7 @@ TEST_F(ServerRaftConsensusPATest, appendEntries_snapshot)
     // but it's not easily testable
 }
 
-// used in AppendSnapshotChunk tests
+// used in InstallSnapshot tests
 class ServerRaftConsensusPSTest : public ServerRaftConsensusPTest {
     ServerRaftConsensusPSTest()
         : peer()
@@ -2069,13 +2379,12 @@ class ServerRaftConsensusPSTest : public ServerRaftConsensusPTest {
 
         // First create a snapshot file on disk.
         // Note that this one doesn't have a Raft header.
-        Storage::SnapshotFile::Writer w(consensus->storageDirectory);
-        w.getStream().WriteString("hello, world!");
+        Storage::SnapshotFile::Writer w(consensus->storageLayout);
+        w.writeRaw("hello, world!", 13);
         w.save();
         consensus->lastSnapshotIndex = 2;
 
         request.set_server_id(1);
-        request.set_recipient_id(2);
         request.set_term(5);
         request.set_last_snapshot_index(2);
         request.set_byte_offset(0);
@@ -2086,66 +2395,66 @@ class ServerRaftConsensusPSTest : public ServerRaftConsensusPTest {
     }
 
     std::shared_ptr<Peer> peer;
-    Protocol::Raft::AppendSnapshotChunk::Request request;
-    Protocol::Raft::AppendSnapshotChunk::Response response;
+    Protocol::Raft::InstallSnapshot::Request request;
+    Protocol::Raft::InstallSnapshot::Response response;
 };
 
-TEST_F(ServerRaftConsensusPSTest, appendSnapshotChunk_rpcFailed)
+TEST_F(ServerRaftConsensusPSTest, installSnapshot_rpcFailed)
 {
-    peerService->closeSession(Protocol::Raft::OpCode::APPEND_SNAPSHOT_CHUNK,
+    peerService->closeSession(Protocol::Raft::OpCode::INSTALL_SNAPSHOT,
                               request);
     // expect warning
     LogCabin::Core::Debug::setLogPolicy({
         {"Server/RaftConsensus.cc", "ERROR"}
     });
     std::unique_lock<Mutex> lockGuard(consensus->mutex);
-    consensus->appendSnapshotChunk(lockGuard, *peer);
+    consensus->installSnapshot(lockGuard, *peer);
     EXPECT_LT(Clock::now(), peer->backoffUntil);
     EXPECT_EQ(0U, peer->snapshotFileOffset);
 }
 
 
-TEST_F(ServerRaftConsensusPSTest, appendSnapshotChunk_termChanged)
+TEST_F(ServerRaftConsensusPSTest, installSnapshot_termChanged)
 {
     peerService->runArbitraryCode(
-            Protocol::Raft::OpCode::APPEND_SNAPSHOT_CHUNK,
+            Protocol::Raft::OpCode::INSTALL_SNAPSHOT,
             request,
             std::make_shared<BumpTermAndReply>(*consensus, response));
     std::unique_lock<Mutex> lockGuard(consensus->mutex);
-    consensus->appendSnapshotChunk(lockGuard, *peer);
+    consensus->installSnapshot(lockGuard, *peer);
     EXPECT_EQ(TimePoint::min(), peer->backoffUntil);
     EXPECT_EQ(0U, peer->snapshotFileOffset);
 }
 
-TEST_F(ServerRaftConsensusPSTest, appendSnapshotChunk_termStale)
+TEST_F(ServerRaftConsensusPSTest, installSnapshot_termStale)
 {
     response.set_term(10);
-    peerService->reply(Protocol::Raft::OpCode::APPEND_SNAPSHOT_CHUNK,
+    peerService->reply(Protocol::Raft::OpCode::INSTALL_SNAPSHOT,
                        request, response);
     std::unique_lock<Mutex> lockGuard(consensus->mutex);
-    consensus->appendSnapshotChunk(lockGuard, *peer);
+    consensus->installSnapshot(lockGuard, *peer);
     EXPECT_EQ(0U, peer->snapshotFileOffset);
     EXPECT_EQ(State::FOLLOWER, consensus->state);
     EXPECT_EQ(10U, consensus->currentTerm);
 }
 
-TEST_F(ServerRaftConsensusPSTest, appendSnapshotChunk_ok)
+TEST_F(ServerRaftConsensusPSTest, installSnapshot_ok)
 {
     consensus->SOFT_RPC_SIZE_LIMIT = 7;
     request.set_data("hello, ");
     request.set_done(false);
-    peerService->reply(Protocol::Raft::OpCode::APPEND_SNAPSHOT_CHUNK,
+    peerService->reply(Protocol::Raft::OpCode::INSTALL_SNAPSHOT,
                        request, response);
     request.set_byte_offset(7);
     request.set_data("world!");
     request.set_done(true);
-    peerService->reply(Protocol::Raft::OpCode::APPEND_SNAPSHOT_CHUNK,
+    peerService->reply(Protocol::Raft::OpCode::INSTALL_SNAPSHOT,
                        request, response);
     std::unique_lock<Mutex> lockGuard(consensus->mutex);
-    consensus->appendSnapshotChunk(lockGuard, *peer);
+    consensus->installSnapshot(lockGuard, *peer);
     // make sure we don't use an updated lastSnapshotIndex value
     consensus->lastSnapshotIndex = 1;
-    consensus->appendSnapshotChunk(lockGuard, *peer);
+    consensus->installSnapshot(lockGuard, *peer);
     EXPECT_EQ(2U, peer->lastAgreeIndex);
     EXPECT_EQ(3U, peer->nextIndex);
     EXPECT_FALSE(peer->snapshotFile);
@@ -2161,12 +2470,15 @@ TEST_F(ServerRaftConsensusTest, becomeLeader)
 {
     init();
     consensus->stepDown(5);
+    entry5.set_cluster_time(60);
+    consensus->clusterClock.newEpoch(60);
     consensus->append({&entry5});
     EXPECT_EQ(5U, consensus->currentTerm);
     consensus->startNewElection();
     Peer& peer = *getPeer(2);
     peer.requestVoteDone = true;
     peer.haveVote_ = true;
+    Clock::mockValue += std::chrono::hours(10);
     consensus->becomeLeader();
     EXPECT_EQ(State::LEADER, consensus->state);
     EXPECT_EQ(6U, consensus->currentTerm);
@@ -2179,6 +2491,8 @@ TEST_F(ServerRaftConsensusTest, becomeLeader)
     EXPECT_EQ(6U, nop.term());
     EXPECT_EQ(Protocol::Raft::EntryType::NOOP, nop.type());
     EXPECT_EQ(TimePoint::max(), consensus->startElectionAt);
+    EXPECT_EQ(60U, consensus->clusterClock.clusterTimeAtEpoch);
+    EXPECT_EQ(Clock::mockValue, consensus->clusterClock.localTimeAtEpoch);
 
     drainDiskQueue(*consensus);
     EXPECT_EQ(2U, consensus->configuration->localServer->lastSyncedIndex);
@@ -2196,7 +2510,8 @@ TEST_F(ServerRaftConsensusTest, discardUnneededEntries)
     drainDiskQueue(*consensus);
     std::unique_ptr<Storage::SnapshotFile::Writer> writer =
         consensus->beginSnapshot(2);
-    writer->getStream().WriteLittleEndian32(0xdeadbeef);
+    uint32_t d = 0xdeadbeef;
+    writer->writeRaw(&d, sizeof(d));
     consensus->snapshotDone(2, std::move(writer));
     consensus->discardUnneededEntries();
     EXPECT_EQ(3U, consensus->log->getLogStartIndex());
@@ -2215,7 +2530,8 @@ TEST_F(ServerRaftConsensusTest, getLastLogTerm)
     // snapshot only
     std::unique_ptr<Storage::SnapshotFile::Writer> writer =
         consensus->beginSnapshot(2);
-    writer->getStream().WriteLittleEndian32(0xdeadbeef);
+    uint32_t d = 0xdeadbeef;
+    writer->writeRaw(&d, sizeof(d));
     consensus->snapshotDone(2, std::move(writer));
     EXPECT_LT(consensus->log->getLastLogIndex(),
               consensus->log->getLogStartIndex());
@@ -2246,11 +2562,23 @@ TEST_F(ServerRaftConsensusTest, readSnapshot)
     EXPECT_FALSE(bool(consensus->snapshotReader));
 
     // snapshot found
+    entry1.set_cluster_time(10);
+    consensus->clusterClock.newEpoch(10);
     consensus->append({&entry1});
+    consensus->clusterClock.newEpoch(20);
     consensus->currentTerm = 1;
     consensus->startNewElection();
     drainDiskQueue(*consensus);
     EXPECT_EQ(2U, consensus->commitIndex);
+
+    std::unique_ptr<Storage::MemoryLog> log2(new Storage::MemoryLog());
+    {
+        Log::Entry e1, e2;
+        e1 = consensus->log->getEntry(1);
+        e2 = consensus->log->getEntry(2);
+        log2->append({&e1, &e2});
+    }
+
     consensus->beginSnapshot(2)->save();
     consensus->commitIndex = 0;
     consensus->configurationManager->descriptions.clear();
@@ -2258,6 +2586,7 @@ TEST_F(ServerRaftConsensusTest, readSnapshot)
     EXPECT_EQ(2U, consensus->lastSnapshotIndex);
     EXPECT_EQ(2U, consensus->lastSnapshotTerm);
     EXPECT_EQ(2U, consensus->commitIndex);
+    EXPECT_EQ(20U, consensus->lastSnapshotClusterTime);
     // Don't really know exactly how big the snapshot will be in bytes, but
     // between 10 and 1K seems reasonable.
     EXPECT_LT(10U, consensus->lastSnapshotBytes);
@@ -2268,8 +2597,11 @@ TEST_F(ServerRaftConsensusTest, readSnapshot)
                                                             descriptions));
     EXPECT_EQ(d, consensus->configurationManager->descriptions.at(1));
     EXPECT_EQ(3U, consensus->log->getLogStartIndex());
+    EXPECT_EQ(20U, consensus->clusterClock.clusterTimeAtEpoch);
 
     // does not affect commitIndex if done again
+    entry2.set_cluster_time(30);
+    consensus->clusterClock.newEpoch(30);
     consensus->append({&entry2});
     drainDiskQueue(*consensus);
     EXPECT_EQ(3U, consensus->commitIndex);
@@ -2282,9 +2614,15 @@ TEST_F(ServerRaftConsensusTest, readSnapshot)
     // truncates the log if it does not agree with the snapshot
     EXPECT_EQ(3U, consensus->log->getLogStartIndex());
     EXPECT_EQ(3U, consensus->log->getLastLogIndex());
+
+    log2->metadata = consensus->log->metadata;
+    consensus->log.reset(log2.release());
     consensus->commitIndex = 0;
     consensus->configuration->localServer->lastSyncedIndex = 0;
-    consensus->log->truncateSuffix(1);
+    consensus->clusterClock.newEpoch(20);
+    consensus->lastSnapshotIndex = 0;
+    EXPECT_EQ(1U, consensus->log->getLogStartIndex());
+    EXPECT_EQ(2U, consensus->log->getLastLogIndex());
     consensus->readSnapshot();
     EXPECT_EQ(3U, consensus->log->getLogStartIndex());
     EXPECT_EQ(2U, consensus->log->getLastLogIndex());
@@ -2298,6 +2636,27 @@ TEST_F(ServerRaftConsensusTest, readSnapshot_incompleteLogPrefix)
     EXPECT_DEATH({ consensus->log->truncatePrefix(2);
                    consensus->readSnapshot(); },
                  "corrupt disk state");
+}
+
+TEST_F(ServerRaftConsensusTest, readSnapshot_emptyFile)
+{
+    init();
+    Storage::SnapshotFile::Writer writer(consensus->storageLayout);
+    writer.save();
+    EXPECT_DEATH({ consensus->readSnapshot(); },
+                 "completely empty");
+}
+
+TEST_F(ServerRaftConsensusTest, readSnapshot_unknownVersion)
+{
+    init();
+    Storage::SnapshotFile::Writer writer(consensus->storageLayout);
+    uint8_t version = 2;
+    writer.writeRaw(&version, sizeof(version));
+    writer.save();
+    EXPECT_DEATH({ consensus->readSnapshot(); },
+                 "Snapshot format version read was 2, but this code can only "
+                 "read version 1");
 }
 
 TEST_F(ServerRaftConsensusTest, replicateEntry_notLeader)
@@ -2350,7 +2709,6 @@ TEST_F(ServerRaftConsensusPTest, requestVote_rpcFailed)
 
     Protocol::Raft::RequestVote::Request request;
     request.set_server_id(1);
-    request.set_recipient_id(2);
     request.set_term(6);
     request.set_last_log_term(5);
     request.set_last_log_index(1);
@@ -2376,7 +2734,6 @@ TEST_F(ServerRaftConsensusPTest, requestVote_ignoreResult)
 
     Protocol::Raft::RequestVote::Request request;
     request.set_server_id(1);
-    request.set_recipient_id(2);
     request.set_term(5);
     request.set_last_log_term(5);
     request.set_last_log_index(1);
@@ -2411,7 +2768,6 @@ TEST_F(ServerRaftConsensusPTest, requestVote_termStale)
 
     Protocol::Raft::RequestVote::Request request;
     request.set_server_id(1);
-    request.set_recipient_id(2);
     request.set_term(7);
     request.set_last_log_term(6);
     request.set_last_log_index(3);
@@ -2443,11 +2799,11 @@ TEST_F(ServerRaftConsensusPTest, requestVote_termOkAsLeader)
     consensus->stepDown(5);
     *entry1.mutable_configuration() = desc(
         "prev_configuration {"
-        "    servers { server_id: 1, address: '127.0.0.1:61023' }"
-        "    servers { server_id: 2, address: '127.0.0.1:61024' }"
-        "    servers { server_id: 3, address: '127.0.0.1:61024' }"
-        "    servers { server_id: 4, address: '127.0.0.1:61024' }"
-        "    servers { server_id: 5, address: '127.0.0.1:61024' }"
+        "    servers { server_id: 1, addresses: '127.0.0.1:5254' }"
+        "    servers { server_id: 2, addresses: '127.0.0.1:5255' }"
+        "    servers { server_id: 3, addresses: '127.0.0.1:5255' }"
+        "    servers { server_id: 4, addresses: '127.0.0.1:5255' }"
+        "    servers { server_id: 5, addresses: '127.0.0.1:5255' }"
         "}");
     consensus->append({&entry1});
     consensus->append({&entry2});
@@ -2465,7 +2821,6 @@ TEST_F(ServerRaftConsensusPTest, requestVote_termOkAsLeader)
     // 1. Get response from peer2 but don't get its vote.
     Protocol::Raft::RequestVote::Request request;
     request.set_server_id(1);
-    request.set_recipient_id(2);
     request.set_term(6);
     request.set_last_log_term(2);
     request.set_last_log_index(4);
@@ -2482,7 +2837,6 @@ TEST_F(ServerRaftConsensusPTest, requestVote_termOkAsLeader)
     EXPECT_EQ(State::CANDIDATE, consensus->state);
 
     // 2. Get vote from peer3, still a candidate
-    request.set_recipient_id(3);
     response.set_granted(true);
     peerService->reply(Protocol::Raft::OpCode::REQUEST_VOTE,
                        request, response);
@@ -2492,7 +2846,6 @@ TEST_F(ServerRaftConsensusPTest, requestVote_termOkAsLeader)
     EXPECT_EQ(State::CANDIDATE, consensus->state);
 
     // 3. Get vote from peer4, become leader
-    request.set_recipient_id(4);
     peerService->reply(Protocol::Raft::OpCode::REQUEST_VOTE,
                        request, response);
     consensus->requestVote(lockGuard, peer4);
@@ -2536,7 +2889,7 @@ TEST_F(ServerRaftConsensusTest, startNewElection)
     consensus->append({&entry5});
 
     consensus->snapshotWriter.reset(
-        new Storage::SnapshotFile::Writer(consensus->storageDirectory));
+        new Storage::SnapshotFile::Writer(consensus->storageLayout));
     consensus->startNewElection();
     EXPECT_EQ(State::CANDIDATE, consensus->state);
     EXPECT_EQ(6U, consensus->currentTerm);
@@ -2560,7 +2913,7 @@ TEST_F(ServerRaftConsensusTest, startNewElection)
     entry1.set_term(9);
     *entry1.mutable_configuration() = desc(
         "prev_configuration {"
-            "servers { server_id: 2, address: '127.0.0.1:61025' }"
+            "servers { server_id: 2, addresses: '127.0.0.1:5256' }"
         "}");
     consensus->append({&entry1});
     consensus->startNewElection();
@@ -2608,7 +2961,7 @@ TEST_F(ServerRaftConsensusTest, stepDown)
 
     // from follower to new term
     consensus->snapshotWriter.reset(
-        new Storage::SnapshotFile::Writer(consensus->storageDirectory));
+        new Storage::SnapshotFile::Writer(consensus->storageLayout));
     consensus->stepDown(consensus->currentTerm + 1);
     EXPECT_EQ(oldStartElectionAt, consensus->startElectionAt);
     EXPECT_FALSE(bool(consensus->snapshotWriter));
@@ -2639,7 +2992,7 @@ class UpToDateLeaderHelper {
             peer->lastAckEpoch = consensus->currentEpoch;
         } else if (iter == 2) {
             peer->lastAgreeIndex = 4;
-            consensus->advanceCommittedId();
+            consensus->advanceCommitIndex();
         } else {
             FAIL();
         }
@@ -2672,7 +3025,8 @@ TEST_F(ServerRaftConsensusTest, upToDateLeader)
     lockGuard.unlock();
     std::unique_ptr<Storage::SnapshotFile::Writer> writer =
         consensus->beginSnapshot(2);
-    writer->getStream().WriteLittleEndian32(0xdeadbeef);
+    uint32_t d = 0xdeadbeef;
+    writer->writeRaw(&d, sizeof(d));
     consensus->snapshotDone(2, std::move(writer));
     consensus->log->truncatePrefix(3);
     consensus->configurationManager->truncatePrefix(3);
@@ -2690,7 +3044,7 @@ TEST_F(ServerRaftConsensusTest, upToDateLeader)
     consensus->stateChanged.callback = std::ref(helper);
     peer->nextHeartbeatTime = TimePoint::max();
     EXPECT_TRUE(consensus->upToDateLeader(lockGuard));
-    EXPECT_EQ(round(Clock::now()),
+    EXPECT_EQ(Clock::now(),
               peer->nextHeartbeatTime);
     EXPECT_EQ(3U, helper.iter);
 }

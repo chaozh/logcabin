@@ -23,6 +23,7 @@
 #include "Core/Debug.h"
 #include "Event/Loop.h"
 #include "RPC/MessageSocket.h"
+#include "include/LogCabin/Debug.h"
 
 namespace LogCabin {
 namespace RPC {
@@ -124,8 +125,10 @@ TEST_F(RPCMessageSocketTest, readableSenderDisconnectInHeader) {
 
 TEST_F(RPCMessageSocketTest, readableMessageTooLong) {
     MessageSocket::Header header;
-    header.messageId = 0;
+    header.fixed = 0xdaf4;
+    header.version = 1;
     header.payloadLength = 65;
+    header.messageId = 0;
     header.toBigEndian();
     EXPECT_EQ(ssize_t(sizeof(header)),
               send(remote, &header, sizeof(header), 0));
@@ -138,8 +141,10 @@ TEST_F(RPCMessageSocketTest, readableEmptyPayload) {
     // This test exists to prevent a regression. Before, sending a message with
     // a length of 0 was not handled correctly.
     MessageSocket::Header header;
-    header.messageId = 12;
+    header.fixed = 0xdaf4;
+    header.version = 1;
     header.payloadLength = 0;
+    header.messageId = 12;
     header.toBigEndian();
     EXPECT_EQ(ssize_t(sizeof(header)),
               send(remote, &header, sizeof(header), 0));
@@ -153,8 +158,10 @@ TEST_F(RPCMessageSocketTest, readableEmptyPayload) {
 
 TEST_F(RPCMessageSocketTest, readableSenderDisconnectInPayload) {
     MessageSocket::Header header;
-    header.messageId = 0;
+    header.fixed = 0xdaf4;
+    header.version = 1;
     header.payloadLength = 1;
+    header.messageId = 0;
     header.toBigEndian();
     EXPECT_EQ(ssize_t(sizeof(header)),
               send(remote, &header, sizeof(header), 0));
@@ -168,8 +175,10 @@ TEST_F(RPCMessageSocketTest, readableSenderDisconnectInPayload) {
 
 TEST_F(RPCMessageSocketTest, readableAllAtOnce) {
     MessageSocket::Header header;
-    header.messageId = 0xdeadbeef8badf00d;
+    header.fixed = 0xdaf4;
+    header.version = 1;
     header.payloadLength = 64;
+    header.messageId = 0xdeadbeef8badf00d;
     header.toBigEndian();
     char buf[sizeof(header) + 64];
     memcpy(buf, &header, sizeof(header));
@@ -196,8 +205,10 @@ TEST_F(RPCMessageSocketTest, readableAllAtOnce) {
 
 TEST_F(RPCMessageSocketTest, readableBytewise) {
     MessageSocket::Header header;
-    header.messageId = 0xdeadbeef8badf00d;
+    header.fixed = 0xdaf4;
+    header.version = 1;
     header.payloadLength = 64;
+    header.messageId = 0xdeadbeef8badf00d;
     header.toBigEndian();
     char buf[sizeof(header) + 64];
     memcpy(buf, &header, sizeof(header));
@@ -238,8 +249,10 @@ TEST_F(RPCMessageSocketTest, writableDisconnect) {
 
 TEST_F(RPCMessageSocketTest, writableNormal) {
     MessageSocket::Header header;
-    header.messageId = 123;
+    header.fixed = 0xdaf4;
+    header.version = 1;
     header.payloadLength = 64;
+    header.messageId = 123;
     header.toBigEndian();
     char expected[sizeof(header) + 64];
     memcpy(expected, &header, sizeof(header));

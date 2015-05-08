@@ -14,6 +14,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <cassert>
 #include <chrono>
 #include <iostream>
 #include <time.h>
@@ -61,17 +62,17 @@ makeTimeSpec(const std::chrono::time_point<Clock, Duration>& when)
  * versions, since those use only a microsecond granularity.
  */
 struct CSystemClock {
-  typedef std::chrono::nanoseconds duration;
-  typedef duration::rep rep;
-  typedef duration::period period;
-  typedef std::chrono::time_point<CSystemClock, duration> time_point;
+    typedef std::chrono::nanoseconds duration;
+    typedef duration::rep rep;
+    typedef duration::period period;
+    typedef std::chrono::time_point<CSystemClock, duration> time_point;
 
-  // libstdc++ 4.7 renamed monotonic_clock to steady_clock to conform with
-  // C++11. This class defines both, since it's free.
-  static const bool is_monotonic = false;
-  static const bool is_steady = false;
+    // libstdc++ 4.7 renamed monotonic_clock to steady_clock to conform with
+    // C++11. This class defines both, since it's free.
+    static const bool is_monotonic = false;
+    static const bool is_steady = false;
 
-  static time_point now();
+    static time_point now();
 };
 
 /**
@@ -92,17 +93,17 @@ const clockid_t STEADY_CLOCK_ID = CLOCK_MONOTONIC;
  * are not actually monotonic (they're typedefed to system_clock).
  */
 struct CSteadyClock {
-  typedef std::chrono::nanoseconds duration;
-  typedef duration::rep rep;
-  typedef duration::period period;
-  typedef std::chrono::time_point<CSteadyClock, duration> time_point;
+    typedef std::chrono::nanoseconds duration;
+    typedef duration::rep rep;
+    typedef duration::period period;
+    typedef std::chrono::time_point<CSteadyClock, duration> time_point;
 
-  // libstdc++ 4.7 renamed monotonic_clock to steady_clock to conform with
-  // C++11. This class defines both, since it's free.
-  static const bool is_monotonic = true;
-  static const bool is_steady = true;
+    // libstdc++ 4.7 renamed monotonic_clock to steady_clock to conform with
+    // C++11. This class defines both, since it's free.
+    static const bool is_monotonic = true;
+    static const bool is_steady = true;
 
-  static time_point now();
+    static time_point now();
 };
 
 
@@ -114,29 +115,41 @@ struct CSteadyClock {
 template<typename _BaseClock>
 struct MockableClock
 {
-  typedef _BaseClock BaseClock;
-  typedef typename BaseClock::duration duration;
-  typedef typename BaseClock::rep rep;
-  typedef typename BaseClock::period period;
-  typedef typename BaseClock::time_point time_point;
+    typedef _BaseClock BaseClock;
+    typedef typename BaseClock::duration duration;
+    typedef typename BaseClock::rep rep;
+    typedef typename BaseClock::period period;
+    typedef typename BaseClock::time_point time_point;
 
 // libstdc++ 4.7 renamed monotonic_clock to steady_clock to conform with C++11.
 #if __GNUC__ == 4 && __GNUC_MINOR__ < 7
-  static const bool is_monotonic = BaseClock::is_monotonic;
-  static const bool is_steady = BaseClock::is_monotonic;
+    static const bool is_monotonic = BaseClock::is_monotonic;
+    static const bool is_steady = BaseClock::is_monotonic;
 #else
-  static const bool is_steady = BaseClock::is_steady;
+    static const bool is_steady = BaseClock::is_steady;
 #endif
 
-  static time_point now() {
-      if (useMockValue)
-          return mockValue;
-      else
-          return BaseClock::now();
-  }
+    static time_point now() {
+        if (useMockValue)
+            return mockValue;
+        else
+            return BaseClock::now();
+    }
 
-  static bool useMockValue;
-  static time_point mockValue;
+    static bool useMockValue;
+    static time_point mockValue;
+
+    /// RAII class to mock out the clock and then restore it.
+    struct Mocker {
+        explicit Mocker(time_point value = now()) {
+            assert(!useMockValue);
+            useMockValue = true;
+            mockValue = value;
+        }
+        ~Mocker() {
+            useMockValue = false;
+        }
+    };
 };
 
 template<typename BaseClock>
@@ -183,11 +196,6 @@ rdtsc()
     __asm__ __volatile__("rdtsc" : "=a" (lo), "=d" (hi));
     return (((uint64_t)hi << 32) | lo);
 }
-
-/**
- * Return the system time since the Unix epoch in nanoseconds.
- */
-int64_t getTimeNanos();
 
 /**
  * Block the calling thread until the given time.

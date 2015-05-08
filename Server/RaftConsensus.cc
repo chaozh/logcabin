@@ -16,7 +16,9 @@
 
 #include <algorithm>
 #include <fcntl.h>
+#include <limits>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -36,7 +38,6 @@
 #include "RPC/ServerRPC.h"
 #include "Server/RaftConsensus.h"
 #include "Server/Globals.h"
-#include "Server/StateMachine.h"
 #include "Storage/LogFactory.h"
 
 namespace LogCabin {
@@ -52,7 +53,10 @@ bool startThreads = true;
 
 Server::Server(uint64_t serverId)
     : serverId(serverId)
-    , address()
+    , addresses()
+    , haveStateMachineSupportedVersions(false)
+    , minStateMachineVersion(std::numeric_limits<uint16_t>::max())
+    , maxStateMachineVersion(0)
     , gcFlag(false)
 {
 }
@@ -174,7 +178,6 @@ Peer::Peer(uint64_t serverId, RaftConsensus& consensus)
     , lastSnapshotIndex(0)
     , session()
     , rpc()
-    , thread()
 {
 }
 
@@ -203,6 +206,7 @@ Peer::beginLeadership()
 void
 Peer::exit()
 {
+    NOTICE("Flagging peer %lu to exit", serverId);
     exiting = true;
 }
 
@@ -242,7 +246,7 @@ Peer::scheduleHeartbeat()
     nextHeartbeatTime = Clock::now();
 }
 
-bool
+Peer::CallStatus
 Peer::callRPC(Protocol::Raft::OpCode opCode,
               const google::protobuf::Message& request,
               google::protobuf::Message& response,
@@ -263,7 +267,7 @@ Peer::callRPC(Protocol::Raft::OpCode opCode,
                         rpcFailuresSinceLastWarning);
                 rpcFailuresSinceLastWarning = 0;
             }
-            return true;
+            return CallStatus::OK;
         case RPCStatus::SERVICE_SPECIFIC_ERROR:
             PANIC("unexpected service-specific error");
         case RPCStatus::TIMEOUT:
@@ -278,9 +282,13 @@ Peer::callRPC(Protocol::Raft::OpCode opCode,
                         rpcFailuresSinceLastWarning,
                         rpc.getErrorMessage().c_str());
             }
-            return false;
+            return CallStatus::FAILED;
         case RPCStatus::RPC_CANCELED:
-            return false;
+            return CallStatus::FAILED;
+        case RPCStatus::INVALID_SERVICE:
+            PANIC("The server isn't running the RaftService");
+        case RPCStatus::INVALID_REQUEST:
+            return CallStatus::INVALID_REQUEST;
     }
     PANIC("Unexpected RPC status");
 }
@@ -291,8 +299,8 @@ Peer::startThread(std::shared_ptr<Peer> self)
     thisCatchUpIterationStart = Clock::now();
     thisCatchUpIterationGoalId = consensus.log->getLastLogIndex();
     ++consensus.numPeerThreads;
-    thread = std::thread(&RaftConsensus::peerThreadMain, &consensus, self);
-    thread.detach();
+    NOTICE("Starting peer thread for server %lu", serverId);
+    std::thread(&RaftConsensus::peerThreadMain, &consensus, self).detach();
 }
 
 std::shared_ptr<RPC::ClientSession>
@@ -301,14 +309,14 @@ Peer::getSession(std::unique_lock<Mutex>& lockGuard)
     if (!session || !session->getErrorMessage().empty()) {
         // release lock for concurrency
         Core::MutexUnlock<Mutex> unlockGuard(lockGuard);
-        RPC::Address target(address, Protocol::Common::DEFAULT_PORT);
+        RPC::Address target(addresses, Protocol::Common::DEFAULT_PORT);
         target.refresh(RPC::Address::TimePoint::max());
-        session = RPC::ClientSession::makeSession(
-            eventLoop,
+        Client::SessionManager::ServerId peerId(serverId);
+        session = consensus.sessionManager.createSession(
             target,
-            Protocol::Common::MAX_MESSAGE_LENGTH,
             RPC::ClientSession::TimePoint::max(),
-            consensus.globals.config);
+            &consensus.globals.clusterUUID,
+            &peerId);
     }
     return session;
 }
@@ -317,7 +325,7 @@ std::ostream&
 Peer::dumpToStream(std::ostream& os) const
 {
     os << "Peer " << serverId << std::endl;
-    os << "address: " << address << std::endl;
+    os << "addresses: " << addresses << std::endl;
     switch (consensus.state) {
         case RaftConsensus::State::FOLLOWER:
             break;
@@ -339,7 +347,6 @@ Peer::dumpToStream(std::ostream& os) const
             os << "lastAgreeIndex: " << lastAgreeIndex << std::endl;
             break;
     }
-    os << "address: " << address << std::endl;
     return os;
 }
 
@@ -475,7 +482,7 @@ Configuration::lookupAddress(uint64_t serverId) const
 {
     auto it = knownServers.find(serverId);
     if (it != knownServers.end())
-        return it->second->address;
+        return it->second->addresses;
     return "";
 }
 
@@ -521,11 +528,14 @@ void setGCFlag(Server& server)
 void
 Configuration::reset()
 {
+    NOTICE("Resetting to blank configuration");
     state = State::BLANK;
     id = 0;
     description = {};
     oldServers.servers.clear();
     newServers.servers.clear();
+    for (auto it = knownServers.begin(); it != knownServers.end(); ++it)
+        it->second->exit();
     knownServers.clear();
     knownServers[localServer->serverId] = localServer;
 }
@@ -552,7 +562,7 @@ Configuration::setConfiguration(
          confIt != description.prev_configuration().servers().end();
          ++confIt) {
         std::shared_ptr<Server> server = getServer(confIt->server_id());
-        server->address = confIt->address();
+        server->addresses = confIt->addresses();
         oldServers.servers.push_back(server);
     }
 
@@ -561,7 +571,7 @@ Configuration::setConfiguration(
          confIt != description.next_configuration().servers().end();
          ++confIt) {
         std::shared_ptr<Server> server = getServer(confIt->server_id());
-        server->address = confIt->address();
+        server->addresses = confIt->addresses();
         newServers.servers.push_back(server);
     }
 
@@ -592,7 +602,7 @@ Configuration::setStagingServers(
          it != stagingServers.servers().end();
          ++it) {
         std::shared_ptr<Server> server = getServer(it->server_id());
-        server->address = it->address();
+        server->addresses = it->addresses();
         newServers.servers.push_back(server);
     }
 }
@@ -626,6 +636,7 @@ Configuration::updateServerStats(Protocol::ServerStats& serverStats,
             *serverStats.mutable_raft()->add_peer();
         peerStats.set_server_id(it->first);
         const ServerRef& peer = it->second;
+        peerStats.set_addresses(peer->addresses);
         peerStats.set_old_member(oldServers.contains(peer));
         peerStats.set_new_member(state == State::TRANSITIONAL &&
                                  newServers.contains(peer));
@@ -769,22 +780,60 @@ ConfigurationManager::restoreInvariants()
     }
 }
 
+////////// ClusterClock //////////
+
+ClusterClock::ClusterClock()
+    : clusterTimeAtEpoch(0)
+    , localTimeAtEpoch(Core::Time::SteadyClock::now())
+{
+}
+
+void
+ClusterClock::newEpoch(uint64_t clusterTime)
+{
+    clusterTimeAtEpoch = clusterTime;
+    localTimeAtEpoch = Core::Time::SteadyClock::now();
+}
+
+uint64_t
+ClusterClock::leaderStamp()
+{
+    auto localTime = Core::Time::SteadyClock::now();
+    int64_t nanosSinceEpoch = std::chrono::nanoseconds(
+        localTime - localTimeAtEpoch).count();
+    assert(nanosSinceEpoch >= 0);
+    clusterTimeAtEpoch += nanosSinceEpoch;
+    localTimeAtEpoch = localTime;
+    return clusterTimeAtEpoch;
+}
+
+uint64_t
+ClusterClock::interpolate() const
+{
+    int64_t nanosSinceEpoch = std::chrono::nanoseconds(
+        Core::Time::SteadyClock::now() - localTimeAtEpoch).count();
+    assert(nanosSinceEpoch >= 0);
+    return clusterTimeAtEpoch + nanosSinceEpoch;
+}
+
 
 ////////// RaftConsensus::Entry //////////
 
 RaftConsensus::Entry::Entry()
-    : entryId()
+    : index(0)
     , type(SKIP)
-    , data()
+    , command()
     , snapshotReader()
+    , clusterTime(0)
 {
 }
 
 RaftConsensus::Entry::Entry(Entry&& other)
-    : entryId(other.entryId)
+    : index(other.index)
     , type(other.type)
-    , data(std::move(other.data))
+    , command(std::move(other.command))
     , snapshotReader(std::move(other.snapshotReader))
+    , clusterTime(other.clusterTime)
 {
 }
 
@@ -797,18 +846,24 @@ RaftConsensus::Entry::~Entry()
 
 RaftConsensus::RaftConsensus(Globals& globals)
     : ELECTION_TIMEOUT_MS(globals.config.read<uint64_t>(
-        "electionTimeoutMilliseconds", 150))
+        "electionTimeoutMilliseconds", 500))
     , HEARTBEAT_PERIOD_MS(globals.config.read<uint64_t>(
         "heartbeatPeriodMilliseconds",
         ELECTION_TIMEOUT_MS / 2))
     , RPC_FAILURE_BACKOFF_MS(globals.config.read<uint64_t>(
         "rpcFailureBackoffMilliseconds",
         ELECTION_TIMEOUT_MS / 2))
+    , STATE_MACHINE_UPDATER_BACKOFF(std::chrono::milliseconds(
+        globals.config.read<uint64_t>(
+            "stateMachineUpdaterBackoffMilliseconds",
+            10000)))
     , SOFT_RPC_SIZE_LIMIT(Protocol::Common::MAX_MESSAGE_LENGTH - 1024)
     , serverId(0)
-    , serverAddress()
+    , serverAddresses()
     , globals(globals)
-    , storageDirectory()
+    , storageLayout()
+    , sessionManager(globals.eventLoop,
+                     globals.config)
     , mutex()
     , stateChanged()
     , exiting(false)
@@ -822,6 +877,7 @@ RaftConsensus::RaftConsensus(Globals& globals)
     , state(State::FOLLOWER)
     , lastSnapshotIndex(0)
     , lastSnapshotTerm(0)
+    , lastSnapshotClusterTime(0)
     , lastSnapshotBytes(0)
     , snapshotReader()
     , snapshotWriter()
@@ -829,10 +885,12 @@ RaftConsensus::RaftConsensus(Globals& globals)
     , leaderId(0)
     , votedFor(0)
     , currentEpoch(0)
+    , clusterClock()
     , startElectionAt(TimePoint::max())
     , withholdVotesUntil(TimePoint::min())
     , leaderDiskThread()
     , timerThread()
+    , stateMachineUpdaterThread()
     , stepDownThread()
     , invariants(*this)
 {
@@ -840,56 +898,77 @@ RaftConsensus::RaftConsensus(Globals& globals)
 
 RaftConsensus::~RaftConsensus()
 {
-    exit();
+    if (!exiting)
+        exit();
     if (leaderDiskThread.joinable())
         leaderDiskThread.join();
     if (timerThread.joinable())
         timerThread.join();
+    if (stateMachineUpdaterThread.joinable())
+        stateMachineUpdaterThread.join();
     if (stepDownThread.joinable())
         stepDownThread.join();
+    NOTICE("Joined with disk and timer threads");
     std::unique_lock<Mutex> lockGuard(mutex);
-    while (numPeerThreads > 0)
-        stateChanged.wait(lockGuard);
+    if (numPeerThreads > 0) {
+        NOTICE("Waiting for %u peer threads to exit", numPeerThreads);
+        while (numPeerThreads > 0)
+            stateChanged.wait(lockGuard);
+    }
+    NOTICE("Peer threads have exited");
     // issue any outstanding disk flushes
     if (logSyncQueued) {
         std::unique_ptr<Log::Sync> sync = log->takeSync();
         sync->wait();
         log->syncComplete(std::move(sync));
     }
+    NOTICE("Completed disk writes");
 }
 
 void
 RaftConsensus::init()
 {
-    std::unique_lock<Mutex> lockGuard(mutex);
+    std::lock_guard<Mutex> lockGuard(mutex);
 #if DEBUG
-    mutex.callback = std::bind(&Invariants::checkAll, &invariants);
+    if (globals.config.read<bool>("raftDebug", false)) {
+        mutex.callback = std::bind(&Invariants::checkAll, &invariants);
+    }
 #endif
-    // TODO(ongaro): uhh, how are server ID's assigned? I don't think this
-    // makes sense with reconfiguration.
+
     NOTICE("My server ID is %lu", serverId);
 
-    if (storageDirectory.fd == -1) {
-        Storage::FilesystemUtil::File parentDir =
-            Storage::FilesystemUtil::openDir(
-                globals.config.read<std::string>("storagePath", "storage"));
-        storageDirectory = Storage::FilesystemUtil::openDir(parentDir,
-                              Core::StringUtil::format("server%lu", serverId));
+    if (storageLayout.topDir.fd == -1) {
+        if (globals.config.read("use-temporary-storage", false))
+            storageLayout.initTemporary(serverId); // unit tests
+        else
+            storageLayout.init(globals.config, serverId);
     }
 
     configuration.reset(new Configuration(serverId, *this));
     configurationManager.reset(new ConfigurationManager(*configuration));
 
+    NOTICE("Reading the log");
     if (!log) { // some unit tests pre-set the log; don't overwrite it
-        log = Storage::LogFactory::makeLog(globals.config, storageDirectory);
+        log = Storage::LogFactory::makeLog(globals.config, storageLayout);
     }
-    for (uint64_t entryId = log->getLogStartIndex();
-         entryId <= log->getLastLogIndex();
-         ++entryId) {
-        const Log::Entry& entry = log->getEntry(entryId);
-        if (entry.type() == Protocol::Raft::EntryType::CONFIGURATION) {
-            configurationManager->add(entryId, entry.configuration());
+    for (uint64_t index = log->getLogStartIndex();
+         index <= log->getLastLogIndex();
+         ++index) {
+        const Log::Entry& entry = log->getEntry(index);
+        if (entry.type() == Protocol::Raft::EntryType::UNKNOWN) {
+            PANIC("Don't understand the entry type for index %lu (term %lu) "
+                  "found on disk",
+                  index, entry.term());
         }
+        if (entry.type() == Protocol::Raft::EntryType::CONFIGURATION) {
+            configurationManager->add(index, entry.configuration());
+        }
+    }
+
+    // Restore cluster time epoch from last log entry, if any
+    if (log->getLastLogIndex() >= log->getLogStartIndex()) {
+        clusterClock.newEpoch(
+            log->getEntry(log->getLastLogIndex()).cluster_time());
     }
 
     NOTICE("The log contains indexes %lu through %lu (inclusive)",
@@ -905,26 +984,40 @@ RaftConsensus::init()
     // conflicting log entries
     readSnapshot();
 
+    // Clean up incomplete snapshots left by prior runs. This could be done
+    // earlier, but maybe it's nicer to make sure we can get to this point
+    // without PANICing before deleting these files.
+    Storage::SnapshotFile::discardPartialSnapshots(storageLayout);
+
     if (configuration->id == 0)
         NOTICE("No configuration, waiting to receive one.");
 
     stepDown(currentTerm);
     if (startThreads) {
-        leaderDiskThread = std::thread(&RaftConsensus::leaderDiskThreadMain,
-                                       this);
-        timerThread = std::thread(&RaftConsensus::timerThreadMain,
-                                      this);
-        stepDownThread = std::thread(&RaftConsensus::stepDownThreadMain,
-                                     this);
+        leaderDiskThread = std::thread(
+            &RaftConsensus::leaderDiskThreadMain, this);
+        timerThread = std::thread(
+            &RaftConsensus::timerThreadMain, this);
+        if (globals.config.read<bool>("disableStateMachineUpdates", false)) {
+            NOTICE("Not starting state machine updater thread (state machine "
+                   "updates are disabled in config)");
+        } else {
+            stateMachineUpdaterThread = std::thread(
+                &RaftConsensus::stateMachineUpdaterThreadMain, this);
+        }
+        stepDownThread = std::thread(
+            &RaftConsensus::stepDownThreadMain, this);
     }
     // log->path = ""; // hack to disable disk
     stateChanged.notify_all();
+    printElectionState();
 }
 
 void
 RaftConsensus::exit()
 {
-    std::unique_lock<Mutex> lockGuard(mutex);
+    NOTICE("Shutting down");
+    std::lock_guard<Mutex> lockGuard(mutex);
     exiting = true;
     if (configuration)
         configuration->forEach(&Server::exit);
@@ -934,7 +1027,7 @@ RaftConsensus::exit()
 void
 RaftConsensus::bootstrapConfiguration()
 {
-    std::unique_lock<Mutex> lockGuard(mutex);
+    std::lock_guard<Mutex> lockGuard(mutex);
 
     if (currentTerm != 0 ||
         log->getLogStartIndex() != 1 ||
@@ -949,12 +1042,13 @@ RaftConsensus::bootstrapConfiguration()
     Log::Entry entry;
     entry.set_term(1);
     entry.set_type(Protocol::Raft::EntryType::CONFIGURATION);
+    entry.set_cluster_time(0);
     Protocol::Raft::Configuration& configuration =
         *entry.mutable_configuration();
     Protocol::Raft::Server& server =
         *configuration.mutable_prev_configuration()->add_servers();
     server.set_server_id(serverId);
-    server.set_address(serverAddress);
+    server.set_addresses(serverAddresses);
     append({&entry});
 }
 
@@ -976,7 +1070,7 @@ RaftConsensus::getConfiguration(
 }
 
 std::pair<RaftConsensus::ClientResult, uint64_t>
-RaftConsensus::getLastCommittedId() const
+RaftConsensus::getLastCommitIndex() const
 {
     std::unique_lock<Mutex> lockGuard(mutex);
     if (!upToDateLeader(lockGuard))
@@ -988,24 +1082,24 @@ RaftConsensus::getLastCommittedId() const
 std::string
 RaftConsensus::getLeaderHint() const
 {
-    std::unique_lock<Mutex> lockGuard(mutex);
+    std::lock_guard<Mutex> lockGuard(mutex);
     return configuration->lookupAddress(leaderId);
 }
 
 RaftConsensus::Entry
-RaftConsensus::getNextEntry(uint64_t lastEntryId) const
+RaftConsensus::getNextEntry(uint64_t lastIndex) const
 {
     std::unique_lock<Mutex> lockGuard(mutex);
-    uint64_t nextEntryId = lastEntryId + 1;
+    uint64_t nextIndex = lastIndex + 1;
     while (true) {
         if (exiting)
             throw Core::Util::ThreadInterruptedException();
-        if (commitIndex >= nextEntryId) {
+        if (commitIndex >= nextIndex) {
             RaftConsensus::Entry entry;
 
             // Make the state machine load a snapshot if we don't have the next
             // entry it needs in the log.
-            if (log->getLogStartIndex() > nextEntryId) {
+            if (log->getLogStartIndex() > nextIndex) {
                 entry.type = Entry::SNAPSHOT;
                 // For well-behaved state machines, we expect 'snapshotReader'
                 // to contain a SnapshotFile::Reader that we can return
@@ -1023,17 +1117,23 @@ RaftConsensus::getNextEntry(uint64_t lastEntryId) const
                     const_cast<RaftConsensus*>(this)->readSnapshot();
                     entry.snapshotReader = std::move(snapshotReader);
                 }
-                entry.entryId = lastSnapshotIndex;
+                entry.index = lastSnapshotIndex;
+                entry.clusterTime = lastSnapshotClusterTime;
             } else {
                 // not a snapshot
-                const Log::Entry& logEntry = log->getEntry(nextEntryId);
-                entry.entryId = nextEntryId;
+                const Log::Entry& logEntry = log->getEntry(nextIndex);
+                entry.index = nextIndex;
                 if (logEntry.type() == Protocol::Raft::EntryType::DATA) {
                     entry.type = Entry::DATA;
-                    entry.data = logEntry.data();
+                    const std::string& s = logEntry.data();
+                    entry.command = Core::Buffer(
+                        memcpy(new char[s.length()], s.data(), s.length()),
+                        s.length(),
+                        Core::Buffer::deleteArrayFn<char>);
                 } else {
                     entry.type = Entry::SKIP;
                 }
+                entry.clusterTime = logEntry.cluster_time();
             }
             return entry;
         }
@@ -1044,7 +1144,7 @@ RaftConsensus::getNextEntry(uint64_t lastEntryId) const
 SnapshotStats::SnapshotStats
 RaftConsensus::getSnapshotStats() const
 {
-    std::unique_lock<Mutex> lockGuard(mutex);
+    std::lock_guard<Mutex> lockGuard(mutex);
 
     SnapshotStats::SnapshotStats s;
     s.set_last_snapshot_index(lastSnapshotIndex);
@@ -1061,13 +1161,26 @@ RaftConsensus::handleAppendEntries(
                     const Protocol::Raft::AppendEntries::Request& request,
                     Protocol::Raft::AppendEntries::Response& response)
 {
-    std::unique_lock<Mutex> lockGuard(mutex);
+    std::lock_guard<Mutex> lockGuard(mutex);
     assert(!exiting);
 
     // Set response to a rejection. We'll overwrite these later if we end up
     // accepting the request.
     response.set_term(currentTerm);
     response.set_success(false);
+    response.set_last_log_index(log->getLastLogIndex());
+
+    // Piggy-back server capabilities.
+    {
+        auto& cap = *response.mutable_server_capabilities();
+        auto& s = *configuration->localServer;
+        if (s.haveStateMachineSupportedVersions) {
+            cap.set_min_supported_state_machine_version(
+                    s.minStateMachineVersion);
+            cap.set_max_supported_state_machine_version(
+                    s.maxStateMachineVersion);
+        }
+    }
 
     // If the caller's term is stale, just return our term to it.
     if (request.term() < currentTerm) {
@@ -1094,6 +1207,7 @@ RaftConsensus::handleAppendEntries(
     if (leaderId == 0) {
         leaderId = request.server_id();
         NOTICE("All hail leader %lu for term %lu", leaderId, currentTerm);
+        printElectionState();
     } else {
         assert(leaderId == request.server_id());
     }
@@ -1135,38 +1249,52 @@ RaftConsensus::handleAppendEntries(
     // acknowledged data is safe. However, there is a window of vulnerability
     // on the follower's disk between the truncate and append operations (which
     // are not done atomically) when the follower processes the later request.
-    uint64_t entryId = request.prev_log_index();
+    uint64_t index = request.prev_log_index();
     for (auto it = request.entries().begin();
          it != request.entries().end();
          ++it) {
-        ++entryId;
+        ++index;
         const Protocol::Raft::Entry& entry = *it;
-        if (entryId < log->getLogStartIndex()) {
+        if (index < log->getLogStartIndex()) {
             // We already snapshotted and discarded this index, so presumably
             // we've received a committed entry we once already had.
             continue;
         }
-        if (log->getLastLogIndex() >= entryId) {
-            if (log->getEntry(entryId).term() == entry.term())
+        if (log->getLastLogIndex() >= index) {
+            if (log->getEntry(index).term() == entry.term())
                 continue;
             // should never truncate committed entries:
-            assert(commitIndex < entryId);
+            assert(commitIndex < index);
             NOTICE("Truncating %lu entries after %lu from the log",
-                   log->getLastLogIndex() - entryId + 1,
-                   entryId - 1);
-            log->truncateSuffix(entryId - 1);
-            configurationManager->truncateSuffix(entryId - 1);
+                   log->getLastLogIndex() - index + 1,
+                   index - 1);
+            log->truncateSuffix(index - 1);
+            configurationManager->truncateSuffix(index - 1);
         }
 
         // Append this and all following entries.
         std::vector<const Protocol::Raft::Entry*> entries;
-        while (it != request.entries().end()) {
-            entries.push_back(&*it);
+        do {
+            const Protocol::Raft::Entry& entry = *it;
+            if (entry.type() == Protocol::Raft::EntryType::UNKNOWN) {
+                PANIC("Leader %lu is trying to send us an unknown log entry "
+                      "type for index %lu (term %lu). It shouldn't do that, "
+                      "and there's not a good way forward. There's some hope "
+                      "that if this server reboots, it'll come back up with a "
+                      "newer version of the code that understands the entry.",
+                      index,
+                      entry.term(),
+                      leaderId);
+            }
+            entries.push_back(&entry);
             ++it;
-        }
+            ++index;
+        } while (it != request.entries().end());
         append(entries);
+        clusterClock.newEpoch(entries.back()->cluster_time());
         break;
     }
+    response.set_last_log_index(log->getLastLogIndex());
 
     // Set our committed ID from the request's. In rare cases, this would make
     // our committed ID decrease. For example, this could happen with a new
@@ -1182,11 +1310,11 @@ RaftConsensus::handleAppendEntries(
 }
 
 void
-RaftConsensus::handleAppendSnapshotChunk(
-        const Protocol::Raft::AppendSnapshotChunk::Request& request,
-        Protocol::Raft::AppendSnapshotChunk::Response& response)
+RaftConsensus::handleInstallSnapshot(
+        const Protocol::Raft::InstallSnapshot::Request& request,
+        Protocol::Raft::InstallSnapshot::Response& response)
 {
-    std::unique_lock<Mutex> lockGuard(mutex);
+    std::lock_guard<Mutex> lockGuard(mutex);
     assert(!exiting);
 
     response.set_term(currentTerm);
@@ -1198,7 +1326,7 @@ RaftConsensus::handleAppendSnapshotChunk(
         return;
     }
     if (request.term() > currentTerm) {
-        NOTICE("Received AppendSnapshotChunk request from server %lu in "
+        NOTICE("Received InstallSnapshot request from server %lu in "
                "term %lu (this server's term was %lu)",
                 request.server_id(), request.term(), currentTerm);
         // We're about to bump our term in the stepDown below: update
@@ -1216,30 +1344,29 @@ RaftConsensus::handleAppendSnapshotChunk(
     if (leaderId == 0) {
         leaderId = request.server_id();
         NOTICE("All hail leader %lu for term %lu", leaderId, currentTerm);
+        printElectionState();
     } else {
         assert(leaderId == request.server_id());
     }
 
     if (!snapshotWriter) {
         snapshotWriter.reset(
-            new Storage::SnapshotFile::Writer(storageDirectory));
+            new Storage::SnapshotFile::Writer(storageLayout));
     }
-    if (request.byte_offset() <
-        uint64_t(snapshotWriter->getStream().ByteCount())) {
+    if (request.byte_offset() < snapshotWriter->getBytesWritten()) {
         WARNING("Ignoring stale snapshot chunk for byte offset %lu when the "
                 "next byte needed is %lu",
                 request.byte_offset(),
-                uint64_t(snapshotWriter->getStream().ByteCount()));
+                snapshotWriter->getBytesWritten());
         return;
     }
-    if (request.byte_offset() >
-        uint64_t(snapshotWriter->getStream().ByteCount())) {
+    if (request.byte_offset() > snapshotWriter->getBytesWritten()) {
         PANIC("Leader tried to send snapshot chunk at byte offset %lu but the "
               "next byte needed is %lu. It's supposed to send these in order.",
               request.byte_offset(),
-              uint64_t(snapshotWriter->getStream().ByteCount()));
+              snapshotWriter->getBytesWritten());
     }
-    snapshotWriter->getStream().WriteString(request.data());
+    snapshotWriter->writeRaw(request.data().data(), request.data().length());
 
     if (request.done()) {
         if (request.last_snapshot_index() < lastSnapshotIndex) {
@@ -1266,8 +1393,15 @@ RaftConsensus::handleRequestVote(
                     const Protocol::Raft::RequestVote::Request& request,
                     Protocol::Raft::RequestVote::Response& response)
 {
-    std::unique_lock<Mutex> lockGuard(mutex);
+    std::lock_guard<Mutex> lockGuard(mutex);
     assert(!exiting);
+
+    // If the caller has a less complete log, we can't give it our vote.
+    uint64_t lastLogIndex = log->getLastLogIndex();
+    uint64_t lastLogTerm = getLastLogTerm();
+    bool logIsOk = (request.last_log_term() > lastLogTerm ||
+                    (request.last_log_term() == lastLogTerm &&
+                     request.last_log_index() >= lastLogIndex));
 
     if (withholdVotesUntil > Clock::now()) {
         NOTICE("Rejecting RequestVote for term %lu from server %lu, since "
@@ -1277,6 +1411,7 @@ RaftConsensus::handleRequestVote(
                leaderId, request.server_id());
         response.set_term(currentTerm);
         response.set_granted(false);
+        response.set_log_ok(logIsOk);
         return;
     }
 
@@ -1291,13 +1426,6 @@ RaftConsensus::handleRequestVote(
     // However, this is just an optimization that does not affect correctness
     // or really even efficiency, so it's not worth the trouble.
 
-    // If the caller has a less complete log, we can't give it our vote.
-    uint64_t lastLogIndex = log->getLastLogIndex();
-    uint64_t lastLogTerm = getLastLogTerm();
-    bool logIsOk = (request.last_log_term() > lastLogTerm ||
-                    (request.last_log_term() == lastLogTerm &&
-                     request.last_log_index() >= lastLogIndex));
-
     if (request.term() == currentTerm) {
         if (logIsOk && votedFor == 0) {
             // Give caller our vote
@@ -1307,6 +1435,7 @@ RaftConsensus::handleRequestVote(
             setElectionTimer();
             votedFor = request.server_id();
             updateLogMetadata();
+            printElectionState();
         }
     }
 
@@ -1315,55 +1444,113 @@ RaftConsensus::handleRequestVote(
     // don't strictly need the first condition
     response.set_granted(request.term() == currentTerm &&
                          votedFor == request.server_id());
+    response.set_log_ok(logIsOk);
 }
 
 std::pair<RaftConsensus::ClientResult, uint64_t>
-RaftConsensus::replicate(const std::string& operation)
+RaftConsensus::replicate(const Core::Buffer& operation)
 {
     std::unique_lock<Mutex> lockGuard(mutex);
-    VERBOSE("replicate(%s)", operation.c_str());
     Log::Entry entry;
     entry.set_type(Protocol::Raft::EntryType::DATA);
-    entry.set_data(operation);
+    entry.set_data(operation.getData(), operation.getLength());
     return replicateEntry(entry, lockGuard);
 }
 
+struct StagingProgressing {
+    StagingProgressing(uint64_t epoch,
+                       Protocol::Client::SetConfiguration::Response& response)
+        : epoch(epoch)
+        , response(response)
+    {
+    }
+    bool operator()(Server& server) {
+        uint64_t serverEpoch = server.getLastAckEpoch();
+        if (serverEpoch < epoch) {
+            auto& s = *response.mutable_configuration_bad()->add_bad_servers();
+            s.set_server_id(server.serverId);
+            s.set_addresses(server.addresses);
+            return false;
+        }
+        return true;
+    }
+    const uint64_t epoch;
+    Protocol::Client::SetConfiguration::Response& response;
+};
+
 RaftConsensus::ClientResult
 RaftConsensus::setConfiguration(
-        uint64_t oldId,
-        const Protocol::Raft::SimpleConfiguration& nextConfiguration)
+        const Protocol::Client::SetConfiguration::Request& request,
+        Protocol::Client::SetConfiguration::Response& response)
 {
     std::unique_lock<Mutex> lockGuard(mutex);
 
-    if (state != State::LEADER)
+    if (exiting || state != State::LEADER) {
+        // caller fills out response
         return ClientResult::NOT_LEADER;
-    if (configuration->id != oldId ||
-        configuration->state != Configuration::State::STABLE) {
+    }
+    if (configuration->id != request.old_id()) {
         // configurations has changed in the meantime
+        response.mutable_configuration_changed()->set_error(
+            Core::StringUtil::format(
+                "The current configuration has ID %lu (no longer %lu) "
+                "and it's %s",
+                configuration->id,
+                request.old_id(),
+                Core::StringUtil::toString(configuration->state).c_str()));
+        return ClientResult::FAIL;
+    }
+    if (configuration->state != Configuration::State::STABLE) {
+        response.mutable_configuration_changed()->set_error(
+            Core::StringUtil::format(
+                "The current configuration (%lu) is not stable (it's %s)",
+                configuration->id,
+                Core::StringUtil::toString(configuration->state).c_str()));
         return ClientResult::FAIL;
     }
 
-    uint64_t term = currentTerm;
+    NOTICE("Attempting to change the configuration from %lu",
+           configuration->id);
+
+    // Set the staging servers in the configuration.
+    Protocol::Raft::SimpleConfiguration nextConfiguration;
+    for (auto it = request.new_servers().begin();
+         it != request.new_servers().end();
+         ++it) {
+        NOTICE("Adding server %lu at %s to staging servers",
+               it->server_id(), it->addresses().c_str());
+        Protocol::Raft::Server* s = nextConfiguration.add_servers();
+        s->set_server_id(it->server_id());
+        s->set_addresses(it->addresses());
+    }
     configuration->setStagingServers(nextConfiguration);
     stateChanged.notify_all();
 
     // Wait for new servers to be caught up. This will abort if not every
     // server makes progress in a ELECTION_TIMEOUT_MS period.
+    uint64_t term = currentTerm;
     ++currentEpoch;
     uint64_t epoch = currentEpoch;
     TimePoint checkProgressAt =
         Clock::now() + std::chrono::milliseconds(ELECTION_TIMEOUT_MS);
     while (true) {
-        if (exiting || term != currentTerm)
+        if (exiting || term != currentTerm) {
+            NOTICE("Lost leadership, aborting configuration change");
+            // caller will fill in response
             return ClientResult::NOT_LEADER;
-        if (configuration->stagingAll(&Server::isCaughtUp))
+        }
+        if (configuration->stagingAll(&Server::isCaughtUp)) {
+            NOTICE("Done catching up servers");
             break;
+        }
         if (Clock::now() >= checkProgressAt) {
-            if (configuration->stagingMin(&Server::getLastAckEpoch) < epoch) {
+            StagingProgressing progressing(epoch, response);
+            if (!configuration->stagingAll(progressing)) {
+                NOTICE("Failed to catch up new servers, aborting "
+                       "configuration change");
                 configuration->resetStagingServers();
                 stateChanged.notify_all();
-                // TODO(ongaro): probably need to return a different type of
-                // message: confuses oldId mismatch from new server down
+                // progressing filled in response
                 return ClientResult::FAIL;
             } else {
                 ++currentEpoch;
@@ -1377,6 +1564,7 @@ RaftConsensus::setConfiguration(
     }
 
     // Write and commit transitional configuration
+    NOTICE("Writing transitional configuration entry");
     Protocol::Raft::Configuration newConfiguration;
     *newConfiguration.mutable_prev_configuration() =
         configuration->description.prev_configuration();
@@ -1386,35 +1574,72 @@ RaftConsensus::setConfiguration(
     *entry.mutable_configuration() = newConfiguration;
     std::pair<ClientResult, uint64_t> result =
         replicateEntry(entry, lockGuard);
-    if (result.first != ClientResult::SUCCESS)
+    if (result.first != ClientResult::SUCCESS) {
+        NOTICE("Failed to commit transitional configuration entry, aborting "
+               "configuration change (%s)",
+               Core::StringUtil::toString(result.first).c_str());
+        if (result.first == ClientResult::NOT_LEADER) {
+            // caller will fill in response
+        } else {
+            response.mutable_configuration_changed()->set_error(
+                Core::StringUtil::format(
+                    "Couldn't successfully replicate the transitional "
+                    "configuration (%s)",
+                    Core::StringUtil::toString(result.first).c_str()));
+        }
         return result.first;
+    }
     uint64_t transitionalId = result.second;
 
     // Wait until the configuration that removes the old servers has been
     // committed. This is the first configuration with ID greater than
     // transitionalId.
+    NOTICE("Waiting for stable configuration to commit");
     while (true) {
         // Check this first: if the new configuration excludes us so we've
         // stepped down upon committing it, we still want to return success.
         if (configuration->id > transitionalId &&
             commitIndex >= configuration->id) {
+            response.mutable_ok();
+            NOTICE("Stable configuration committed. Configuration change "
+                   "completed successfully");
             return ClientResult::SUCCESS;
         }
-        if (exiting || term != currentTerm)
+        if (exiting || term != currentTerm) {
+            NOTICE("Lost leadership");
+            // caller fills in response
             return ClientResult::NOT_LEADER;
+        }
         stateChanged.wait(lockGuard);
+    }
+}
+
+void
+RaftConsensus::setSupportedStateMachineVersions(uint16_t minSupported,
+                                                uint16_t maxSupported)
+{
+    std::lock_guard<Mutex> lockGuard(mutex);
+    auto& s = *configuration->localServer;
+    if (!s.haveStateMachineSupportedVersions ||
+        s.minStateMachineVersion != minSupported ||
+        s.maxStateMachineVersion != maxSupported) {
+
+        s.haveStateMachineSupportedVersions = true;
+        s.minStateMachineVersion = minSupported;
+        s.maxStateMachineVersion = maxSupported;
+        stateChanged.notify_all();
     }
 }
 
 std::unique_ptr<Storage::SnapshotFile::Writer>
 RaftConsensus::beginSnapshot(uint64_t lastIncludedIndex)
 {
-    std::unique_lock<Mutex> lockGuard(mutex);
+    std::lock_guard<Mutex> lockGuard(mutex);
 
     NOTICE("Creating new snapshot through log index %lu (inclusive)",
            lastIncludedIndex);
     std::unique_ptr<Storage::SnapshotFile::Writer> writer(
-                new Storage::SnapshotFile::Writer(storageDirectory));
+                new Storage::SnapshotFile::Writer(storageLayout));
 
     // Only committed entries may be snapshotted.
     // (This check relies on commitIndex monotonically increasing.)
@@ -1423,20 +1648,28 @@ RaftConsensus::beginSnapshot(uint64_t lastIncludedIndex)
               "%lu is last committed entry)", lastIncludedIndex, commitIndex);
     }
 
+    // Format version of snapshot file is 1.
+    uint8_t version = 1;
+    writer->writeRaw(&version, sizeof(version));
+
     // set header fields
     SnapshotMetadata::Header header;
     header.set_last_included_index(lastIncludedIndex);
-    // Set last_included_term:
+    // Set last_included_term and last_cluster_time:
     if (lastIncludedIndex >= log->getLogStartIndex() &&
         lastIncludedIndex <= log->getLastLogIndex()) {
-        header.set_last_included_term(log->getEntry(lastIncludedIndex).term());
+        const Log::Entry& entry = log->getEntry(lastIncludedIndex);
+        header.set_last_included_term(entry.term());
+        header.set_last_cluster_time(entry.cluster_time());
     } else if (lastIncludedIndex == 0) {
         WARNING("Taking a snapshot covering no log entries");
         header.set_last_included_term(0);
+        header.set_last_cluster_time(0);
     } else if (lastIncludedIndex == lastSnapshotIndex) {
         WARNING("Taking a snapshot where we already have one, covering "
                 "entries 1 through %lu (inclusive)", lastIncludedIndex);
         header.set_last_included_term(lastSnapshotTerm);
+        header.set_last_cluster_time(lastSnapshotClusterTime);
     } else {
         WARNING("We've already discarded the entries that the state machine "
                 "wants to snapshot. This can happen in rare cases if the "
@@ -1447,7 +1680,9 @@ RaftConsensus::beginSnapshot(uint64_t lastIncludedIndex)
         // If this turns out to be common, we should return NULL instead and
         // change the state machines to deal with that.
         header.set_last_included_term(0);
+        header.set_last_cluster_time(0);
     }
+
     // Copy the configuration as of lastIncludedIndex to the header.
     std::pair<uint64_t, Protocol::Raft::Configuration> c =
         configurationManager->getLatestConfigurationAsOf(lastIncludedIndex);
@@ -1460,11 +1695,7 @@ RaftConsensus::beginSnapshot(uint64_t lastIncludedIndex)
     }
 
     // write header to file
-    google::protobuf::io::CodedOutputStream& stream = writer->getStream();
-    int size = header.ByteSize();
-    stream.WriteLittleEndian32(size);
-    header.SerializeWithCachedSizes(&stream);
-
+    writer->writeMessage(header);
     return writer;
 }
 
@@ -1473,7 +1704,7 @@ RaftConsensus::snapshotDone(
         uint64_t lastIncludedIndex,
         std::unique_ptr<Storage::SnapshotFile::Writer> writer)
 {
-    std::unique_lock<Mutex> lockGuard(mutex);
+    std::lock_guard<Mutex> lockGuard(mutex);
     if (lastIncludedIndex <= lastSnapshotIndex) {
         NOTICE("Discarding snapshot through %lu since we already have one "
                "(presumably from another server) through %lu",
@@ -1493,7 +1724,9 @@ RaftConsensus::snapshotDone(
 
     lastSnapshotBytes = writer->save();
     lastSnapshotIndex = lastIncludedIndex;
-    lastSnapshotTerm = log->getEntry(lastIncludedIndex).term();
+    const Log::Entry& lastEntry = log->getEntry(lastIncludedIndex);
+    lastSnapshotTerm = lastEntry.term();
+    lastSnapshotClusterTime = lastEntry.cluster_time();
 
     // It's easier to grab this configuration out of the manager again than to
     // carry it around after writing the header.
@@ -1520,7 +1753,7 @@ RaftConsensus::snapshotDone(
 void
 RaftConsensus::updateServerStats(Protocol::ServerStats& serverStats) const
 {
-    std::unique_lock<Mutex> lockGuard(mutex);
+    std::lock_guard<Mutex> lockGuard(mutex);
     Core::Time::SteadyTimeConverter time;
     serverStats.clear_raft();
     Protocol::ServerStats::Raft& raftStats = *serverStats.mutable_raft();
@@ -1543,8 +1776,12 @@ RaftConsensus::updateServerStats(Protocol::ServerStats& serverStats) const
     raftStats.set_voted_for(votedFor);
     raftStats.set_start_election_at(time.unixNanos(startElectionAt));
     raftStats.set_withhold_votes_until(time.unixNanos(withholdVotesUntil));
+    raftStats.set_cluster_time_epoch(clusterClock.clusterTimeAtEpoch);
+    raftStats.set_cluster_time(clusterClock.interpolate());
 
     raftStats.set_last_snapshot_index(lastSnapshotIndex);
+    raftStats.set_last_snapshot_term(lastSnapshotTerm);
+    raftStats.set_last_snapshot_cluster_time(lastSnapshotClusterTime);
     raftStats.set_last_snapshot_bytes(lastSnapshotBytes);
     raftStats.set_log_start_index(log->getLogStartIndex());
     raftStats.set_log_bytes(log->getSizeBytes());
@@ -1555,7 +1792,7 @@ RaftConsensus::updateServerStats(Protocol::ServerStats& serverStats) const
 std::ostream&
 operator<<(std::ostream& os, const RaftConsensus& raft)
 {
-    std::unique_lock<Mutex> lockGuard(raft.mutex);
+    std::lock_guard<Mutex> lockGuard(raft.mutex);
     typedef RaftConsensus::State State;
     os << "server id: " << raft.serverId << std::endl;
     os << "term: " << raft.currentTerm << std::endl;
@@ -1563,6 +1800,8 @@ operator<<(std::ostream& os, const RaftConsensus& raft)
     os << "leader: " << raft.leaderId << std::endl;
     os << "lastSnapshotIndex: " << raft.lastSnapshotIndex << std::endl;
     os << "lastSnapshotTerm: " << raft.lastSnapshotTerm << std::endl;
+    os << "lastSnapshotClusterTime: " << raft.lastSnapshotClusterTime
+       << std::endl;
     os << "commitIndex: " << raft.commitIndex << std::endl;
     switch (raft.state) {
         case State::FOLLOWER:
@@ -1585,6 +1824,115 @@ operator<<(std::ostream& os, const RaftConsensus& raft)
 
 
 //// RaftConsensus private methods that MUST acquire the lock
+
+namespace {
+struct StateMachineVersionIntersection {
+    StateMachineVersionIntersection()
+        : missingCount(0)
+        , allCount(0)
+        , minVersion(0)
+        , maxVersion(std::numeric_limits<uint16_t>::max()) {
+    }
+    void operator()(Server& server) {
+        ++allCount;
+        if (server.haveStateMachineSupportedVersions) {
+            minVersion = std::max(server.minStateMachineVersion,
+                                  minVersion);
+            maxVersion = std::min(server.maxStateMachineVersion,
+                                  maxVersion);
+        } else {
+            ++missingCount;
+        }
+    }
+    uint64_t missingCount;
+    uint64_t allCount;
+    uint16_t minVersion;
+    uint16_t maxVersion;
+};
+} // anonymous namespace
+
+void
+RaftConsensus::stateMachineUpdaterThreadMain()
+{
+    // This implementation might create many spurious entries, since this
+    // process will append a state machine version if it hasn't appended that
+    // same version before during this boot. That should be fine for most use
+    // cases. If the state machine's num_redundant_advance_version_entries
+    // server stat gets to be large, this may need to be revisited.
+    std::unique_lock<Mutex> lockGuard(mutex);
+    Core::ThreadId::setName("StateMachineUpdater");
+    uint64_t lastVersionCommitted = 0;
+    TimePoint backoffUntil = TimePoint::min();
+    while (!exiting) {
+        TimePoint now = Clock::now();
+        if (backoffUntil <= now && state == State::LEADER) {
+            StateMachineVersionIntersection s;
+            configuration->forEach(std::ref(s));
+            if (s.missingCount == 0) {
+                if (s.minVersion > s.maxVersion) {
+                    ERROR("The state machines on the %lu servers do not "
+                          "currently support a common version "
+                          "(max of mins=%u, min of maxes=%u). Will wait to "
+                          "change the state machine version for at least "
+                          "another backoff period",
+                          s.allCount,
+                          s.minVersion,
+                          s.maxVersion);
+                    backoffUntil = now + STATE_MACHINE_UPDATER_BACKOFF;
+                } else { // s.maxVersion is the one we want
+                    if (s.maxVersion > lastVersionCommitted) {
+                        NOTICE("Appending log entry to advance state machine "
+                               "version to %u (it may be set to %u already, "
+                               "but it's hard to check that and not much "
+                               "overhead to just do it again)",
+                               s.maxVersion,
+                               s.maxVersion);
+                        Log::Entry entry;
+                        entry.set_term(currentTerm);
+                        entry.set_type(Protocol::Raft::EntryType::DATA);
+                        entry.set_cluster_time(clusterClock.leaderStamp());
+                        Protocol::Client::StateMachineCommand::Request command;
+                        command.mutable_advance_version()->
+                            set_requested_version(s.maxVersion);
+                        Core::Buffer cmdBuf;
+                        Core::ProtoBuf::serialize(command, cmdBuf);
+                        entry.set_data(cmdBuf.getData(), cmdBuf.getLength());
+
+                        std::pair<ClientResult, uint64_t> result =
+                            replicateEntry(entry, lockGuard);
+                        if (result.first == ClientResult::SUCCESS) {
+                            lastVersionCommitted = s.maxVersion;
+                        } else {
+                            using Core::StringUtil::toString;
+                            WARNING("Failed to commit entry to advance state "
+                                    "machine version to version %u (%s). "
+                                    "Will retry later after backoff period",
+                                    s.maxVersion,
+                                    toString(result.first).c_str());
+                            backoffUntil = now + STATE_MACHINE_UPDATER_BACKOFF;
+                        }
+                        continue;
+                    } else {
+                        // We're in good shape, go back to sleep.
+                    }
+                }
+            } else { // missing info from at least one server
+                // Do nothing until we have info from everyone else
+                // (stateChanged will be notified). The backoff is here just to
+                // avoid spamming the NOTICE message.
+                NOTICE("Waiting to receive state machine supported version "
+                       "information from all peers (missing %lu of %lu)",
+                       s.missingCount, s.allCount);
+                backoffUntil = now + STATE_MACHINE_UPDATER_BACKOFF;
+            }
+        }
+        if (backoffUntil <= now)
+            stateChanged.wait(lockGuard);
+        else
+            stateChanged.wait_until(lockGuard, backoffUntil);
+    }
+    NOTICE("Exiting");
+}
 
 void
 RaftConsensus::leaderDiskThreadMain()
@@ -1609,7 +1957,7 @@ RaftConsensus::leaderDiskThreadMain()
             }
             if (state == State::LEADER && currentTerm == term) {
                 configuration->localServer->lastSyncedIndex = sync->lastIndex;
-                advanceCommittedId();
+                advanceCommitIndex();
             }
             log->syncComplete(std::move(sync));
             continue;
@@ -1636,6 +1984,7 @@ RaftConsensus::peerThreadMain(std::shared_ptr<Peer> peer)
     std::unique_lock<Mutex> lockGuard(mutex);
     Core::ThreadId::setName(
         Core::StringUtil::format("Peer(%lu)", peer->serverId));
+    NOTICE("Peer thread for server %lu started", peer->serverId);
 
     // Each iteration of this loop issues a new RPC or sleeps on the condition
     // variable.
@@ -1664,7 +2013,7 @@ RaftConsensus::peerThreadMain(std::shared_ptr<Peer> peer)
                 case State::LEADER:
                     if (peer->getLastAgreeIndex() < log->getLastLogIndex() ||
                         peer->nextHeartbeatTime < now) {
-                        // appendEntries delegates to appendSnapshotChunk if we
+                        // appendEntries delegates to installSnapshot if we
                         // need to send a snapshot instead
                         appendEntries(lockGuard, *peer);
                     } else {
@@ -1680,6 +2029,7 @@ RaftConsensus::peerThreadMain(std::shared_ptr<Peer> peer)
     // must return immediately after this
     --numPeerThreads;
     stateChanged.notify_all();
+    NOTICE("Peer thread for server %lu exiting", peer->serverId);
 }
 
 void
@@ -1735,28 +2085,28 @@ RaftConsensus::stepDownThreadMain()
 //// RaftConsensus private methods that MUST NOT acquire the lock
 
 void
-RaftConsensus::advanceCommittedId()
+RaftConsensus::advanceCommitIndex()
 {
     if (state != State::LEADER) {
         // getLastAgreeIndex is undefined unless we're leader
-        WARNING("advanceCommittedId called as %s",
+        WARNING("advanceCommitIndex called as %s",
                 Core::StringUtil::toString(state).c_str());
         return;
     }
 
     // calculate the largest entry ID stored on a quorum of servers
-    uint64_t newCommittedId =
+    uint64_t newCommitIndex =
         configuration->quorumMin(&Server::getLastAgreeIndex);
-    if (commitIndex >= newCommittedId)
+    if (commitIndex >= newCommitIndex)
         return;
     // If we have discarded the entry, it's because we already knew it was
     // committed.
-    assert(newCommittedId >= log->getLogStartIndex());
+    assert(newCommitIndex >= log->getLogStartIndex());
     // At least one of these entries must also be from the current term to
     // guarantee that no server without them can be elected.
-    if (log->getEntry(newCommittedId).term() != currentTerm)
+    if (log->getEntry(newCommitIndex).term() != currentTerm)
         return;
-    commitIndex = newCommittedId;
+    commitIndex = newCommitIndex;
     VERBOSE("New commitIndex: %lu", commitIndex);
     assert(commitIndex <= log->getLastLogIndex());
     stateChanged.notify_all();
@@ -1777,6 +2127,7 @@ RaftConsensus::advanceCommittedId()
             Log::Entry entry;
             entry.set_term(currentTerm);
             entry.set_type(Protocol::Raft::EntryType::CONFIGURATION);
+            entry.set_cluster_time(clusterClock.leaderStamp());
             *entry.mutable_configuration()->mutable_prev_configuration() =
                 configuration->description.next_configuration();
             append({&entry});
@@ -1818,7 +2169,7 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
 
     // Don't have needed entry: send a snapshot instead.
     if (peer.nextIndex < log->getLogStartIndex()) {
-        appendSnapshotChunk(lockGuard, peer);
+        installSnapshot(lockGuard, peer);
         return;
     }
 
@@ -1832,14 +2183,13 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
         prevLogTerm = lastSnapshotTerm;
     } else {
         // Don't have needed entry for prevLogTerm: send snapshot instead.
-        appendSnapshotChunk(lockGuard, peer);
+        installSnapshot(lockGuard, peer);
         return;
     }
 
     // Build up request
     Protocol::Raft::AppendEntries::Request request;
     request.set_server_id(serverId);
-    request.set_recipient_id(peer.serverId);
     request.set_term(currentTerm);
     request.set_prev_log_term(prevLogTerm);
     request.set_prev_log_index(prevLogIndex);
@@ -1849,17 +2199,17 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
     // the last one out.
     uint64_t numEntries = 0;
     if (!peer.forceHeartbeat) {
-        for (uint64_t entryId = peer.nextIndex;
-             entryId <= lastLogIndex;
-             ++entryId) {
-            const Log::Entry& entry = log->getEntry(entryId);
+        for (uint64_t index = peer.nextIndex;
+             index <= lastLogIndex;
+             ++index) {
+            const Log::Entry& entry = log->getEntry(index);
             *request.add_entries() = entry;
             uint64_t requestSize =
                 Core::Util::downCast<uint64_t>(request.ByteSize());
             if (requestSize < SOFT_RPC_SIZE_LIMIT || numEntries == 0) {
                 // this entry fits, send it
-                VERBOSE("sending entry <id=%lu,term=%lu>",
-                        entryId, entry.term());
+                VERBOSE("sending entry <index=%lu,term=%lu>",
+                        index, entry.term());
                 ++numEntries;
             } else {
                 // this entry doesn't fit, discard it
@@ -1873,13 +2223,20 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
     Protocol::Raft::AppendEntries::Response response;
     TimePoint start = Clock::now();
     uint64_t epoch = currentEpoch;
-    bool ok = peer.callRPC(Protocol::Raft::OpCode::APPEND_ENTRIES,
-                           request, response,
-                           lockGuard);
-    if (!ok) {
-        peer.backoffUntil = start +
-            std::chrono::milliseconds(RPC_FAILURE_BACKOFF_MS);
-        return;
+    Peer::CallStatus status = peer.callRPC(
+                Protocol::Raft::OpCode::APPEND_ENTRIES,
+                request, response,
+                lockGuard);
+    switch (status) {
+        case Peer::CallStatus::OK:
+            break;
+        case Peer::CallStatus::FAILED:
+            peer.backoffUntil = start +
+                std::chrono::milliseconds(RPC_FAILURE_BACKOFF_MS);
+            return;
+        case Peer::CallStatus::INVALID_REQUEST:
+            PANIC("The server's RaftService doesn't support the AppendEntries "
+                  "RPC or claims the request is malformed");
     }
 
     // Process response
@@ -1911,7 +2268,7 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
                         "didn't.");
             } else {
                 peer.lastAgreeIndex = prevLogIndex + numEntries;
-                advanceCommittedId();
+                advanceCommitIndex();
             }
             peer.nextIndex = peer.lastAgreeIndex + 1;
             peer.forceHeartbeat = false;
@@ -1939,25 +2296,36 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
                 --peer.nextIndex;
         }
     }
+    if (response.has_server_capabilities()) {
+        auto& cap = response.server_capabilities();
+        if (cap.has_min_supported_state_machine_version() &&
+            cap.has_max_supported_state_machine_version()) {
+            peer.haveStateMachineSupportedVersions = true;
+            peer.minStateMachineVersion = Core::Util::downCast<uint16_t>(
+                cap.min_supported_state_machine_version());
+            peer.maxStateMachineVersion = Core::Util::downCast<uint16_t>(
+                cap.max_supported_state_machine_version());
+            stateChanged.notify_all();
+        }
+    }
 }
 
 void
-RaftConsensus::appendSnapshotChunk(std::unique_lock<Mutex>& lockGuard,
-                                   Peer& peer)
+RaftConsensus::installSnapshot(std::unique_lock<Mutex>& lockGuard,
+                               Peer& peer)
 {
     // Build up request
-    Protocol::Raft::AppendSnapshotChunk::Request request;
+    Protocol::Raft::InstallSnapshot::Request request;
     request.set_server_id(serverId);
-    request.set_recipient_id(peer.serverId);
     request.set_term(currentTerm);
 
     // Open the latest snapshot if we haven't already. Stash a copy of the
     // lastSnapshotIndex that goes along with the file, since it's possible
     // that this will change while we're transferring chunks).
     if (!peer.snapshotFile) {
-        namespace FilesystemUtil = Storage::FilesystemUtil;
-        peer.snapshotFile.reset(new FilesystemUtil::FileContents(
-            FilesystemUtil::openFile(storageDirectory, "snapshot", O_RDONLY)));
+        namespace FS = Storage::FilesystemUtil;
+        peer.snapshotFile.reset(new FS::FileContents(
+            FS::openFile(storageLayout.snapshotDir, "snapshot", O_RDONLY)));
         peer.snapshotFileOffset = 0;
         peer.lastSnapshotIndex = lastSnapshotIndex;
     }
@@ -1975,16 +2343,23 @@ RaftConsensus::appendSnapshotChunk(std::unique_lock<Mutex>& lockGuard,
                      peer.snapshotFile->getFileLength());
 
     // Execute RPC
-    Protocol::Raft::AppendSnapshotChunk::Response response;
+    Protocol::Raft::InstallSnapshot::Response response;
     TimePoint start = Clock::now();
     uint64_t epoch = currentEpoch;
-    bool ok = peer.callRPC(Protocol::Raft::OpCode::APPEND_SNAPSHOT_CHUNK,
-                           request, response,
-                           lockGuard);
-    if (!ok) {
-        peer.backoffUntil = start +
-            std::chrono::milliseconds(RPC_FAILURE_BACKOFF_MS);
-        return;
+    Peer::CallStatus status = peer.callRPC(
+                Protocol::Raft::OpCode::INSTALL_SNAPSHOT,
+                request, response,
+                lockGuard);
+    switch (status) {
+        case Peer::CallStatus::OK:
+            break;
+        case Peer::CallStatus::FAILED:
+            peer.backoffUntil = start +
+                std::chrono::milliseconds(RPC_FAILURE_BACKOFF_MS);
+            return;
+        case Peer::CallStatus::INVALID_REQUEST:
+            PANIC("The server's RaftService doesn't support the "
+                  "InstallSnapshot RPC or claims the request is malformed");
     }
 
     // Process response
@@ -1997,7 +2372,7 @@ RaftConsensus::appendSnapshotChunk(std::unique_lock<Mutex>& lockGuard,
     // this term.
     assert(state == State::LEADER);
     if (response.term() > currentTerm) {
-        NOTICE("Received AppendSnapshotChunk response from server %lu in "
+        NOTICE("Received InstallSnapshot response from server %lu in "
                "term %lu (this server's term was %lu)",
                 peer.serverId, response.term(), currentTerm);
         stepDown(response.term());
@@ -2014,8 +2389,8 @@ RaftConsensus::appendSnapshotChunk(std::unique_lock<Mutex>& lockGuard,
             // These entries are already committed if they're in a snapshot, so
             // the commitIndex shouldn't advance, but let's just follow the
             // simple rule that bumping lastAgreeIndex should always be
-            // followed by a call to advanceCommittedId():
-            advanceCommittedId();
+            // followed by a call to advanceCommitIndex():
+            advanceCommitIndex();
             peer.snapshotFile.reset();
             peer.snapshotFileOffset = 0;
             peer.lastSnapshotIndex = 0;
@@ -2030,8 +2405,15 @@ RaftConsensus::becomeLeader()
     NOTICE("Now leader for term %lu", currentTerm);
     state = State::LEADER;
     leaderId = serverId;
+    printElectionState();
     startElectionAt = TimePoint::max();
     withholdVotesUntil = TimePoint::max();
+
+    // Our local cluster time clock has been ticking ever since we got the last
+    // log entry/snapshot. Set the clock back to when that happened, since we
+    // don't really want to count that time (the cluster probably had no leader
+    // for most of it).
+    clusterClock.newEpoch(clusterClock.clusterTimeAtEpoch);
 
     // The ordering is pretty important here: First set nextIndex and
     // lastAgreeIndex for ourselves and each follower, then append the no op.
@@ -2045,6 +2427,7 @@ RaftConsensus::becomeLeader()
     Log::Entry entry;
     entry.set_term(currentTerm);
     entry.set_type(Protocol::Raft::EntryType::NOOP);
+    entry.set_cluster_time(clusterClock.leaderStamp());
     append({&entry});
 
     // Outstanding RequestVote RPCs are no longer needed.
@@ -2095,30 +2478,34 @@ void
 RaftConsensus::readSnapshot()
 {
     std::unique_ptr<Storage::SnapshotFile::Reader> reader;
-    if (storageDirectory.fd != -1) {
+    if (storageLayout.serverDir.fd != -1) {
         try {
-            reader.reset(new Storage::SnapshotFile::Reader(storageDirectory));
+            reader.reset(new Storage::SnapshotFile::Reader(storageLayout));
         } catch (const std::runtime_error& e) { // file not found
             NOTICE("%s", e.what());
         }
     }
     if (reader) {
-        google::protobuf::io::CodedInputStream& stream = reader->getStream();
-
-        // read header protobuf from stream
-        bool ok = true;
-        uint32_t numBytes = 0;
-        ok = stream.ReadLittleEndian32(&numBytes);
-        if (!ok)
-            PANIC("couldn't read snapshot");
-        SnapshotMetadata::Header header;
-        auto limit = stream.PushLimit(numBytes);
-        ok = header.MergePartialFromCodedStream(&stream);
-        stream.PopLimit(limit);
-        if (!ok)
-            PANIC("couldn't read snapshot");
+        // Check that this snapshot uses format version 1
+        uint8_t version = 0;
+        uint64_t bytesRead = reader->readRaw(&version, sizeof(version));
+        if (bytesRead < 1) {
+            PANIC("Found completely empty snapshot file (it doesn't even "
+                  "have a version field)");
+        } else {
+            if (version != 1) {
+                PANIC("Snapshot format version read was %u, but this code can "
+                      "only read version 1",
+                      version);
+            }
+        }
 
         // load header contents
+        SnapshotMetadata::Header header;
+        std::string error = reader->readMessage(header);
+        if (!error.empty()) {
+            PANIC("Couldn't read snapshot header: %s", error.c_str());
+        }
         if (header.last_included_index() < lastSnapshotIndex) {
             PANIC("Trying to load a snapshot that is more stale than one this "
                   "server loaded earlier. The earlier snapshot covers through "
@@ -2130,6 +2517,7 @@ RaftConsensus::readSnapshot()
         }
         lastSnapshotIndex = header.last_included_index();
         lastSnapshotTerm = header.last_included_term();
+        lastSnapshotClusterTime = header.last_cluster_time();
         lastSnapshotBytes = reader->getSizeBytes();
         commitIndex = std::max(lastSnapshotIndex, commitIndex);
 
@@ -2164,6 +2552,7 @@ RaftConsensus::readSnapshot()
                 sync->wait();
                 log->syncComplete(std::move(sync));
             }
+            clusterClock.newEpoch(lastSnapshotClusterTime);
         }
 
         discardUnneededEntries();
@@ -2198,6 +2587,7 @@ RaftConsensus::replicateEntry(Log::Entry& entry,
 {
     if (state == State::LEADER) {
         entry.set_term(currentTerm);
+        entry.set_cluster_time(clusterClock.leaderStamp());
         append({&entry});
         uint64_t index = log->getLastLogIndex();
         while (!exiting && currentTerm == entry.term()) {
@@ -2216,7 +2606,6 @@ RaftConsensus::requestVote(std::unique_lock<Mutex>& lockGuard, Peer& peer)
 {
     Protocol::Raft::RequestVote::Request request;
     request.set_server_id(serverId);
-    request.set_recipient_id(peer.serverId);
     request.set_term(currentTerm);
     request.set_last_log_term(getLastLogTerm());
     request.set_last_log_index(log->getLastLogIndex());
@@ -2225,13 +2614,21 @@ RaftConsensus::requestVote(std::unique_lock<Mutex>& lockGuard, Peer& peer)
     VERBOSE("requestVote start");
     TimePoint start = Clock::now();
     uint64_t epoch = currentEpoch;
-    bool ok = peer.callRPC(Protocol::Raft::OpCode::REQUEST_VOTE,
-                           request, response, lockGuard);
+    Peer::CallStatus status = peer.callRPC(
+                Protocol::Raft::OpCode::REQUEST_VOTE,
+                request, response,
+                lockGuard);
     VERBOSE("requestVote done");
-    if (!ok) {
-        peer.backoffUntil = start +
-            std::chrono::milliseconds(RPC_FAILURE_BACKOFF_MS);
-        return;
+    switch (status) {
+        case Peer::CallStatus::OK:
+            break;
+        case Peer::CallStatus::FAILED:
+            peer.backoffUntil = start +
+                std::chrono::milliseconds(RPC_FAILURE_BACKOFF_MS);
+            return;
+        case Peer::CallStatus::INVALID_REQUEST:
+            PANIC("The server's RaftService doesn't support the RequestVote "
+                  "RPC or claims the request is malformed");
     }
 
     if (currentTerm != request.term() || state != State::CANDIDATE ||
@@ -2275,6 +2672,29 @@ RaftConsensus::setElectionTimer()
 }
 
 void
+RaftConsensus::printElectionState() const
+{
+    const char* s = NULL;
+    switch (state) {
+        case State::FOLLOWER:
+            s = "FOLLOWER, ";
+            break;
+        case State::CANDIDATE:
+            s = "CANDIDATE,";
+            break;
+        case State::LEADER:
+            s = "LEADER,   ";
+            break;
+    }
+    NOTICE("server=%lu, term=%lu, state=%s leader=%lu, vote=%lu",
+           serverId,
+           currentTerm,
+           s,
+           leaderId,
+           votedFor);
+}
+
+void
 RaftConsensus::startNewElection()
 {
     if (configuration->id == 0) {
@@ -2283,11 +2703,25 @@ RaftConsensus::startNewElection()
         return;
     }
 
-    NOTICE("Running for election in term %lu", currentTerm + 1);
+    if (leaderId > 0) {
+        NOTICE("Running for election in term %lu "
+               "(haven't heard from leader %lu lately)",
+               currentTerm + 1,
+               leaderId);
+    } else if (state == State::CANDIDATE) {
+        NOTICE("Running for election in term %lu "
+               "(previous candidacy for term %lu timed out)",
+               currentTerm + 1,
+               currentTerm);
+    } else {
+        NOTICE("Running for election in term %lu",
+               currentTerm + 1);
+    }
     ++currentTerm;
     state = State::CANDIDATE;
     leaderId = 0;
     votedFor = serverId;
+    printElectionState();
     setElectionTimer();
     configuration->forEach(&Server::beginRequestVote);
     if (snapshotWriter) {
@@ -2317,8 +2751,14 @@ RaftConsensus::stepDown(uint64_t newTerm)
             snapshotWriter->discard();
             snapshotWriter.reset();
         }
+        state = State::FOLLOWER;
+        printElectionState();
+    } else {
+        if (state != State::FOLLOWER) {
+            state = State::FOLLOWER;
+            printElectionState();
+        }
     }
-    state = State::FOLLOWER;
     if (startElectionAt == TimePoint::max()) // was leader
         setElectionTimer();
     if (withholdVotesUntil == TimePoint::max()) // was leader

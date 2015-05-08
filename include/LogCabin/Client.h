@@ -31,8 +31,21 @@
 
 namespace LogCabin {
 
+// forward declarations
+namespace Core {
+namespace Debug {
+} // namespace LogCabin::Core::Debug
+} // namespace LogCabin::Core
+
+// forward declarations
 namespace Protocol {
-class ServerStats; // forward declaration
+class ServerStats;
+namespace Client {
+class StateMachineQuery_Request;
+class StateMachineQuery_Response;
+class StateMachineCommand_Request;
+class StateMachineCommand_Response;
+} // namespace LogCabin::Protocol::Client
 } // namespace LogCabin::Protocol
 
 namespace Client {
@@ -40,13 +53,43 @@ namespace Client {
 class ClientImpl; // forward declaration
 class TreeDetails; // forward declaration
 
+// To control how the debug log operates, clients should
+// #include <LogCabin/Debug.h>
+// and access it through
+// LogCabin::Client::Debug.
+namespace Debug = Core::Debug;
+
 /**
- * A list of servers.
- * The first component is the server ID.
- * The second component is the network address of the server.
+ * A member of the cluster Configuration.
+ */
+struct Server {
+    /// Constructor.
+    Server(uint64_t serverId, const std::string& addresses);
+    /// Default constructor.
+    Server();
+    /// Copy constructor.
+    Server(const Server& other);
+    /// Destructor.
+    ~Server();
+    /// Copy assignment.
+    Server& operator=(const Server& other);
+
+    /**
+     * The unique ID of the server.
+     */
+    uint64_t serverId;
+
+    /**
+     * The network addresses of the server (comma-delimited).
+     */
+    std::string addresses;
+};
+
+/**
+ * Defines the members of the cluster.
  * Used in Cluster::getConfiguration and Cluster::setConfiguration.
  */
-typedef std::vector<std::pair<uint64_t, std::string>> Configuration;
+typedef std::vector<Server> Configuration;
 
 /**
  * Returned by Cluster::setConfiguration.
@@ -54,6 +97,7 @@ typedef std::vector<std::pair<uint64_t, std::string>> Configuration;
 struct ConfigurationResult {
     ConfigurationResult();
     ~ConfigurationResult();
+
     enum Status {
         /**
          * The operation succeeded.
@@ -75,6 +119,11 @@ struct ConfigurationResult {
      * If status is BAD, the servers that were unavailable to join the cluster.
      */
     Configuration badServers;
+
+    /**
+     * Error message, if status is not OK.
+     */
+    std::string error;
 };
 
 /**
@@ -460,6 +509,64 @@ class Tree {
 };
 
 /**
+ * When running in testing mode, these callbacks serve as a way for the
+ * application to interpose on requests and responses to inject failures and
+ * model dynamic scenarios. See Cluster's constructor for more information.
+ *
+ * This is experimental and is not part of LogCabin's public API.
+ */
+class TestingCallbacks {
+  public:
+
+    /**
+     * Constructor. Does nothing.
+     */
+    TestingCallbacks();
+
+    /**
+     * Destructor. Does nothing.
+     */
+    virtual ~TestingCallbacks();
+
+    /**
+     * Handle a read-only state machine query, such as Tree::read or
+     * Tree::listDirectory.
+     * The default implementation just returns false.
+     * \param[in,out] request
+     *      Protocol buffer containing request details. You can modify this and
+     *      return false to have a slightly different request executed against
+     *      the in-memory data structure.
+     * \param[out] response
+     *      Protocol buffer where response details should be filled in if true
+     *      is returned.
+     * \return
+     *      True if handled, false to query the in-memory data structure.
+     */
+    virtual bool stateMachineQuery(
+        Protocol::Client::StateMachineQuery_Request& request,
+        Protocol::Client::StateMachineQuery_Response& response);
+
+    /**
+     * Handle a read-write state machine command, such as Tree::read or
+     * Tree::listDirectory.
+     * The default implementation just returns false.
+     * \param[in,out] request
+     *      Protocol buffer containing request details. You can modify this and
+     *      return false to have a slightly different request executed against
+     *      the in-memory data structure.
+     * \param[out] response
+     *      Protocol buffer where response details should be filled in if true
+     *      is returned.
+     * \return
+     *      True if handled, false to query the in-memory data structure.
+     */
+    virtual bool stateMachineCommand(
+        Protocol::Client::StateMachineCommand_Request& request,
+        Protocol::Client::StateMachineCommand_Response& response);
+};
+
+
+/**
  * A handle to the LogCabin cluster.
  *
  * If the client requests changes to the cluster's replicated state machine
@@ -476,26 +583,28 @@ class Cluster {
     /**
      * Settings for the client library. These are all optional.
      * Currently supported options:
+     * - clusterUUID (see sample.conf)
      * - tcpHeartbeatTimeoutMilliseconds (see sample.conf)
+     * - tcpConnectTimeoutMilliseconds (see sample.conf)
      */
     typedef std::map<std::string, std::string> Options;
-
-    /**
-     * Defines a special type to use as an argument to the constructor that is
-     * for testing purposes only.
-     */
-    enum ForTesting { FOR_TESTING };
 
     /**
      * Construct a Cluster object for testing purposes only. Instead of
      * connecting to a LogCabin cluster, it will keep all state locally in
      * memory.
-     * \param t
-     *      The only possible value is Cluster::FOR_TESTING.
+     *
+     * This is experimental and is not part of LogCabin's public API.
+     *
+     * \param testingCallbacks
+     *      These allow the application to interpose on requests. A
+     *      default-constructed TestingCallbacks will execute requests against
+     *      an in-memory structure. Applications can pass in classes derived
+     *      from TestingCallbacks to model failures and more dynamic scenarios.
      * \param options
-     *      Settings for the client library.
+     *      Settings for the client library (see #Options).
      */
-    explicit Cluster(ForTesting t,
+    explicit Cluster(std::shared_ptr<TestingCallbacks> testingCallbacks,
                      const Options& options = Options());
 
     /**
@@ -504,9 +613,9 @@ class Cluster {
      *      A string describing the hosts in the cluster. This should be of the
      *      form host:port, where host is usually a DNS name that resolves to
      *      multiple IP addresses. Alternatively, you can pass a list of hosts
-     *      as host1:port1;host2:port2;host3:port3.
+     *      as host1:port1,host2:port2,host3:port3.
      * \param options
-     *      Settings for the client library.
+     *      Settings for the client library (see #Options).
      */
     explicit Cluster(const std::string& hosts,
                      const Options& options = Options());
@@ -535,6 +644,36 @@ class Cluster {
     ConfigurationResult setConfiguration(
                                 uint64_t oldId,
                                 const Configuration& newConfiguration);
+
+    /**
+     * Retrieve basic information from the given server, like its ID and the
+     * addresses on which it is listening.
+     * \param host
+     *      The hostname or IP address of the server to retrieve stats from. It
+     *      is recommended that you do not use a DNS name that resolves to
+     *      multiple hosts here.
+     * \param timeoutNanoseconds
+     *      Abort the operation if it has not completed within the specified
+     *      period of time. Time is specified in nanoseconds, and the special
+     *      value of 0 indicates no timeout.
+     * \warning
+     *      The client library does not currently implement timeouts for DNS
+     *      lookups. See https://github.com/logcabin/logcabin/issues/75
+     * \param[out] info
+     *      Protocol buffer of Stats as retrieved from the server.
+     * \return
+     *      Either OK or TIMEOUT.
+     */
+    Result
+    getServerInfo(const std::string& host,
+                  uint64_t timeoutNanoseconds,
+                  Server& info);
+    /**
+     * Like getServerStats but throws exceptions upon errors.
+     */
+    Server
+    getServerInfoEx(const std::string& host,
+                    uint64_t timeoutNanoseconds);
 
     /**
      * Retrieve statistics from the given server, which are useful for

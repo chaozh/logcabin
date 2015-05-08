@@ -47,8 +47,40 @@ Result
 treeError(const Message& response)
 {
     Result result;
-    result.status = static_cast<Status>(response.status());
     result.error = response.error();
+    switch (response.status()) {
+        case Protocol::Client::Status::OK:
+            result.status = Status::OK;
+            break;
+        case Protocol::Client::Status::INVALID_ARGUMENT:
+            result.status = Status::INVALID_ARGUMENT;
+            break;
+        case Protocol::Client::Status::LOOKUP_ERROR:
+            result.status = Status::LOOKUP_ERROR;
+            break;
+        case Protocol::Client::Status::TYPE_ERROR:
+            result.status = Status::TYPE_ERROR;
+            break;
+        case Protocol::Client::Status::CONDITION_NOT_MET:
+            result.status = Status::CONDITION_NOT_MET;
+            break;
+        case Protocol::Client::Status::TIMEOUT:
+            result.status = Status::TIMEOUT;
+            break;
+        case Protocol::Client::Status::SESSION_EXPIRED:
+            PANIC("The client's session to the cluster expired. This is a "
+                  "fatal error, since without a session the servers can't "
+                  "tell if retried requests were already applied or not.");
+            break;
+        default:
+            result.status = Status::INVALID_ARGUMENT;
+            result.error = Core::StringUtil::format(
+                "Did not understand status code in response (%u). "
+                "Original error was: %s",
+                response.status(),
+                response.error().c_str());
+            break;
+    }
     return result;
 }
 
@@ -97,20 +129,40 @@ split(const std::string& path, std::vector<std::string>& components)
  */
 void
 treeCall(LeaderRPCBase& leaderRPC,
-         LeaderRPC::OpCode opCode,
          const Protocol::Client::ReadOnlyTree::Request& request,
          Protocol::Client::ReadOnlyTree::Response& response,
          ClientImpl::TimePoint timeout)
 {
+    VERBOSE("Calling read-only tree query with request:\n%s",
+            Core::StringUtil::trim(
+                Core::ProtoBuf::dumpString(request)).c_str());
     LeaderRPC::Status status;
-    status = leaderRPC.call(opCode, request, response, timeout);
+    Protocol::Client::StateMachineQuery::Request qrequest;
+    Protocol::Client::StateMachineQuery::Response qresponse;
+    *qrequest.mutable_tree() = request;
+    status = leaderRPC.call(Protocol::Client::OpCode::STATE_MACHINE_QUERY,
+                            qrequest, qresponse, timeout);
     switch (status) {
         case LeaderRPC::Status::OK:
+            response = *qresponse.mutable_tree();
+            VERBOSE("Reply to read-only tree query:\n%s",
+                    Core::StringUtil::trim(
+                        Core::ProtoBuf::dumpString(response)).c_str());
             break;
         case LeaderRPC::Status::TIMEOUT:
             response.set_status(Protocol::Client::Status::TIMEOUT);
             response.set_error("Client-specified timeout elapsed");
+            VERBOSE("Timeout elapsed on read-only tree query");
             break;
+        case LeaderRPC::Status::INVALID_REQUEST:
+            // TODO(ongaro): Once any new Tree request types are introduced,
+            // this PANIC will need to move up the call stack, so that we can
+            // try a new-style request and then ask for forgiveness if it
+            // fails. Same for the read-write tree calls below.
+            PANIC("The server and/or replicated state machine doesn't support "
+                  "the read-only tree query or claims the request is "
+                  "malformed. Request is: %s",
+                  Core::ProtoBuf::dumpString(request).c_str());
     }
 }
 
@@ -121,24 +173,43 @@ treeCall(LeaderRPCBase& leaderRPC,
  */
 void
 treeCall(LeaderRPCBase& leaderRPC,
-         LeaderRPC::OpCode opCode,
          const Protocol::Client::ReadWriteTree::Request& request,
          Protocol::Client::ReadWriteTree::Response& response,
          ClientImpl::TimePoint timeout)
 {
+    VERBOSE("Calling read-write tree command with request:\n%s",
+            Core::StringUtil::trim(
+                Core::ProtoBuf::dumpString(request)).c_str());
+    Protocol::Client::StateMachineCommand::Request crequest;
+    Protocol::Client::StateMachineCommand::Response cresponse;
+    *crequest.mutable_tree() = request;
     LeaderRPC::Status status;
-    if (request.exactly_once().client_id() == 0)
+    if (request.exactly_once().client_id() == 0) {
+        VERBOSE("Already timed out on establishing session for read-write "
+                "tree command");
         status = LeaderRPC::Status::TIMEOUT;
-    else
-        status = leaderRPC.call(opCode, request, response, timeout);
+    } else {
+        status = leaderRPC.call(Protocol::Client::OpCode::STATE_MACHINE_COMMAND,
+                                crequest, cresponse, timeout);
+    }
 
     switch (status) {
         case LeaderRPC::Status::OK:
+            response = *cresponse.mutable_tree();
+            VERBOSE("Reply to read-write tree command:\n%s",
+                    Core::StringUtil::trim(
+                        Core::ProtoBuf::dumpString(response)).c_str());
             break;
         case LeaderRPC::Status::TIMEOUT:
             response.set_status(Protocol::Client::Status::TIMEOUT);
             response.set_error("Client-specified timeout elapsed");
+            VERBOSE("Timeout elapsed on read-write tree command");
             break;
+        case LeaderRPC::Status::INVALID_REQUEST:
+            PANIC("The server and/or replicated state machine doesn't support "
+                  "the read-write tree command or claims the request is "
+                  "malformed. Request is: %s",
+                  Core::ProtoBuf::dumpString(request).c_str());
     }
 }
 
@@ -174,7 +245,7 @@ void
 ClientImpl::ExactlyOnceRPCHelper::exit()
 {
     {
-        std::unique_lock<Core::Mutex> lockGuard(mutex);
+        std::lock_guard<Core::Mutex> lockGuard(mutex);
         exiting = true;
         keepAliveCV.notify_all();
         if (keepAliveCall)
@@ -187,21 +258,21 @@ ClientImpl::ExactlyOnceRPCHelper::exit()
 Protocol::Client::ExactlyOnceRPCInfo
 ClientImpl::ExactlyOnceRPCHelper::getRPCInfo(TimePoint timeout)
 {
-    std::unique_lock<Core::Mutex> lockGuard(mutex);
-    return getRPCInfo(lockGuard, timeout);
+    std::lock_guard<Core::Mutex> lockGuard(mutex);
+    return getRPCInfo(Core::HoldingMutex(lockGuard), timeout);
 }
 
 void
 ClientImpl::ExactlyOnceRPCHelper::doneWithRPC(
         const Protocol::Client::ExactlyOnceRPCInfo& rpcInfo)
 {
-    std::unique_lock<Core::Mutex> lockGuard(mutex);
-    doneWithRPC(rpcInfo, lockGuard);
+    std::lock_guard<Core::Mutex> lockGuard(mutex);
+    doneWithRPC(rpcInfo, Core::HoldingMutex(lockGuard));
 }
 
 Protocol::Client::ExactlyOnceRPCInfo
 ClientImpl::ExactlyOnceRPCHelper::getRPCInfo(
-        std::unique_lock<Core::Mutex>& lockGuard,
+        Core::HoldingMutex holdingMutex,
         TimePoint timeout)
 {
     Protocol::Client::ExactlyOnceRPCInfo rpcInfo;
@@ -212,10 +283,13 @@ ClientImpl::ExactlyOnceRPCHelper::getRPCInfo(
     }
     if (clientId == 0) {
         lastKeepAliveStart = Clock::now();
-        Protocol::Client::OpenSession::Request request;
-        Protocol::Client::OpenSession::Response response;
+        Protocol::Client::StateMachineCommand::Request request;
+        Protocol::Client::StateMachineCommand::Response response;
+        request.mutable_open_session();
         LeaderRPC::Status status =
-            client->leaderRPC->call(OpCode::OPEN_SESSION, request, response,
+            client->leaderRPC->call(OpCode::STATE_MACHINE_COMMAND,
+                                    request,
+                                    response,
                                     timeout);
         switch (status) {
             case LeaderRPC::Status::OK:
@@ -223,8 +297,12 @@ ClientImpl::ExactlyOnceRPCHelper::getRPCInfo(
             case LeaderRPC::Status::TIMEOUT:
                 rpcInfo.set_client_id(0);
                 return rpcInfo;
+            case LeaderRPC::Status::INVALID_REQUEST:
+                PANIC("The server and/or replicated state machine doesn't "
+                      "support the OpenSession command or claims the request "
+                      "is malformed");
         }
-        clientId = response.client_id();
+        clientId = response.open_session().client_id();
         assert(clientId > 0);
         keepAliveThread = std::thread(
             &ClientImpl::ExactlyOnceRPCHelper::keepAliveThreadMain,
@@ -245,7 +323,7 @@ ClientImpl::ExactlyOnceRPCHelper::getRPCInfo(
 void
 ClientImpl::ExactlyOnceRPCHelper::doneWithRPC(
                     const Protocol::Client::ExactlyOnceRPCInfo& rpcInfo,
-                    std::unique_lock<Core::Mutex>& lockGuard)
+                    Core::HoldingMutex holdingMutex)
 {
     outstandingRPCNumbers.erase(rpcInfo.rpc_number());
 }
@@ -263,18 +341,21 @@ ClientImpl::ExactlyOnceRPCHelper::keepAliveThreadMain()
             nextKeepAlive = TimePoint::max();
         }
         if (Clock::now() > nextKeepAlive) {
-            Protocol::Client::ReadWriteTree::Request request;
-            *request.mutable_exactly_once() = getRPCInfo(lockGuard,
-                                                         TimePoint::max());
-            setCondition(request,
+            Protocol::Client::StateMachineCommand::Request request;
+            Protocol::Client::ReadWriteTree::Request& trequest =
+                *request.mutable_tree();
+            *trequest.mutable_exactly_once() = getRPCInfo(
+                Core::HoldingMutex(lockGuard),
+                TimePoint::max());
+            setCondition(trequest,
                  {"keepalive",
                  "this is just a no-op to keep the client's session active; "
                  "the condition is expected to fail"});
-            request.mutable_write()->set_path("keepalive");
-            request.mutable_write()->set_contents("you shouldn't see this!");
-            Protocol::Client::ReadWriteTree::Response response;
+            trequest.mutable_write()->set_path("keepalive");
+            trequest.mutable_write()->set_contents("you shouldn't see this!");
+            Protocol::Client::StateMachineCommand::Response response;
             keepAliveCall = client->leaderRPC->makeCall();
-            keepAliveCall->start(OpCode::READ_WRITE_TREE, request,
+            keepAliveCall->start(OpCode::STATE_MACHINE_COMMAND, request,
                                  TimePoint::max());
             LeaderRPCBase::Call::Status callStatus;
             {
@@ -290,14 +371,20 @@ ClientImpl::ExactlyOnceRPCHelper::keepAliveThreadMain()
                     continue; // retry outer loop
                 case LeaderRPCBase::Call::Status::TIMEOUT:
                     PANIC("Unexpected timeout for keep-alive");
+                case LeaderRPCBase::Call::Status::INVALID_REQUEST:
+                    PANIC("The server rejected our keep-alive request (Tree "
+                          "write with unmet condition) as invalid");
             }
-            doneWithRPC(request.exactly_once(), lockGuard);
-            if (response.status() !=
+            doneWithRPC(trequest.exactly_once(),
+                        Core::HoldingMutex(lockGuard));
+            const Protocol::Client::ReadWriteTree::Response& tresponse =
+                response.tree();
+            if (tresponse.status() !=
                 Protocol::Client::Status::CONDITION_NOT_MET) {
                 WARNING("Keep-alive write should have failed its condition. "
                         "Unexpected status was %d: %s",
-                        response.status(),
-                        response.error().c_str());
+                        tresponse.status(),
+                        tresponse.error().c_str());
             }
             continue;
         }
@@ -310,14 +397,23 @@ ClientImpl::ExactlyOnceRPCHelper::keepAliveThreadMain()
 ClientImpl::ClientImpl(const std::map<std::string, std::string>& options)
     : config(options)
     , eventLoop()
+    , clusterUUID()
+    , sessionManager(eventLoop, config)
     , sessionCreationBackoff(5,                   // 5 new connections per
                              100UL * 1000 * 1000) // 100 ms
     , hosts()
     , leaderRPC()             // set in init()
-    , rpcProtocolVersion(~0U) // set in init()
     , exactlyOnceRPCHelper(this)
     , eventLoopThread()
 {
+    NOTICE("Configuration settings:\n"
+           "# begin config\n"
+           "%s"
+           "# end config",
+           Core::StringUtil::toString(config).c_str());
+    std::string uuid = config.read("clusterUUID", std::string(""));
+    if (!uuid.empty())
+        clusterUUID.set(uuid);
 }
 
 ClientImpl::~ClientImpl()
@@ -343,11 +439,10 @@ ClientImpl::initDerived()
         leaderRPC.reset(new LeaderRPC(
             RPC::Address(hosts, Protocol::Common::DEFAULT_PORT),
             eventLoop,
+            clusterUUID,
             sessionCreationBackoff,
-            config));
+            sessionManager));
     }
-    if (rpcProtocolVersion == ~0U)
-        rpcProtocolVersion = negotiateRPCVersion();
 }
 
 std::pair<uint64_t, Configuration>
@@ -362,7 +457,7 @@ ClientImpl::getConfiguration()
     for (auto it = response.servers().begin();
          it != response.servers().end();
          ++it) {
-        configuration.emplace_back(it->server_id(), it->address());
+        configuration.push_back({it->server_id(), it->addresses()});
     }
     return {response.id(), configuration};
 }
@@ -378,18 +473,21 @@ ClientImpl::setConfiguration(uint64_t oldId,
          it != newConfiguration.end();
          ++it) {
         Protocol::Client::Server* s = request.add_new_servers();
-        s->set_server_id(it->first);
-        s->set_address(it->second);
+        s->set_server_id(it->serverId);
+        s->set_addresses(it->addresses);
     }
     Protocol::Client::SetConfiguration::Response response;
     leaderRPC->call(OpCode::SET_CONFIGURATION, request, response,
                     TimePoint::max());
     ConfigurationResult result;
     if (response.has_ok()) {
+        result.status = ConfigurationResult::OK;
         return result;
     }
     if (response.has_configuration_changed()) {
         result.status = ConfigurationResult::CHANGED;
+        result.error = ("configuration changed: " +
+                        response.configuration_changed().error());
         return result;
     }
     if (response.has_configuration_bad()) {
@@ -397,12 +495,76 @@ ClientImpl::setConfiguration(uint64_t oldId,
         for (auto it = response.configuration_bad().bad_servers().begin();
              it != response.configuration_bad().bad_servers().end();
              ++it) {
-            result.badServers.emplace_back(it->server_id(), it->address());
+            result.badServers.emplace_back(it->server_id(), it->addresses());
         }
+        result.error = "servers slow or unavailable";
         return result;
     }
-    PANIC("Did not understand server response to append RPC:\n%s",
+    PANIC("Did not understand server response to setConfiguration RPC:\n%s",
           Core::ProtoBuf::dumpString(response).c_str());
+}
+
+Result
+ClientImpl::getServerInfo(const std::string& host,
+                          TimePoint timeout,
+                          Server& info)
+{
+    Result timeoutResult;
+    timeoutResult.status = Client::Status::TIMEOUT;
+    timeoutResult.error = "Client-specified timeout elapsed";
+
+    while (true) {
+        sessionCreationBackoff.delayAndBegin(timeout);
+
+        RPC::Address address(host, Protocol::Common::DEFAULT_PORT);
+        address.refresh(timeout);
+
+        std::shared_ptr<RPC::ClientSession> session =
+            sessionManager.createSession(address, timeout, &clusterUUID);
+
+        Protocol::Client::GetServerInfo::Request request;
+        RPC::ClientRPC rpc(session,
+                           Protocol::Common::ServiceId::CLIENT_SERVICE,
+                           1,
+                           OpCode::GET_SERVER_INFO,
+                           request);
+
+        typedef RPC::ClientRPC::Status RPCStatus;
+        Protocol::Client::GetServerInfo::Response response;
+        Protocol::Client::Error error;
+        RPCStatus status = rpc.waitForReply(&response, &error, timeout);
+
+        // Decode the response
+        switch (status) {
+            case RPCStatus::OK:
+                info.serverId = response.server_info().server_id();
+                info.addresses = response.server_info().addresses();
+                return Result();
+            case RPCStatus::RPC_FAILED:
+                break;
+            case RPCStatus::TIMEOUT:
+                return timeoutResult;
+            case RPCStatus::SERVICE_SPECIFIC_ERROR:
+                // Hmm, we don't know what this server is trying to tell us,
+                // but something is wrong. The server shouldn't reply back with
+                // error codes we don't understand. That's why we gave it a
+                // serverSpecificErrorVersion number in the request header.
+                PANIC("Unknown error code %u returned in service-specific "
+                      "error. This probably indicates a bug in the server",
+                      error.error_code());
+            case RPCStatus::RPC_CANCELED:
+                PANIC("RPC canceled unexpectedly");
+            case RPCStatus::INVALID_SERVICE:
+                PANIC("The server isn't running the ClientService");
+            case RPCStatus::INVALID_REQUEST:
+                PANIC("The server's ClientService doesn't support the "
+                      "GetServerInfo RPC or claims the request is malformed");
+        }
+        if (timeout < Clock::now())
+            return timeoutResult;
+        else
+            continue;
+    }
 }
 
 Result
@@ -421,12 +583,7 @@ ClientImpl::getServerStats(const std::string& host,
         address.refresh(timeout);
 
         std::shared_ptr<RPC::ClientSession> session =
-            RPC::ClientSession::makeSession(
-                            eventLoop,
-                            address,
-                            Protocol::Common::MAX_MESSAGE_LENGTH,
-                            timeout,
-                            config);
+            sessionManager.createSession(address, timeout, &clusterUUID);
 
         Protocol::Client::GetServerStats::Request request;
         RPC::ClientRPC rpc(session,
@@ -459,6 +616,11 @@ ClientImpl::getServerStats(const std::string& host,
                       error.error_code());
             case RPCStatus::RPC_CANCELED:
                 PANIC("RPC canceled unexpectedly");
+            case RPCStatus::INVALID_SERVICE:
+                PANIC("The server isn't running the ClientService");
+            case RPCStatus::INVALID_REQUEST:
+                PANIC("The server's ClientService doesn't support the "
+                      "GetServerStats RPC or claims the request is malformed");
         }
         if (timeout < Clock::now())
             return timeoutResult;
@@ -539,7 +701,7 @@ ClientImpl::makeDirectory(const std::string& path,
     setCondition(request, condition);
     request.mutable_make_directory()->set_path(realPath);
     Protocol::Client::ReadWriteTree::Response response;
-    treeCall(*leaderRPC, OpCode::READ_WRITE_TREE,
+    treeCall(*leaderRPC,
              request, response, timeout);
     exactlyOnceRPCHelper.doneWithRPC(request.exactly_once());
     if (response.status() != Protocol::Client::Status::OK)
@@ -563,7 +725,7 @@ ClientImpl::listDirectory(const std::string& path,
     setCondition(request, condition);
     request.mutable_list_directory()->set_path(realPath);
     Protocol::Client::ReadOnlyTree::Response response;
-    treeCall(*leaderRPC, OpCode::READ_ONLY_TREE,
+    treeCall(*leaderRPC,
              request, response, timeout);
     if (response.status() != Protocol::Client::Status::OK)
         return treeError(response);
@@ -589,7 +751,7 @@ ClientImpl::removeDirectory(const std::string& path,
     setCondition(request, condition);
     request.mutable_remove_directory()->set_path(realPath);
     Protocol::Client::ReadWriteTree::Response response;
-    treeCall(*leaderRPC, OpCode::READ_WRITE_TREE,
+    treeCall(*leaderRPC,
              request, response, timeout);
     exactlyOnceRPCHelper.doneWithRPC(request.exactly_once());
     if (response.status() != Protocol::Client::Status::OK)
@@ -615,7 +777,7 @@ ClientImpl::write(const std::string& path,
     request.mutable_write()->set_path(realPath);
     request.mutable_write()->set_contents(contents);
     Protocol::Client::ReadWriteTree::Response response;
-    treeCall(*leaderRPC, OpCode::READ_WRITE_TREE,
+    treeCall(*leaderRPC,
              request, response, timeout);
     exactlyOnceRPCHelper.doneWithRPC(request.exactly_once());
     if (response.status() != Protocol::Client::Status::OK)
@@ -639,7 +801,7 @@ ClientImpl::read(const std::string& path,
     setCondition(request, condition);
     request.mutable_read()->set_path(realPath);
     Protocol::Client::ReadOnlyTree::Response response;
-    treeCall(*leaderRPC, OpCode::READ_ONLY_TREE,
+    treeCall(*leaderRPC,
              request, response, timeout);
     if (response.status() != Protocol::Client::Status::OK)
         return treeError(response);
@@ -663,47 +825,13 @@ ClientImpl::removeFile(const std::string& path,
     setCondition(request, condition);
     request.mutable_remove_file()->set_path(realPath);
     Protocol::Client::ReadWriteTree::Response response;
-    treeCall(*leaderRPC, OpCode::READ_WRITE_TREE,
+    treeCall(*leaderRPC,
              request, response, timeout);
     exactlyOnceRPCHelper.doneWithRPC(request.exactly_once());
     if (response.status() != Protocol::Client::Status::OK)
         return treeError(response);
     return Result();
 }
-
-uint32_t
-ClientImpl::negotiateRPCVersion()
-{
-    // Doesn't seem reasonable for this to block forever: defer until first
-    // RPC, and use the timeout from that? See
-    // https://github.com/logcabin/logcabin/issues/76
-
-    Protocol::Client::GetSupportedRPCVersions::Request request;
-    Protocol::Client::GetSupportedRPCVersions::Response response;
-    leaderRPC->call(OpCode::GET_SUPPORTED_RPC_VERSIONS,
-                    request, response, TimePoint::max());
-    uint32_t serverMin = response.min_version();
-    uint32_t serverMax = response.max_version();
-    if (MAX_RPC_PROTOCOL_VERSION < serverMin) {
-        PANIC("This client is too old to talk to your LogCabin cluster. "
-              "You'll need to update your LogCabin client library. The "
-              "server supports down to version %u, but this library only "
-              "supports up to version %u.",
-              serverMin, MAX_RPC_PROTOCOL_VERSION);
-
-    } else if (MIN_RPC_PROTOCOL_VERSION > serverMax) {
-        PANIC("This client is too new to talk to your LogCabin cluster. "
-              "You'll need to upgrade your LogCabin cluster or downgrade "
-              "your LogCabin client library. The server supports up to "
-              "version %u, but this library only supports down to version %u.",
-              serverMax, MIN_RPC_PROTOCOL_VERSION);
-    } else {
-        // There exists a protocol version both the client and server speak.
-        // The preferred one is the maximum one they both support.
-        return std::min(MAX_RPC_PROTOCOL_VERSION, serverMax);
-    }
-}
-
 
 } // namespace LogCabin::Client
 } // namespace LogCabin

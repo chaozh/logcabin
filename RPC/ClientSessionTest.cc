@@ -1,5 +1,5 @@
 /* Copyright (c) 2012-2014 Stanford University
- * Copyright (c) 2014 Diego Ongaro
+ * Copyright (c) 2014-2015 Diego Ongaro
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -20,16 +20,13 @@
 #include <thread>
 #include <unistd.h>
 
-#if __GNUC__ >= 4 && __GNUC_MINOR__ >= 5
-#include <atomic>
-#else
-#include <cstdatomic>
-#endif
-
+#include "Core/CompatAtomic.h"
 #include "Core/Debug.h"
 #include "Event/Loop.h"
 #include "Event/Timer.h"
+#include "Protocol/Common.h"
 #include "RPC/ClientSession.h"
+#include "include/LogCabin/Debug.h"
 
 namespace LogCabin {
 namespace RPC {
@@ -115,12 +112,14 @@ TEST_F(RPCClientSessionTest, handleReceivedMessage) {
 
 TEST_F(RPCClientSessionTest, handleReceivedMessage_ping) {
     // spurious
-    session->messageSocket->handler.handleReceivedMessage(0, Core::Buffer());
+    session->messageSocket->handler.handleReceivedMessage(
+        Protocol::Common::PING_MESSAGE_ID, Core::Buffer());
 
     // ping requested
     session->numActiveRPCs = 1;
     session->activePing = true;
-    session->messageSocket->handler.handleReceivedMessage(0, Core::Buffer());
+    session->messageSocket->handler.handleReceivedMessage(
+        Protocol::Common::PING_MESSAGE_ID, Core::Buffer());
     session->numActiveRPCs = 0;
     EXPECT_FALSE(session->activePing);
     EXPECT_TRUE(session->timer.isScheduled());
@@ -224,15 +223,16 @@ TEST_F(RPCClientSessionTest, constructor_timeout_TimingSensitive) {
     ClientSession::connectFn = std::ref(c);
     Address address("127.0.0.1", 0);
     address.refresh(Address::TimePoint::max());
-    uint64_t start = Core::Time::getTimeNanos();
+    auto start = Core::Time::SystemClock::now();
     auto session2 = ClientSession::makeSession(
         eventLoop,
         address,
         1024,
         Core::Time::SteadyClock::now() + std::chrono::milliseconds(5),
         Core::Config());
-    uint64_t end = Core::Time::getTimeNanos();
-    uint64_t elapsedMs = (end - start) / 1000000;
+    auto end = Core::Time::SystemClock::now();
+    uint64_t elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            end - start).count();
     EXPECT_LE(5U, elapsedMs);
     EXPECT_GE(100U, elapsedMs);
     ClientSession::connectFn = ::connect;
@@ -242,22 +242,35 @@ TEST_F(RPCClientSessionTest, makeSession) {
     EXPECT_EQ(session.get(), session->self.lock().get());
 }
 
+TEST_F(RPCClientSessionTest, makeErrorSession) {
+    std::shared_ptr<ClientSession> esession =
+        ClientSession::makeErrorSession(eventLoop, "my error msg");
+    EXPECT_EQ("my error msg", esession->getErrorMessage());
+    OpaqueClientRPC rpc = esession->sendRequest(buf("hi"));
+    rpc.update();
+    EXPECT_EQ(OpaqueClientRPC::Status::ERROR, rpc.getStatus());
+    EXPECT_FALSE(rpc.session);
+    EXPECT_EQ("", str(rpc.reply));
+    EXPECT_EQ("my error msg", rpc.errorMessage);
+    EXPECT_EQ(0U, esession->responses.size());
+}
+
 TEST_F(RPCClientSessionTest, destructor) {
     // nothing visible to test
 }
 
 TEST_F(RPCClientSessionTest, sendRequest) {
-    EXPECT_EQ(1U, session->nextMessageId);
+    EXPECT_EQ(0U, session->nextMessageId);
     session->activePing = true;
     OpaqueClientRPC rpc = session->sendRequest(buf("hi"));
     EXPECT_EQ(1U, session->numActiveRPCs);
     EXPECT_FALSE(session->activePing);
     EXPECT_TRUE(session->timer.isScheduled());
     EXPECT_EQ(session, rpc.session);
-    EXPECT_EQ(1U, rpc.responseToken);
+    EXPECT_EQ(0U, rpc.responseToken);
     EXPECT_EQ(OpaqueClientRPC::Status::NOT_READY, rpc.getStatus());
-    EXPECT_EQ(2U, session->nextMessageId);
-    auto it = session->responses.find(1);
+    EXPECT_EQ(1U, session->nextMessageId);
+    auto it = session->responses.find(0);
     ASSERT_TRUE(it != session->responses.end());
     ClientSession::Response& response = *it->second;
     EXPECT_EQ(ClientSession::Response::WAITING,
@@ -312,7 +325,7 @@ TEST_F(RPCClientSessionTest, updateNotReady) {
 
 TEST_F(RPCClientSessionTest, updateReady) {
     OpaqueClientRPC rpc = session->sendRequest(buf("hi"));
-    auto it = session->responses.find(1);
+    auto it = session->responses.find(0);
     ASSERT_TRUE(it != session->responses.end());
     ClientSession::Response& response = *it->second;
     response.status = ClientSession::Response::HAS_REPLY;
@@ -351,7 +364,7 @@ TEST_F(RPCClientSessionTest, waitCanceled) {
 TEST_F(RPCClientSessionTest, waitCanceledWhileWaiting) {
     OpaqueClientRPC rpc = session->sendRequest(buf("hi"));
     {
-        ClientSession::Response& response = *session->responses.at(1);
+        ClientSession::Response& response = *session->responses.at(0);
         response.ready.callback = std::bind(&OpaqueClientRPC::cancel, &rpc);
         rpc.waitForReply(TimePoint::max());
     }
@@ -362,7 +375,7 @@ TEST_F(RPCClientSessionTest, waitCanceledWhileWaiting) {
 
 TEST_F(RPCClientSessionTest, waitReady) {
     OpaqueClientRPC rpc = session->sendRequest(buf("hi"));
-    auto it = session->responses.find(1);
+    auto it = session->responses.find(0);
     ASSERT_TRUE(it != session->responses.end());
     ClientSession::Response& response = *it->second;
     response.status = ClientSession::Response::HAS_REPLY;
@@ -405,7 +418,7 @@ TEST_F(RPCClientSessionTest, waitTimeout_futureThenOk) {
                      std::chrono::milliseconds(2));
     EXPECT_EQ(OpaqueClientRPC::Status::NOT_READY, rpc.getStatus());
 
-    auto it = session->responses.find(1);
+    auto it = session->responses.find(0);
     ASSERT_TRUE(it != session->responses.end());
     ClientSession::Response& response = *it->second;
     response.status = ClientSession::Response::HAS_REPLY;

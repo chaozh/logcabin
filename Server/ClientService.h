@@ -50,28 +50,15 @@ class ClientService : public RPC::Service {
     std::string getName() const;
 
   private:
-
     ////////// RPC handlers //////////
 
+    void getServerInfo(RPC::ServerRPC rpc);
     void getServerStats(RPC::ServerRPC rpc);
-    void getSupportedRPCVersions(RPC::ServerRPC rpc);
-    void openSession(RPC::ServerRPC rpc);
     void getConfiguration(RPC::ServerRPC rpc);
     void setConfiguration(RPC::ServerRPC rpc);
-    void readOnlyTreeRPC(RPC::ServerRPC rpc);
-    void readWriteTreeRPC(RPC::ServerRPC rpc);
-
-    std::pair<RaftConsensus::ClientResult, uint64_t>
-    submit(RPC::ServerRPC& rpc, const google::protobuf::Message& command);
-
-    RaftConsensus::ClientResult
-    catchUpStateMachine(RPC::ServerRPC& rpc);
-
-    bool
-    getResponse(RPC::ServerRPC& rpc,
-                uint64_t entryId,
-                const Protocol::Client::ExactlyOnceRPCInfo& rpcInfo,
-                Protocol::Client::CommandResponse& response);
+    void stateMachineCommand(RPC::ServerRPC rpc);
+    void stateMachineQuery(RPC::ServerRPC rpc);
+    void verifyRecipient(RPC::ServerRPC rpc);
 
     /**
      * The LogCabin daemon's top-level objects.

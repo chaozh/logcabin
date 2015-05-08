@@ -1,6 +1,13 @@
 import sys
 import os
 
+# Access through env['VERSION'], env['RPM_VERSION'], and env['RPM_RELEASE'] to
+# allow users to override these. RPM versioning is explained here:
+# https://fedoraproject.org/wiki/Packaging:NamingGuidelines#NonNumericRelease
+_VERSION = '1.0.1-alpha.0'
+_RPM_VERSION = '1.0.1'
+_RPM_RELEASE = '0.1.alpha.0'
+
 opts = Variables('Local.sc')
 
 opts.AddVariables(
@@ -16,6 +23,9 @@ opts.AddVariables(
     ("BUILDTYPE", "Build type (RELEASE or DEBUG)", "DEBUG"),
     ("VERBOSE", "Show full build information (0 or 1)", "0"),
     ("NUMCPUS", "Number of CPUs to use for build (0 means auto).", "0"),
+    ("VERSION", "Override version string", _VERSION),
+    ("RPM_VERSION", "Override version number for rpm", _RPM_VERSION),
+    ("RPM_RELEASE", "Override release string for rpm", _RPM_RELEASE),
 )
 
 env = Environment(options = opts,
@@ -99,8 +109,8 @@ SConscript('Tree/SConscript', variant_dir='build/Tree')
 SConscript('Client/SConscript', variant_dir='build/Client')
 SConscript('Storage/SConscript', variant_dir='build/Storage')
 SConscript('Server/SConscript', variant_dir='build/Server')
-SConscript('test/SConscript', variant_dir='build/test')
 SConscript('Examples/SConscript', variant_dir='build/Examples')
+SConscript('test/SConscript', variant_dir='build/test')
 
 # This function is taken from http://www.scons.org/wiki/PhonyTargets
 def PhonyTargets(env = None, **kw):
@@ -128,6 +138,7 @@ daemon = env.Program("build/LogCabin",
              object_files['Server'] +
              object_files['Storage'] +
              object_files['Tree'] +
+             object_files['Client'] +
              object_files['Protocol'] +
              object_files['RPC'] +
              object_files['Event'] +
@@ -135,21 +146,41 @@ daemon = env.Program("build/LogCabin",
             LIBS = [ "pthread", "protobuf", "rt", "cryptopp" ])
 env.Default(daemon)
 
+storageTool = env.Program("build/Storage/Tool",
+            (["build/Storage/Tool.cc"] +
+             [ # these proto files should maybe move into Protocol
+                "build/Server/SnapshotMetadata.pb.o",
+                "build/Server/SnapshotStateMachine.pb.o",
+             ] +
+             object_files['Storage'] +
+             object_files['Tree'] +
+             object_files['Protocol'] +
+             object_files['Core']),
+            LIBS = [ "pthread", "protobuf", "rt", "cryptopp" ])
+env.Default(storageTool)
+
 
 ### scons install target
 
 env.InstallAs('/etc/init.d/logcabin',           'scripts/logcabin-init-redhat')
 env.InstallAs('/usr/bin/logcabind',             'build/LogCabin')
+env.InstallAs('/usr/bin/logcabin',              'build/Examples/TreeOps')
 env.InstallAs('/usr/bin/logcabin-benchmark',    'build/Examples/Benchmark')
-env.InstallAs('/usr/bin/logcabin-dumptree',     'build/Examples/DumpTree')
 env.InstallAs('/usr/bin/logcabin-helloworld',   'build/Examples/HelloWorld')
 env.InstallAs('/usr/bin/logcabin-reconfigure',  'build/Examples/Reconfigure')
 env.InstallAs('/usr/bin/logcabin-serverstats',  'build/Examples/ServerStats')
 env.InstallAs('/usr/bin/logcabin-smoketest',    'build/Examples/SmokeTest')
+env.InstallAs('/usr/bin/logcabin-storage',      'build/Storage/Tool')
 env.Alias('install', ['/etc', '/usr'])
 
 
 #### 'scons rpm' target
+
+# Work-around for older versions of SCons (2.3.0) that had LC_ALL set to
+# lowercase c instead of uppercase C. SCons hg changeset 2943:8e42d865bdda in
+# Nov 3, 2013 fixed this upstream in SCons. Without this workaround, building
+# the RPM with 2.3.0 would sometimes fail.
+env['RPM'] = 'LC_ALL=C rpmbuild'
 
 # monkey-patch for SCons.Tool.packaging.rpm.collectintargz, which tries to put
 # way too many files into the source tarball (the source tarball should only
@@ -174,30 +205,50 @@ for target in env.FindInstalledFiles():
     install_commands.append('mkdir -p $RPM_BUILD_ROOT%s' % parent)
     install_commands.append('cp %s $RPM_BUILD_ROOT%s' % (source, target))
 
-VERSION = '0.0.1-alpha.0'
-# https://fedoraproject.org/wiki/Packaging:NamingGuidelines#NonNumericRelease
-RPM_VERSION = '0.0.1'
-RPM_RELEASE = '0.1.alpha.0'
-PACKAGEROOT = 'logcabin-%s' % RPM_VERSION
+# We probably don't want rpm to strip binaries.
+# This is kludged into the spec file.
+skip_stripping_binaries_commands = [
+    # The normal __os_install_post consists of:
+    #    %{_rpmconfigdir}/brp-compress
+    #    %{_rpmconfigdir}/brp-strip %{__strip}
+    #    %{_rpmconfigdir}/brp-strip-static-archive %{__strip}
+    #    %{_rpmconfigdir}/brp-strip-comment-note %{__strip} %{__objdump}
+    # as shown by: rpm --showrc | grep ' __os_install_post' -A10
+    #
+    # brp-compress just gzips manpages, which is fine. The others are probably
+    # undesirable.
+    #
+    # This can go anywhere in the spec file.
+    '%define __os_install_post /usr/lib/rpm/brp-compress',
+
+    # Your distro may also be configured to build -debuginfo packages by default,
+    # stripping the binaries and placing their symbols there. Let's not do that
+    # either.
+    #
+    # This has to go at the top of the spec file.
+    '%global _enable_debug_package 0',
+    '%global debug_package %{nil}',
+]
+
+PACKAGEROOT = 'logcabin-%s' % env['RPM_VERSION']
 
 rpms=RPMPackager.package(env,
-    target         = ['logcabin-%s' % RPM_VERSION],
+    target         = ['logcabin-%s' % env['RPM_VERSION']],
     source         = env.FindInstalledFiles(),
     X_RPM_INSTALL  = '\n'.join(install_commands),
     PACKAGEROOT    = PACKAGEROOT,
     NAME           = 'logcabin',
-    VERSION        = RPM_VERSION,
-    PACKAGEVERSION = RPM_RELEASE,
+    VERSION        = env['RPM_VERSION'],
+    PACKAGEVERSION = env['RPM_RELEASE'],
     LICENSE        = 'ISC',
     SUMMARY        = 'LogCabin is clustered consensus deamon',
-    X_RPM_GROUP    = 'Application/logcabin',
+    X_RPM_GROUP    = ('Application/logcabin' + '\n' +
+                      '\n'.join(skip_stripping_binaries_commands)),
     DESCRIPTION    =
     'LogCabin is a distributed system that provides a small amount of\n'
     'highly replicated, consistent storage. It is a reliable place for\n'
     'other distributed systems to store their core metadata and\n'
-    'is helpful in solving cluster management issues. Although its key\n'
-    'functionality is in place, LogCabin is not yet recommended\n'
-    'for actual use.',
+    'is helpful in solving cluster management issues.',
 )
 
 # Rename .rpm files into build/

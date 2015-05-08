@@ -46,9 +46,9 @@ class ClientClientImplExactlyOnceTest : public ::testing::Test {
         mockRPC = new Client::LeaderRPCMock();
         client.leaderRPC = std::unique_ptr<Client::LeaderRPCBase>(mockRPC);
 
-        mockRPC->expect(OpCode::OPEN_SESSION,
-            fromString<Protocol::Client::OpenSession::Response>(
-                        "client_id: 3"));
+        mockRPC->expect(OpCode::STATE_MACHINE_COMMAND,
+            fromString<Protocol::Client::StateMachineCommand::Response>(
+                        "open_session { client_id: 3 }"));
         rpcInfo1 = client.exactlyOnceRPCHelper.getRPCInfo(TimePoint::max());
         rpcInfo2 = client.exactlyOnceRPCHelper.getRPCInfo(TimePoint::max());
     }
@@ -86,9 +86,9 @@ TEST_F(ClientClientImplExactlyOnceTest, getRPCInfo_timeout) {
     EXPECT_EQ(0U, client2.exactlyOnceRPCHelper.clientId);
     EXPECT_EQ(0U, rpcInfo1.client_id());
 
-    mockRPC2->expect(OpCode::OPEN_SESSION,
-        fromString<Protocol::Client::OpenSession::Response>(
-                    "client_id: 4"));
+    mockRPC2->expect(OpCode::STATE_MACHINE_COMMAND,
+        fromString<Protocol::Client::StateMachineCommand::Response>(
+                    "open_session { client_id: 4 }"));
     rpcInfo2 = client2.exactlyOnceRPCHelper.getRPCInfo(TimePoint::max());
     EXPECT_EQ(4U, client2.exactlyOnceRPCHelper.clientId);
     EXPECT_EQ(4U, rpcInfo2.client_id());
@@ -118,9 +118,12 @@ TEST_F(ClientClientImplExactlyOnceTest, keepAliveThreadMain_TimingSensitive) {
                            "likely under heavy load, valgrind, etc.");
     EXPECT_EQ(1U, mockRPC->requestLog.size());
     for (uint64_t i = 0; i < 6; ++i) {
-        mockRPC->expect(OpCode::READ_WRITE_TREE,
-            fromString<Protocol::Client::ReadWriteTree::Response>(
-                        "status: CONDITION_NOT_MET, error: 'err'"));
+        mockRPC->expect(OpCode::STATE_MACHINE_COMMAND,
+            fromString<Protocol::Client::StateMachineCommand::Response>(
+                "tree {"
+                "  status: CONDITION_NOT_MET "
+                "  error: 'err' "
+                "}"));
     }
     client.exactlyOnceRPCHelper.keepAliveIntervalMs = 2;
     client.exactlyOnceRPCHelper.keepAliveCV.notify_all();
@@ -150,7 +153,7 @@ class ClientClientImplTest : public ::testing::Test {
     ClientClientImplTest()
         : client()
     {
-        client.rpcProtocolVersion = 1;
+        client.sessionManager.skipVerify = true;
         client.init("127.0.0.1");
     }
 
@@ -179,6 +182,38 @@ class ClientClientImplServiceMockTest : public ClientClientImplTest {
     std::shared_ptr<RPC::ServiceMock> service;
     std::unique_ptr<RPC::Server> server;
 };
+
+TEST_F(ClientClientImplServiceMockTest, getServerInfo) {
+    Protocol::Client::GetServerInfo::Request request;
+    Protocol::Client::GetServerInfo::Response response;
+    Protocol::Client::Server& ret = *response.mutable_server_info();
+    ret.set_server_id(3);
+    ret.set_addresses("roflcopter");
+
+    service->closeSession(Protocol::Client::OpCode::GET_SERVER_INFO,
+                          request);
+    service->reply(Protocol::Client::OpCode::GET_SERVER_INFO,
+                   request, response);
+    Client::Server info;
+    Client::Result result = client.getServerInfo("127.0.0.1",
+                                                 TimePoint::max(),
+                                                 info);
+    EXPECT_EQ(Client::Status::OK, result.status);
+    EXPECT_EQ(3U, info.serverId);
+    EXPECT_EQ("roflcopter", info.addresses);
+}
+
+TEST_F(ClientClientImplTest, getServerInfo_timeout) {
+    Client::Server info;
+    info.serverId = 9;
+    Client::Result result = client.getServerInfo("127.0.0.1",
+                                                 TimePoint::min(),
+                                                 info);
+    EXPECT_EQ(Client::Status::TIMEOUT, result.status);
+    EXPECT_EQ("Client-specified timeout elapsed", result.error);
+    EXPECT_EQ(9U, info.serverId);
+}
+
 
 TEST_F(ClientClientImplServiceMockTest, getServerStats) {
     Protocol::Client::GetServerStats::Request request;
@@ -268,9 +303,9 @@ class KeepAliveThreadMain_cancel_Helper {
 TEST_F(ClientClientImplExactlyOnceTest, keepAliveThreadMain_cancel) {
     client.exactlyOnceRPCHelper.exit();
     client.exactlyOnceRPCHelper.exiting = false;
-    mockRPC->expect(OpCode::READ_WRITE_TREE,
-        fromString<Protocol::Client::ReadWriteTree::Response>(
-                    ""));
+    mockRPC->expect(OpCode::STATE_MACHINE_COMMAND,
+        fromString<Protocol::Client::StateMachineCommand::Response>(
+                    "tree { }"));
     client.exactlyOnceRPCHelper.lastKeepAliveStart = TimePoint::min();
     client.exactlyOnceRPCHelper.keepAliveIntervalMs = 200;
     KeepAliveThreadMain_cancel_Helper helper(client.exactlyOnceRPCHelper);

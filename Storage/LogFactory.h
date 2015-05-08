@@ -15,15 +15,23 @@
 
 #include <memory>
 
-#include "Core/Config.h"
-#include "Storage/FilesystemUtil.h"
-#include "Storage/Log.h"
-
 #ifndef LOGCABIN_STORAGE_LOGFACTORY_H
 #define LOGCABIN_STORAGE_LOGFACTORY_H
 
 namespace LogCabin {
+
+// forward declaration
+namespace Core {
+class Config;
+}
+
+
 namespace Storage {
+
+// forward declarations
+class Log;
+class Layout;
+
 namespace LogFactory {
 
 /**
@@ -31,15 +39,15 @@ namespace LogFactory {
  * \param config
  *      Determines which concrete type of Log to construct.
  *      PANICs if this is invalid.
- * \param parentDir
+ * \param storageLayout
  *      Log implementations that write to the filesystem should place their
- *      files within this directory.
+ *      files in here.
  * \return
  *      The newly constructed Log instance.
  */
 std::unique_ptr<Log>
 makeLog(const Core::Config& config,
-        const FilesystemUtil::File& parentDir);
+        const Storage::Layout& storageLayout);
 
 } // namespace LogCabin::Storage::LogFactory
 } // namespace LogCabin::Storage

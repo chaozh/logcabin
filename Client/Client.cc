@@ -65,11 +65,44 @@ void throwException(const Result& result)
 } // anonymous namespace
 
 
+////////// Server //////////
+
+Server::Server(uint64_t serverId, const std::string& addresses)
+    : serverId(serverId)
+    , addresses(addresses)
+{
+}
+
+Server::Server()
+    : serverId(~0UL)
+    , addresses("")
+{
+}
+
+Server::Server(const Server& other)
+    : serverId(other.serverId)
+    , addresses(other.addresses)
+{
+}
+
+Server::~Server()
+{
+}
+
+Server&
+Server::operator=(const Server& other)
+{
+    serverId = other.serverId;
+    addresses = other.addresses;
+    return *this;
+}
+
 ////////// ConfigurationResult //////////
 
 ConfigurationResult::ConfigurationResult()
     : status(OK)
     , badServers()
+    , error()
 {
 }
 
@@ -201,7 +234,7 @@ Tree::operator=(const Tree& other)
     // Hold one lock at a time to avoid deadlock and handle self-assignment.
     std::shared_ptr<const TreeDetails> otherTreeDetails =
                                             other.getTreeDetails();
-    std::unique_lock<std::mutex> lockGuard(mutex);
+    std::lock_guard<std::mutex> lockGuard(mutex);
     treeDetails = otherTreeDetails;
     return *this;
 }
@@ -216,7 +249,7 @@ Tree::setWorkingDirectory(const std::string& newWorkingDirectory)
 
     ClientImpl::TimePoint timeout = absTimeout(treeDetails->timeoutNanos);
 
-    std::unique_lock<std::mutex> lockGuard(mutex);
+    std::lock_guard<std::mutex> lockGuard(mutex);
     std::string realPath;
     Result result = treeDetails->clientImpl->canonicalize(
                                 newWorkingDirectory,
@@ -259,7 +292,7 @@ Tree::setCondition(const std::string& path, const std::string& value)
     // way if it doesn't, future calls on this Tree will result in errors
     // instead of operating on the prior condition.
 
-    std::unique_lock<std::mutex> lockGuard(mutex);
+    std::lock_guard<std::mutex> lockGuard(mutex);
     std::string realPath;
     Result result = treeDetails->clientImpl->canonicalize(
                                 path,
@@ -306,7 +339,7 @@ Tree::getTimeout() const
 void
 Tree::setTimeout(uint64_t nanoseconds)
 {
-    std::unique_lock<std::mutex> lockGuard(mutex);
+    std::lock_guard<std::mutex> lockGuard(mutex);
     std::shared_ptr<TreeDetails> newTreeDetails(new TreeDetails(*treeDetails));
     newTreeDetails->timeoutNanos = nanoseconds;
     treeDetails = newTreeDetails;
@@ -426,16 +459,44 @@ std::shared_ptr<const TreeDetails>
 Tree::getTreeDetails() const
 {
     std::shared_ptr<const TreeDetails> ret;
-    std::unique_lock<std::mutex> lockGuard(mutex);
+    std::lock_guard<std::mutex> lockGuard(mutex);
     ret = treeDetails;
     return ret;
 }
 
+////////// TestingCallbacks //////////
+
+TestingCallbacks::TestingCallbacks()
+{
+}
+
+TestingCallbacks::~TestingCallbacks()
+{
+}
+
+bool
+TestingCallbacks::stateMachineQuery(
+    Protocol::Client::StateMachineQuery_Request& request,
+    Protocol::Client::StateMachineQuery_Response& response)
+{
+    return false;
+}
+
+bool
+TestingCallbacks::stateMachineCommand(
+    Protocol::Client::StateMachineCommand_Request& request,
+    Protocol::Client::StateMachineCommand_Response& response)
+{
+    return false;
+}
+
 ////////// Cluster //////////
 
-Cluster::Cluster(ForTesting t,
+Cluster::Cluster(std::shared_ptr<TestingCallbacks> testingCallbacks,
                  const std::map<std::string, std::string>& options)
-    : clientImpl(std::make_shared<MockClientImpl>())
+    : clientImpl(std::make_shared<MockClientImpl>(
+        testingCallbacks ? testingCallbacks
+                         : std::make_shared<TestingCallbacks>()))
 {
     clientImpl->init("-MOCK-");
 }
@@ -466,6 +527,27 @@ Cluster::setConfiguration(uint64_t oldId,
                           const Configuration& newConfiguration)
 {
     return clientImpl->setConfiguration(oldId, newConfiguration);
+}
+
+
+Result
+Cluster::getServerInfo(const std::string& host,
+                       uint64_t timeoutNanoseconds,
+                       Server& info)
+{
+    return clientImpl->getServerInfo(
+                host,
+                absTimeout(timeoutNanoseconds),
+                info);
+}
+
+Server
+Cluster::getServerInfoEx(const std::string& host,
+                         uint64_t timeoutNanoseconds)
+{
+    Server info;
+    throwException(getServerInfo(host, timeoutNanoseconds, info));
+    return info;
 }
 
 Result

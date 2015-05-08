@@ -13,14 +13,10 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#if __GNUC__ >= 4 && __GNUC_MINOR__ >= 5
-#include <atomic>
-#else
-#include <cstdatomic>
-#endif
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include "Core/CompatAtomic.h"
 #include "RPC/ThreadDispatchService.h"
 
 namespace LogCabin {
@@ -60,13 +56,13 @@ TEST_F(RPCThreadDispatchServiceTest, constructor)
     // Give the threads a chance to start up
     for (uint32_t i = 0; i < 10; ++i) {
         {
-            std::unique_lock<std::mutex> lockGuard(dispatchService.mutex);
+            std::lock_guard<std::mutex> lockGuard(dispatchService.mutex);
             if (dispatchService.numFreeWorkers == 5)
                 break;
         }
         usleep(1000);
     }
-    std::unique_lock<std::mutex> lockGuard(dispatchService.mutex);
+    std::lock_guard<std::mutex> lockGuard(dispatchService.mutex);
     EXPECT_EQ(5U, dispatchService.threads.size());
     EXPECT_EQ(5U, dispatchService.numFreeWorkers);
 }
