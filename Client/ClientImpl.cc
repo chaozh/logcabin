@@ -30,16 +30,6 @@ namespace Client {
 
 namespace {
 /**
- * The oldest RPC protocol version that this client library supports.
- */
-const uint32_t MIN_RPC_PROTOCOL_VERSION = 1;
-
-/**
- * The newest RPC protocol version that this client library supports.
- */
-const uint32_t MAX_RPC_PROTOCOL_VERSION = 1;
-
-/**
  * Parse an error response out of a ProtoBuf and into a Result object.
  */
 template<typename Message>
@@ -436,9 +426,9 @@ void
 ClientImpl::initDerived()
 {
     if (!leaderRPC) { // sometimes set in unit tests
+        NOTICE("Using server list: %s", hosts.c_str());
         leaderRPC.reset(new LeaderRPC(
             RPC::Address(hosts, Protocol::Common::DEFAULT_PORT),
-            eventLoop,
             clusterUUID,
             sessionCreationBackoff,
             sessionManager));
@@ -552,6 +542,7 @@ ClientImpl::getServerInfo(const std::string& host,
                 PANIC("Unknown error code %u returned in service-specific "
                       "error. This probably indicates a bug in the server",
                       error.error_code());
+                break;
             case RPCStatus::RPC_CANCELED:
                 PANIC("RPC canceled unexpectedly");
             case RPCStatus::INVALID_SERVICE:
@@ -614,6 +605,7 @@ ClientImpl::getServerStats(const std::string& host,
                 PANIC("Unknown error code %u returned in service-specific "
                       "error. This probably indicates a bug in the server",
                       error.error_code());
+                break;
             case RPCStatus::RPC_CANCELED:
                 PANIC("RPC canceled unexpectedly");
             case RPCStatus::INVALID_SERVICE:
@@ -657,8 +649,8 @@ ClientImpl::canonicalize(const std::string& path,
         if (components.at(i) == "..") {
             if (i > 0) {
                 // erase previous and ".." components
-                components.erase(components.begin() + i - 1,
-                                 components.begin() + i + 1);
+                components.erase(components.begin() + ssize_t(i) - 1,
+                                 components.begin() + ssize_t(i) + 1);
                 --i;
             } else {
                 Result result;
@@ -671,7 +663,7 @@ ClientImpl::canonicalize(const std::string& path,
                 return result;
             }
         } else if (components.at(i) == ".") {
-            components.erase(components.begin() + i);
+            components.erase(components.begin() + ssize_t(i));
         } else {
             ++i;
         }

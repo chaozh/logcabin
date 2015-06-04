@@ -43,9 +43,9 @@
 namespace LogCabin {
 namespace Server {
 
-namespace RaftConsensusInternal {
-
 typedef Storage::Log Log;
+
+namespace RaftConsensusInternal {
 
 bool startThreads = true;
 
@@ -145,7 +145,15 @@ void
 LocalServer::updatePeerStats(Protocol::ServerStats::Raft::Peer& peerStats,
                              Core::Time::SteadyTimeConverter& time) const
 {
-    peerStats.set_last_synced_index(lastSyncedIndex);
+    switch (consensus.state) {
+        case RaftConsensus::State::FOLLOWER:
+            break;
+        case RaftConsensus::State::CANDIDATE:
+            break;
+        case RaftConsensus::State::LEADER:
+            peerStats.set_last_synced_index(lastSyncedIndex);
+            break;
+    }
 }
 
 ////////// Peer //////////
@@ -354,15 +362,30 @@ void
 Peer::updatePeerStats(Protocol::ServerStats::Raft::Peer& peerStats,
                       Core::Time::SteadyTimeConverter& time) const
 {
-    peerStats.set_request_vote_done(requestVoteDone);
-    peerStats.set_have_vote(haveVote_);
-    peerStats.set_force_heartbeat(forceHeartbeat);
-    peerStats.set_next_index(nextIndex);
-    peerStats.set_last_agree_index(lastAgreeIndex);
-    peerStats.set_is_caught_up(isCaughtUp_);
+    switch (consensus.state) {
+        case RaftConsensus::State::FOLLOWER:
+            break;
+        case RaftConsensus::State::CANDIDATE:
+            break;
+        case RaftConsensus::State::LEADER:
+            peerStats.set_force_heartbeat(forceHeartbeat);
+            peerStats.set_next_index(nextIndex);
+            peerStats.set_last_agree_index(lastAgreeIndex);
+            peerStats.set_is_caught_up(isCaughtUp_);
+            peerStats.set_next_heartbeat_at(time.unixNanos(nextHeartbeatTime));
+            break;
+    }
 
-    peerStats.set_next_heartbeat_at(time.unixNanos(nextHeartbeatTime));
-    peerStats.set_backoff_until(time.unixNanos(backoffUntil));
+    switch (consensus.state) {
+        case RaftConsensus::State::FOLLOWER:
+            break;
+        case RaftConsensus::State::CANDIDATE: // fallthrough
+        case RaftConsensus::State::LEADER:
+            peerStats.set_request_vote_done(requestVoteDone);
+            peerStats.set_have_vote(haveVote_);
+            peerStats.set_backoff_until(time.unixNanos(backoffUntil));
+            break;
+    }
 }
 
 ////////// Configuration::SimpleConfiguration //////////
@@ -799,9 +822,9 @@ uint64_t
 ClusterClock::leaderStamp()
 {
     auto localTime = Core::Time::SteadyClock::now();
-    int64_t nanosSinceEpoch = std::chrono::nanoseconds(
-        localTime - localTimeAtEpoch).count();
-    assert(nanosSinceEpoch >= 0);
+    uint64_t nanosSinceEpoch =
+        Core::Util::downCast<uint64_t>(std::chrono::nanoseconds(
+            localTime - localTimeAtEpoch).count());
     clusterTimeAtEpoch += nanosSinceEpoch;
     localTimeAtEpoch = localTime;
     return clusterTimeAtEpoch;
@@ -810,12 +833,63 @@ ClusterClock::leaderStamp()
 uint64_t
 ClusterClock::interpolate() const
 {
-    int64_t nanosSinceEpoch = std::chrono::nanoseconds(
-        Core::Time::SteadyClock::now() - localTimeAtEpoch).count();
-    assert(nanosSinceEpoch >= 0);
+    auto localTime = Core::Time::SteadyClock::now();
+    uint64_t nanosSinceEpoch =
+        Core::Util::downCast<uint64_t>(std::chrono::nanoseconds(
+            localTime - localTimeAtEpoch).count());
     return clusterTimeAtEpoch + nanosSinceEpoch;
 }
 
+namespace {
+
+struct StagingProgressing {
+    StagingProgressing(uint64_t epoch,
+                       Protocol::Client::SetConfiguration::Response& response)
+        : epoch(epoch)
+        , response(response)
+    {
+    }
+    bool operator()(Server& server) {
+        uint64_t serverEpoch = server.getLastAckEpoch();
+        if (serverEpoch < epoch) {
+            auto& s = *response.mutable_configuration_bad()->add_bad_servers();
+            s.set_server_id(server.serverId);
+            s.set_addresses(server.addresses);
+            return false;
+        }
+        return true;
+    }
+    const uint64_t epoch;
+    Protocol::Client::SetConfiguration::Response& response;
+};
+
+struct StateMachineVersionIntersection {
+    StateMachineVersionIntersection()
+        : missingCount(0)
+        , allCount(0)
+        , minVersion(0)
+        , maxVersion(std::numeric_limits<uint16_t>::max()) {
+    }
+    void operator()(Server& server) {
+        ++allCount;
+        if (server.haveStateMachineSupportedVersions) {
+            minVersion = std::max(server.minStateMachineVersion,
+                                  minVersion);
+            maxVersion = std::min(server.maxStateMachineVersion,
+                                  maxVersion);
+        } else {
+            ++missingCount;
+        }
+    }
+    uint64_t missingCount;
+    uint64_t allCount;
+    uint16_t minVersion;
+    uint16_t maxVersion;
+};
+
+} // anonymous namespace
+
+} // namespace RaftConsensusInternal
 
 ////////// RaftConsensus::Entry //////////
 
@@ -840,7 +914,6 @@ RaftConsensus::Entry::Entry(Entry&& other)
 RaftConsensus::Entry::~Entry()
 {
 }
-
 
 ////////// RaftConsensus //////////
 
@@ -888,6 +961,7 @@ RaftConsensus::RaftConsensus(Globals& globals)
     , clusterClock()
     , startElectionAt(TimePoint::max())
     , withholdVotesUntil(TimePoint::min())
+    , numEntriesTruncated(0)
     , leaderDiskThread()
     , timerThread()
     , stateMachineUpdaterThread()
@@ -993,7 +1067,7 @@ RaftConsensus::init()
         NOTICE("No configuration, waiting to receive one.");
 
     stepDown(currentTerm);
-    if (startThreads) {
+    if (RaftConsensusInternal::startThreads) {
         leaderDiskThread = std::thread(
             &RaftConsensus::leaderDiskThreadMain, this);
         timerThread = std::thread(
@@ -1265,11 +1339,14 @@ RaftConsensus::handleAppendEntries(
                 continue;
             // should never truncate committed entries:
             assert(commitIndex < index);
+            uint64_t lastIndexKept = index - 1;
+            uint64_t numTruncating = log->getLastLogIndex() - lastIndexKept;
             NOTICE("Truncating %lu entries after %lu from the log",
-                   log->getLastLogIndex() - index + 1,
-                   index - 1);
-            log->truncateSuffix(index - 1);
-            configurationManager->truncateSuffix(index - 1);
+                   numTruncating,
+                   lastIndexKept);
+            numEntriesTruncated += numTruncating;
+            log->truncateSuffix(lastIndexKept);
+            configurationManager->truncateSuffix(lastIndexKept);
         }
 
         // Append this and all following entries.
@@ -1457,27 +1534,6 @@ RaftConsensus::replicate(const Core::Buffer& operation)
     return replicateEntry(entry, lockGuard);
 }
 
-struct StagingProgressing {
-    StagingProgressing(uint64_t epoch,
-                       Protocol::Client::SetConfiguration::Response& response)
-        : epoch(epoch)
-        , response(response)
-    {
-    }
-    bool operator()(Server& server) {
-        uint64_t serverEpoch = server.getLastAckEpoch();
-        if (serverEpoch < epoch) {
-            auto& s = *response.mutable_configuration_bad()->add_bad_servers();
-            s.set_server_id(server.serverId);
-            s.set_addresses(server.addresses);
-            return false;
-        }
-        return true;
-    }
-    const uint64_t epoch;
-    Protocol::Client::SetConfiguration::Response& response;
-};
-
 RaftConsensus::ClientResult
 RaftConsensus::setConfiguration(
         const Protocol::Client::SetConfiguration::Request& request,
@@ -1544,6 +1600,7 @@ RaftConsensus::setConfiguration(
             break;
         }
         if (Clock::now() >= checkProgressAt) {
+            using RaftConsensusInternal::StagingProgressing;
             StagingProgressing progressing(epoch, response);
             if (!configuration->stagingAll(progressing)) {
                 NOTICE("Failed to catch up new servers, aborting "
@@ -1783,6 +1840,7 @@ RaftConsensus::updateServerStats(Protocol::ServerStats& serverStats) const
     raftStats.set_last_snapshot_term(lastSnapshotTerm);
     raftStats.set_last_snapshot_cluster_time(lastSnapshotClusterTime);
     raftStats.set_last_snapshot_bytes(lastSnapshotBytes);
+    raftStats.set_num_entries_truncated(numEntriesTruncated);
     raftStats.set_log_start_index(log->getLogStartIndex());
     raftStats.set_log_bytes(log->getSizeBytes());
     configuration->updateServerStats(serverStats, time);
@@ -1792,7 +1850,7 @@ RaftConsensus::updateServerStats(Protocol::ServerStats& serverStats) const
 std::ostream&
 operator<<(std::ostream& os, const RaftConsensus& raft)
 {
-    std::lock_guard<Mutex> lockGuard(raft.mutex);
+    std::lock_guard<RaftConsensus::Mutex> lockGuard(raft.mutex);
     typedef RaftConsensus::State State;
     os << "server id: " << raft.serverId << std::endl;
     os << "term: " << raft.currentTerm << std::endl;
@@ -1825,32 +1883,6 @@ operator<<(std::ostream& os, const RaftConsensus& raft)
 
 //// RaftConsensus private methods that MUST acquire the lock
 
-namespace {
-struct StateMachineVersionIntersection {
-    StateMachineVersionIntersection()
-        : missingCount(0)
-        , allCount(0)
-        , minVersion(0)
-        , maxVersion(std::numeric_limits<uint16_t>::max()) {
-    }
-    void operator()(Server& server) {
-        ++allCount;
-        if (server.haveStateMachineSupportedVersions) {
-            minVersion = std::max(server.minStateMachineVersion,
-                                  minVersion);
-            maxVersion = std::min(server.maxStateMachineVersion,
-                                  maxVersion);
-        } else {
-            ++missingCount;
-        }
-    }
-    uint64_t missingCount;
-    uint64_t allCount;
-    uint16_t minVersion;
-    uint16_t maxVersion;
-};
-} // anonymous namespace
-
 void
 RaftConsensus::stateMachineUpdaterThreadMain()
 {
@@ -1866,6 +1898,7 @@ RaftConsensus::stateMachineUpdaterThreadMain()
     while (!exiting) {
         TimePoint now = Clock::now();
         if (backoffUntil <= now && state == State::LEADER) {
+            using RaftConsensusInternal::StateMachineVersionIntersection;
             StateMachineVersionIntersection s;
             configuration->forEach(std::ref(s));
             if (s.missingCount == 0) {
@@ -2865,8 +2898,6 @@ operator<<(std::ostream& os, RaftConsensus::State state)
     }
     return os;
 }
-
-} // namespace RaftConsensusInternal
 
 } // namespace LogCabin::Server
 } // namespace LogCabin

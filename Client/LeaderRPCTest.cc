@@ -60,7 +60,6 @@ class ClientLeaderRPCTest : public ::testing::Test {
         server->registerService(Protocol::Common::ServiceId::CLIENT_SERVICE,
                                 service, 1);
         leaderRPC.reset(new LeaderRPC(address,
-                                      eventLoop,
                                       clusterUUID,
                                       sessionCreationBackoff,
                                       sessionManager));
@@ -273,6 +272,18 @@ TEST_F(ClientLeaderRPCTest, reportFailure) {
     std::shared_ptr<RPC::ClientSession> session2 =
         leaderRPC->getSession(TimePoint::max());
     leaderRPC->reportFailure(session1);
+    EXPECT_TRUE(leaderRPC->leaderSession.get());
+}
+
+TEST_F(ClientLeaderRPCTest, reportNotLeader) {
+    std::shared_ptr<RPC::ClientSession> session1 =
+        leaderRPC->getSession(TimePoint::max());
+    EXPECT_TRUE(leaderRPC->leaderSession.get());
+    leaderRPC->reportNotLeader(session1);
+    EXPECT_FALSE(leaderRPC->leaderSession.get());
+    std::shared_ptr<RPC::ClientSession> session2 =
+        leaderRPC->getSession(TimePoint::max());
+    leaderRPC->reportNotLeader(session1);
     EXPECT_TRUE(leaderRPC->leaderSession.get());
 }
 

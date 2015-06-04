@@ -44,7 +44,7 @@ downCast(const Large& large)
     Small small = static_cast<Small>(large);
     // The following comparison (rather than "large==small") allows
     // this method to convert between signed and unsigned values.
-    assert(large - small == 0);
+    assert(large - static_cast<Large>(small) == 0);
     return small;
 }
 
@@ -68,6 +68,12 @@ class Finally {
     }
     std::function<void()> onDestroy;
 };
+
+/**
+ * Return true if the log of x in base 2 is a whole number.
+ */
+bool
+isPowerOfTwo(uint64_t x);
 
 /**
  * Copy some noncontiguous chunks of data into a contiguous chunk.

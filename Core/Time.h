@@ -67,11 +67,7 @@ struct CSystemClock {
     typedef duration::period period;
     typedef std::chrono::time_point<CSystemClock, duration> time_point;
 
-    // libstdc++ 4.7 renamed monotonic_clock to steady_clock to conform with
-    // C++11. This class defines both, since it's free.
-    static const bool is_monotonic = false;
     static const bool is_steady = false;
-
     static time_point now();
 };
 
@@ -97,10 +93,6 @@ struct CSteadyClock {
     typedef duration::rep rep;
     typedef duration::period period;
     typedef std::chrono::time_point<CSteadyClock, duration> time_point;
-
-    // libstdc++ 4.7 renamed monotonic_clock to steady_clock to conform with
-    // C++11. This class defines both, since it's free.
-    static const bool is_monotonic = true;
     static const bool is_steady = true;
 
     static time_point now();
@@ -121,13 +113,10 @@ struct MockableClock
     typedef typename BaseClock::period period;
     typedef typename BaseClock::time_point time_point;
 
-// libstdc++ 4.7 renamed monotonic_clock to steady_clock to conform with C++11.
-#if __GNUC__ == 4 && __GNUC_MINOR__ < 7
-    static const bool is_monotonic = BaseClock::is_monotonic;
-    static const bool is_steady = BaseClock::is_monotonic;
-#else
+    // libstdc++ 4.7 renamed monotonic_clock to steady_clock to conform with
+    // C++11. This file doesn't use a BaseClock from libstdc++ before 4.8, so
+    // it's ok to just assume is_steady is present.
     static const bool is_steady = BaseClock::is_steady;
-#endif
 
     static time_point now() {
         if (useMockValue)
@@ -167,7 +156,11 @@ MockableClock<BaseClock>::mockValue;
 // libstdc++ 4.7 renamed monotonic_clock to steady_clock to conform with C++11.
 // libstdc++ 4.8 seems to be the first version where std::chrono::steady_clock
 // is usable with nanosecond granularity.
-#if __GNUC__ == 4 && __GNUC_MINOR__ < 8
+// Clang with libstdc++ gives us no way to check the version,
+// so we just use CSteadyClock in that case.
+// Clang with libc++ is known not to work at _LIBCPP_VERSION 1101 and hasn't
+// been tried with other versions (use CSteadyClock).
+#if __clang__ || (__GNUC__ == 4 && __GNUC_MINOR__ < 8)
 typedef MockableClock<CSteadyClock> SteadyClock;
 #else
 typedef MockableClock<std::chrono::steady_clock> SteadyClock;
@@ -178,7 +171,11 @@ typedef MockableClock<std::chrono::steady_clock> SteadyClock;
  */
 // libstdc++ 4.8 seems to be the first version where std::chrono::system_clock
 // has nanosecond granularity.
-#if __GNUC__ == 4 && __GNUC_MINOR__ < 8
+// Clang with libstdc++ gives us no way to check the version,
+// so we just use CSystemClock in that case.
+// Clang with libc++ is known not to work at _LIBCPP_VERSION 1101 and hasn't
+// been tried with other versions (use CSteadyClock).
+#if __clang__ || (__GNUC__ == 4 && __GNUC_MINOR__ < 8)
 typedef MockableClock<CSystemClock> SystemClock;
 #else
 typedef MockableClock<std::chrono::system_clock> SystemClock;
@@ -194,7 +191,7 @@ rdtsc()
 {
     uint32_t lo, hi;
     __asm__ __volatile__("rdtsc" : "=a" (lo), "=d" (hi));
-    return (((uint64_t)hi << 32) | lo);
+    return ((uint64_t(hi) << 32) | lo);
 }
 
 /**
@@ -246,24 +243,27 @@ class SteadyTimeConverter {
 
 namespace std {
 
-/**
- * Prints std::milliseconds values in a way that is useful for unit tests.
- */
-inline std::ostream&
-operator<<(std::ostream& os,
-           const std::chrono::milliseconds& duration) {
-    return os << duration.count() << " ms";
-}
+// The following set of functions prints duration values in a human-friendly
+// way, including their units.
 
-/**
- * Prints std::nanoseconds values in a way that is useful for unit tests.
- */
-inline std::ostream&
+std::ostream&
 operator<<(std::ostream& os,
-           const std::chrono::nanoseconds& duration) {
-    return os << duration.count() << " ns";
-}
-
+           const std::chrono::nanoseconds& duration);
+std::ostream&
+operator<<(std::ostream& os,
+           const std::chrono::microseconds& duration);
+std::ostream&
+operator<<(std::ostream& os,
+           const std::chrono::milliseconds& duration);
+std::ostream&
+operator<<(std::ostream& os,
+           const std::chrono::seconds& duration);
+std::ostream&
+operator<<(std::ostream& os,
+           const std::chrono::minutes& duration);
+std::ostream&
+operator<<(std::ostream& os,
+           const std::chrono::hours& duration);
 
 /**
  * Prints std::time_point values in a way that is useful for unit tests.

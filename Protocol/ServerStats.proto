@@ -15,6 +15,29 @@
 package LogCabin.Protocol;
 
 /**
+ * The format that Core::RollingStat serializes into.
+ */
+message RollingStat {
+    message Exceptional {
+        optional int64 when = 1;
+        optional uint64 value = 2;
+    };
+
+    optional double average = 1;
+    optional uint64 count = 2;
+    optional double ewma2 = 3;
+    optional double ewma4 = 4;
+    optional uint64 exceptional_count = 5;
+    optional uint64 last = 6;
+    optional uint64 min = 7;
+    optional uint64 max = 8;
+    optional uint64 sum = 9;
+    optional double stddev = 10;
+    repeated Exceptional last_exceptional = 11;
+};
+
+
+/**
  * The format for server statistics, useful for diagnostic purposes.
  */
 message ServerStats {
@@ -71,6 +94,7 @@ message ServerStats {
         optional uint64 last_snapshot_cluster_time = 36;
         optional uint64 log_start_index = 33;
         optional uint64 log_bytes = 34;
+        optional uint64 num_entries_truncated = 37;
 
         repeated Peer peer = 91;
     };
@@ -79,6 +103,31 @@ message ServerStats {
         optional uint64 num_segments = 1;
         optional uint64 open_segment_bytes = 2;
         optional uint64 metadata_version = 3;
+        optional RollingStat metadata_write_nanos = 4;
+        optional RollingStat filesystem_ops_nanos = 5;
+    };
+
+    message Tree {
+        optional uint64 num_conditions_checked = 1;
+        optional uint64 num_conditions_failed = 2;
+        optional uint64 num_make_directory_attempted = 3;
+        optional uint64 num_make_directory_success = 4;
+        optional uint64 num_list_directory_attempted = 5;
+        optional uint64 num_list_directory_success = 6;
+        optional uint64 num_remove_directory_attempted = 7;
+        optional uint64 num_remove_directory_parent_not_found = 8;
+        optional uint64 num_remove_directory_target_not_found = 9;
+        optional uint64 num_remove_directory_done = 10;
+        optional uint64 num_remove_directory_success = 11;
+        optional uint64 num_write_attempted = 12;
+        optional uint64 num_write_success = 13;
+        optional uint64 num_read_attempted = 14;
+        optional uint64 num_read_success = 15;
+        optional uint64 num_remove_file_attempted = 16;
+        optional uint64 num_remove_file_parent_not_found = 17;
+        optional uint64 num_remove_file_target_not_found = 18;
+        optional uint64 num_remove_file_done = 19;
+        optional uint64 num_remove_file_success = 20;
     };
 
     message StateMachine {
@@ -94,6 +143,7 @@ message ServerStats {
         optional uint32 min_supported_version = 10;
         optional uint32 max_supported_version = 11;
         optional uint32 running_version = 12;
+        optional Tree tree = 13;
     };
 
     /**

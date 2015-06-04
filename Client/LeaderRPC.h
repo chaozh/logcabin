@@ -228,8 +228,6 @@ class LeaderRPC : public LeaderRPCBase {
      *      Describe the servers to connect to. This class assumes that
      *      refreshing 'hosts' will result in a random host that might be the
      *      current cluster leader.
-     * \param eventLoop
-     *      Used to invoke RPCs.
      * \param clusterUUID
      *      Keeps track of the unique ID for this cluster, if known.
      * \param sessionCreationBackoff
@@ -238,7 +236,6 @@ class LeaderRPC : public LeaderRPCBase {
      *      Used to create new sessions.
      */
     LeaderRPC(const RPC::Address& hosts,
-              Event::Loop& eventLoop,
               SessionManager::ClusterUUID& clusterUUID,
               Backoff& sessionCreationBackoff,
               SessionManager& sessionManager);
@@ -304,6 +301,17 @@ class LeaderRPC : public LeaderRPCBase {
     reportFailure(std::shared_ptr<RPC::ClientSession> cachedSession);
 
     /**
+     * Notify this class that a non-leader server rejected an RPC. This will
+     * usually cause this class to connect to a random server next time
+     * getSession() is called.
+     * \param cachedSession
+     *      Session previously returned by getSession(). This is used to detect
+     *      races in which some other thread has already solved the problem.
+     */
+    void
+    reportNotLeader(std::shared_ptr<RPC::ClientSession> cachedSession);
+
+    /**
      * Notify this class that an RPC on the given session was redirected by a
      * non-leader server. This will usually cause this class to connect to the
      * given host the next time getSession() is called.
@@ -318,9 +326,14 @@ class LeaderRPC : public LeaderRPCBase {
                    const std::string& host);
 
     /**
-     * Used to drive the underlying RPC mechanism.
+     * Notify this class that an RPC on the given session reached a leader.
+     * This is just here for debug log messages.
+     * \param cachedSession
+     *      Session previously returned by getSession(). This is used to detect
+     *      races in which some other thread has already solved any problems.
      */
-    Event::Loop& eventLoop;
+    void
+    reportSuccess(std::shared_ptr<RPC::ClientSession> cachedSession);
 
     /**
      * Keeps track of the unique ID for this cluster, if known.
@@ -363,6 +376,14 @@ class LeaderRPC : public LeaderRPCBase {
      * This is never null, but it might sometimes point to the wrong host.
      */
     std::shared_ptr<RPC::ClientSession> leaderSession;
+
+    /**
+     * The number of attempted RPCs that have not successfully reached a leader
+     * since the last time an RPC did. Used for rate-limiting and summarizing
+     * log messages: they're only printed when this number reaches a power of
+     * two.
+     */
+    uint64_t failuresSinceLastSuccess;
 };
 
 } // namespace LogCabin::Client

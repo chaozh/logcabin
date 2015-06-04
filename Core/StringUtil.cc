@@ -75,19 +75,21 @@ format(const char* format, ...)
 
     // We're not really sure how big of a buffer will be necessary.
     // Try 1K, if not the return value will tell us how much is necessary.
-    int bufSize = 1024;
+    size_t bufSize = 1024;
     while (true) {
         char buf[bufSize];
         // vsnprintf trashes the va_list, so copy it first
         va_list aq;
-        __va_copy(aq, ap);
+        va_copy(aq, ap);
         int r = vsnprintf(buf, bufSize, format, aq);
+        va_end(aq);
         assert(r >= 0); // old glibc versions returned -1
-        if (r < bufSize) {
+        size_t r2 = size_t(r);
+        if (r2 < bufSize) {
             s = buf;
             break;
         }
-        bufSize = r + 1;
+        bufSize = r2 + 1;
     }
 
     va_end(ap);

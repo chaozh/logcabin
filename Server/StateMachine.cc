@@ -148,6 +148,7 @@ StateMachine::updateServerStats(Protocol::ServerStats& serverStats) const
     smStats.set_min_supported_version(MIN_SUPPORTED_VERSION);
     smStats.set_max_supported_version(MAX_SUPPORTED_VERSION);
     smStats.set_running_version(getVersion(lastIndex));
+    tree.updateServerStats(*smStats.mutable_tree());
 }
 
 void
@@ -316,7 +317,7 @@ StateMachine::applyThreadMain()
             if (shouldTakeSnapshot(lastIndex))
                 snapshotSuggested.notify_all();
         }
-    } catch (const Core::Util::ThreadInterruptedException& e) {
+    } catch (const Core::Util::ThreadInterruptedException&) {
         NOTICE("exiting");
         std::lock_guard<std::mutex> lockGuard(mutex);
         exiting = true;
@@ -524,10 +525,8 @@ void
 StateMachine::snapshotThreadMain()
 {
     Core::ThreadId::setName("SnapshotStateMachine");
-    while (true) {
-        std::unique_lock<std::mutex> lockGuard(mutex);
-        if (exiting)
-            return;
+    std::unique_lock<std::mutex> lockGuard(mutex);
+    while (!exiting) {
         if (shouldTakeSnapshot(lastIndex))
             takeSnapshot(lastIndex, lockGuard);
         else
@@ -538,8 +537,9 @@ StateMachine::snapshotThreadMain()
 void
 StateMachine::snapshotWatchdogThreadMain()
 {
-    Core::ThreadId::setName("SnapshotStateMachineWatchdog");
     using Core::StringUtil::toString;
+    Core::ThreadId::setName("SnapshotStateMachineWatchdog");
+    std::unique_lock<std::mutex> lockGuard(mutex);
 
     // The snapshot process that this thread is currently tracking, based on
     // numSnapshotsAttempted. If set to ~0UL, this thread is not currently
@@ -553,7 +553,6 @@ StateMachine::snapshotWatchdogThreadMain()
     const std::chrono::nanoseconds zero = std::chrono::nanoseconds::zero();
 
     while (!exiting) {
-        std::unique_lock<std::mutex> lockGuard(mutex);
         TimePoint waitUntil = TimePoint::max();
         TimePoint now = Clock::now();
 
