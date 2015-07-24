@@ -107,7 +107,7 @@ LocalServer::getLastAckEpoch() const
 }
 
 uint64_t
-LocalServer::getLastAgreeIndex() const
+LocalServer::getMatchIndex() const
 {
     return lastSyncedIndex;
 }
@@ -165,14 +165,14 @@ Peer::Peer(uint64_t serverId, RaftConsensus& consensus)
     , exiting(false)
     , requestVoteDone(false)
     , haveVote_(false)
-    , forceHeartbeat(true)
+    , suppressBulkData(true)
       // It's somewhat important to set nextIndex correctly here, since peers
       // that are added to the configuration won't go through beginLeadership()
       // on the current leader. I say somewhat important because, if nextIndex
       // is set incorrectly, it's self-correcting, so it's just a potential
       // performance issue.
     , nextIndex(consensus.log->getLastLogIndex() + 1)
-    , lastAgreeIndex(0)
+    , matchIndex(0)
     , lastAckEpoch(0)
     , nextHeartbeatTime(TimePoint::min())
     , backoffUntil(TimePoint::min())
@@ -204,8 +204,8 @@ void
 Peer::beginLeadership()
 {
     nextIndex = consensus.log->getLastLogIndex() + 1;
-    lastAgreeIndex = 0;
-    forceHeartbeat = true;
+    matchIndex = 0;
+    suppressBulkData = true;
     snapshotFile.reset();
     snapshotFileOffset = 0;
     lastSnapshotIndex = 0;
@@ -225,9 +225,9 @@ Peer::getLastAckEpoch() const
 }
 
 uint64_t
-Peer::getLastAgreeIndex() const
+Peer::getMatchIndex() const
 {
-    return lastAgreeIndex;
+    return matchIndex;
 }
 
 bool
@@ -350,9 +350,9 @@ Peer::dumpToStream(std::ostream& os) const
             os << std::endl;
             break;
         case RaftConsensus::State::LEADER:
-            os << "forceHeartbeat: " << forceHeartbeat << std::endl;
+            os << "suppressBulkData: " << suppressBulkData << std::endl;
             os << "nextIndex: " << nextIndex << std::endl;
-            os << "lastAgreeIndex: " << lastAgreeIndex << std::endl;
+            os << "matchIndex: " << matchIndex << std::endl;
             break;
     }
     return os;
@@ -368,9 +368,9 @@ Peer::updatePeerStats(Protocol::ServerStats::Raft::Peer& peerStats,
         case RaftConsensus::State::CANDIDATE:
             break;
         case RaftConsensus::State::LEADER:
-            peerStats.set_force_heartbeat(forceHeartbeat);
+            peerStats.set_suppress_bulk_data(suppressBulkData);
             peerStats.set_next_index(nextIndex);
-            peerStats.set_last_agree_index(lastAgreeIndex);
+            peerStats.set_last_agree_index(matchIndex);
             peerStats.set_is_caught_up(isCaughtUp_);
             peerStats.set_next_heartbeat_at(time.unixNanos(nextHeartbeatTime));
             break;
@@ -918,18 +918,34 @@ RaftConsensus::Entry::~Entry()
 ////////// RaftConsensus //////////
 
 RaftConsensus::RaftConsensus(Globals& globals)
-    : ELECTION_TIMEOUT_MS(globals.config.read<uint64_t>(
-        "electionTimeoutMilliseconds", 500))
-    , HEARTBEAT_PERIOD_MS(globals.config.read<uint64_t>(
-        "heartbeatPeriodMilliseconds",
-        ELECTION_TIMEOUT_MS / 2))
-    , RPC_FAILURE_BACKOFF_MS(globals.config.read<uint64_t>(
-        "rpcFailureBackoffMilliseconds",
-        ELECTION_TIMEOUT_MS / 2))
-    , STATE_MACHINE_UPDATER_BACKOFF(std::chrono::milliseconds(
+    : ELECTION_TIMEOUT(
+        std::chrono::milliseconds(
+            globals.config.read<uint64_t>(
+                "electionTimeoutMilliseconds",
+                500)))
+    , HEARTBEAT_PERIOD(
+        globals.config.keyExists("heartbeatPeriodMilliseconds")
+            ? std::chrono::nanoseconds(
+                std::chrono::milliseconds(
+                    globals.config.read<uint64_t>(
+                        "heartbeatPeriodMilliseconds")))
+            : ELECTION_TIMEOUT / 2)
+    , MAX_LOG_ENTRIES_PER_REQUEST(
         globals.config.read<uint64_t>(
-            "stateMachineUpdaterBackoffMilliseconds",
-            10000)))
+            "maxLogEntriesPerRequest",
+            5000))
+    , RPC_FAILURE_BACKOFF(
+        globals.config.keyExists("rpcFailureBackoffMilliseconds")
+            ? std::chrono::nanoseconds(
+                std::chrono::milliseconds(
+                    globals.config.read<uint64_t>(
+                        "rpcFailureBackoffMilliseconds")))
+            : (ELECTION_TIMEOUT / 2))
+    , STATE_MACHINE_UPDATER_BACKOFF(
+        std::chrono::milliseconds(
+            globals.config.read<uint64_t>(
+                "stateMachineUpdaterBackoffMilliseconds",
+                10000)))
     , SOFT_RPC_SIZE_LIMIT(Protocol::Common::MAX_MESSAGE_LENGTH - 1024)
     , serverId(0)
     , serverAddresses()
@@ -1274,8 +1290,7 @@ RaftConsensus::handleAppendEntries(
     // and convert to follower if necessary; reset the election timer.
     stepDown(request.term());
     setElectionTimer();
-    withholdVotesUntil = Clock::now() +
-                         std::chrono::milliseconds(ELECTION_TIMEOUT_MS);
+    withholdVotesUntil = Clock::now() + ELECTION_TIMEOUT;
 
     // Record the leader ID as a hint for clients.
     if (leaderId == 0) {
@@ -1329,6 +1344,11 @@ RaftConsensus::handleAppendEntries(
          ++it) {
         ++index;
         const Protocol::Raft::Entry& entry = *it;
+        if (entry.has_index()) {
+            // This precaution was added after #160: "Packing entries into
+            // AppendEntries requests is broken (critical)".
+            assert(entry.index() == index);
+        }
         if (index < log->getLogStartIndex()) {
             // We already snapshotted and discarded this index, so presumably
             // we've received a committed entry we once already had.
@@ -1414,8 +1434,7 @@ RaftConsensus::handleInstallSnapshot(
     // and convert to follower if necessary; reset the election timer.
     stepDown(request.term());
     setElectionTimer();
-    withholdVotesUntil = Clock::now() +
-                         std::chrono::milliseconds(ELECTION_TIMEOUT_MS);
+    withholdVotesUntil = Clock::now() + ELECTION_TIMEOUT;
 
     // Record the leader ID as a hint for clients.
     if (leaderId == 0) {
@@ -1430,6 +1449,8 @@ RaftConsensus::handleInstallSnapshot(
         snapshotWriter.reset(
             new Storage::SnapshotFile::Writer(storageLayout));
     }
+    response.set_bytes_stored(snapshotWriter->getBytesWritten());
+
     if (request.byte_offset() < snapshotWriter->getBytesWritten()) {
         WARNING("Ignoring stale snapshot chunk for byte offset %lu when the "
                 "next byte needed is %lu",
@@ -1438,12 +1459,28 @@ RaftConsensus::handleInstallSnapshot(
         return;
     }
     if (request.byte_offset() > snapshotWriter->getBytesWritten()) {
-        PANIC("Leader tried to send snapshot chunk at byte offset %lu but the "
-              "next byte needed is %lu. It's supposed to send these in order.",
-              request.byte_offset(),
-              snapshotWriter->getBytesWritten());
+        WARNING("Leader tried to send snapshot chunk at byte offset %lu but "
+                "the next byte needed is %lu. Discarding the chunk.",
+                request.byte_offset(),
+                snapshotWriter->getBytesWritten());
+        if (!request.has_version() || request.version() < 2) {
+            // For compatibility with InstallSnapshot version 1 leader: such a
+            // leader assumes the InstallSnapshot RPC succeeded if the terms
+            // match (it ignores the 'bytes_stored' field). InstallSnapshot
+            // hasn't succeeded here, so we can't respond ok.
+            WARNING("Incrementing our term (to %lu) to force the leader "
+                    "(of %lu) to step down and forget about the partial "
+                    "snapshot it's sending",
+                    currentTerm + 1,
+                    currentTerm);
+            stepDown(currentTerm + 1);
+            // stepDown() changed currentTerm to currentTerm + 1
+            response.set_term(currentTerm);
+        }
+        return;
     }
     snapshotWriter->writeRaw(request.data().data(), request.data().length());
+    response.set_bytes_stored(snapshotWriter->getBytesWritten());
 
     if (request.done()) {
         if (request.last_snapshot_index() < lastSnapshotIndex) {
@@ -1583,12 +1620,11 @@ RaftConsensus::setConfiguration(
     stateChanged.notify_all();
 
     // Wait for new servers to be caught up. This will abort if not every
-    // server makes progress in a ELECTION_TIMEOUT_MS period.
+    // server makes progress in a ELECTION_TIMEOUT period.
     uint64_t term = currentTerm;
     ++currentEpoch;
     uint64_t epoch = currentEpoch;
-    TimePoint checkProgressAt =
-        Clock::now() + std::chrono::milliseconds(ELECTION_TIMEOUT_MS);
+    TimePoint checkProgressAt = Clock::now() + ELECTION_TIMEOUT;
     while (true) {
         if (exiting || term != currentTerm) {
             NOTICE("Lost leadership, aborting configuration change");
@@ -1612,9 +1648,7 @@ RaftConsensus::setConfiguration(
             } else {
                 ++currentEpoch;
                 epoch = currentEpoch;
-                checkProgressAt =
-                    (Clock::now() +
-                     std::chrono::milliseconds(ELECTION_TIMEOUT_MS));
+                checkProgressAt = Clock::now() + ELECTION_TIMEOUT;
             }
         }
         stateChanged.wait_until(lockGuard, checkProgressAt);
@@ -2044,7 +2078,7 @@ RaftConsensus::peerThreadMain(std::shared_ptr<Peer> peer)
 
                 // Leaders replicate entries and periodically send heartbeats.
                 case State::LEADER:
-                    if (peer->getLastAgreeIndex() < log->getLastLogIndex() ||
+                    if (peer->getMatchIndex() < log->getLastLogIndex() ||
                         peer->nextHeartbeatTime < now) {
                         // appendEntries delegates to installSnapshot if we
                         // need to send a snapshot instead
@@ -2092,8 +2126,7 @@ RaftConsensus::stepDownThreadMain()
         // step down. The election timeout is a reasonable amount of time,
         // since it's about when other servers will start elections and bump
         // the term.
-        TimePoint stepDownAt =
-            Clock::now() + std::chrono::milliseconds(ELECTION_TIMEOUT_MS);
+        TimePoint stepDownAt = Clock::now() + ELECTION_TIMEOUT;
         uint64_t term = currentTerm;
         uint64_t epoch = currentEpoch; // currentEpoch was incremented above
         while (true) {
@@ -2121,7 +2154,7 @@ void
 RaftConsensus::advanceCommitIndex()
 {
     if (state != State::LEADER) {
-        // getLastAgreeIndex is undefined unless we're leader
+        // getMatchIndex is undefined unless we're leader
         WARNING("advanceCommitIndex called as %s",
                 Core::StringUtil::toString(state).c_str());
         return;
@@ -2129,7 +2162,7 @@ RaftConsensus::advanceCommitIndex()
 
     // calculate the largest entry ID stored on a quorum of servers
     uint64_t newCommitIndex =
-        configuration->quorumMin(&Server::getLastAgreeIndex);
+        configuration->quorumMin(&Server::getMatchIndex);
     if (commitIndex >= newCommitIndex)
         return;
     // If we have discarded the entry, it's because we already knew it was
@@ -2226,30 +2259,9 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
     request.set_term(currentTerm);
     request.set_prev_log_term(prevLogTerm);
     request.set_prev_log_index(prevLogIndex);
-
-    // Add as many as entries as will fit comfortably in the request. It's
-    // easiest to add one entry at a time until the RPC gets too big, then back
-    // the last one out.
     uint64_t numEntries = 0;
-    if (!peer.forceHeartbeat) {
-        for (uint64_t index = peer.nextIndex;
-             index <= lastLogIndex;
-             ++index) {
-            const Log::Entry& entry = log->getEntry(index);
-            *request.add_entries() = entry;
-            uint64_t requestSize =
-                Core::Util::downCast<uint64_t>(request.ByteSize());
-            if (requestSize < SOFT_RPC_SIZE_LIMIT || numEntries == 0) {
-                // this entry fits, send it
-                VERBOSE("sending entry <index=%lu,term=%lu>",
-                        index, entry.term());
-                ++numEntries;
-            } else {
-                // this entry doesn't fit, discard it
-                request.mutable_entries()->RemoveLast();
-            }
-        }
-    }
+    if (!peer.suppressBulkData)
+        numEntries = packEntries(peer.nextIndex, request);
     request.set_commit_index(std::min(commitIndex, prevLogIndex + numEntries));
 
     // Execute RPC
@@ -2264,8 +2276,8 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
         case Peer::CallStatus::OK:
             break;
         case Peer::CallStatus::FAILED:
-            peer.backoffUntil = start +
-                std::chrono::milliseconds(RPC_FAILURE_BACKOFF_MS);
+            peer.suppressBulkData = true;
+            peer.backoffUntil = start + RPC_FAILURE_BACKOFF;
             return;
         case Peer::CallStatus::INVALID_REQUEST:
             PANIC("The server's RaftService doesn't support the AppendEntries "
@@ -2290,32 +2302,31 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
         assert(response.term() == currentTerm);
         peer.lastAckEpoch = epoch;
         stateChanged.notify_all();
-        peer.nextHeartbeatTime = start +
-            std::chrono::milliseconds(HEARTBEAT_PERIOD_MS);
+        peer.nextHeartbeatTime = start + HEARTBEAT_PERIOD;
         if (response.success()) {
-            if (peer.lastAgreeIndex > prevLogIndex + numEntries) {
+            if (peer.matchIndex > prevLogIndex + numEntries) {
                 // Revisit this warning if we pipeline AppendEntries RPCs for
                 // performance.
-                WARNING("lastAgreeIndex should monotonically increase within a "
+                WARNING("matchIndex should monotonically increase within a "
                         "term, since servers don't forget entries. But it "
                         "didn't.");
             } else {
-                peer.lastAgreeIndex = prevLogIndex + numEntries;
+                peer.matchIndex = prevLogIndex + numEntries;
                 advanceCommitIndex();
             }
-            peer.nextIndex = peer.lastAgreeIndex + 1;
-            peer.forceHeartbeat = false;
+            peer.nextIndex = peer.matchIndex + 1;
+            peer.suppressBulkData = false;
 
             if (!peer.isCaughtUp_ &&
-                peer.thisCatchUpIterationGoalId <= peer.lastAgreeIndex) {
+                peer.thisCatchUpIterationGoalId <= peer.matchIndex) {
                 Clock::duration duration =
                     Clock::now() - peer.thisCatchUpIterationStart;
                 uint64_t thisCatchUpIterationMs =
                     uint64_t(std::chrono::duration_cast<
                                  std::chrono::milliseconds>(duration).count());
-                if (uint64_t(labs(int64_t(peer.lastCatchUpIterationMs -
-                                          thisCatchUpIterationMs))) <
-                    ELECTION_TIMEOUT_MS) {
+                if (labs(int64_t(peer.lastCatchUpIterationMs -
+                                 thisCatchUpIterationMs)) * 1000L * 1000L <
+                    std::chrono::nanoseconds(ELECTION_TIMEOUT).count()) {
                     peer.isCaughtUp_ = true;
                     stateChanged.notify_all();
                 } else {
@@ -2327,6 +2338,15 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
         } else {
             if (peer.nextIndex > 1)
                 --peer.nextIndex;
+            // A server that hasn't been around for a while might have a much
+            // shorter log than ours. The AppendEntries reply contains the
+            // index of its last log entry, and there's no reason for us to
+            // set nextIndex to be more than 1 past that (that would leave a
+            // gap, so it will always be rejected).
+            if (response.has_last_log_index() &&
+                peer.nextIndex > response.last_log_index() + 1) {
+                peer.nextIndex = response.last_log_index() + 1;
+            }
         }
     }
     if (response.has_server_capabilities()) {
@@ -2351,6 +2371,7 @@ RaftConsensus::installSnapshot(std::unique_lock<Mutex>& lockGuard,
     Protocol::Raft::InstallSnapshot::Request request;
     request.set_server_id(serverId);
     request.set_term(currentTerm);
+    request.set_version(2);
 
     // Open the latest snapshot if we haven't already. Stash a copy of the
     // lastSnapshotIndex that goes along with the file, since it's possible
@@ -2361,14 +2382,21 @@ RaftConsensus::installSnapshot(std::unique_lock<Mutex>& lockGuard,
             FS::openFile(storageLayout.snapshotDir, "snapshot", O_RDONLY)));
         peer.snapshotFileOffset = 0;
         peer.lastSnapshotIndex = lastSnapshotIndex;
+        NOTICE("Beginning to send snapshot of %lu bytes up through index %lu "
+               "to follower",
+               peer.snapshotFile->getFileLength(),
+               lastSnapshotIndex);
     }
     request.set_last_snapshot_index(peer.lastSnapshotIndex);
     request.set_byte_offset(peer.snapshotFileOffset);
-    // The amount of data we can send is bounded by the remaining bytes in the
-    // file and the maximum length for RPCs.
-    uint64_t numDataBytes = std::min(
-        peer.snapshotFile->getFileLength() - peer.snapshotFileOffset,
-        SOFT_RPC_SIZE_LIMIT);
+    uint64_t numDataBytes = 0;
+    if (!peer.suppressBulkData) {
+        // The amount of data we can send is bounded by the remaining bytes in
+        // the file and the maximum length for RPCs.
+        numDataBytes = std::min(
+            peer.snapshotFile->getFileLength() - peer.snapshotFileOffset,
+            SOFT_RPC_SIZE_LIMIT);
+    }
     request.set_data(peer.snapshotFile->get<char>(peer.snapshotFileOffset,
                                                   numDataBytes),
                      numDataBytes);
@@ -2387,8 +2415,8 @@ RaftConsensus::installSnapshot(std::unique_lock<Mutex>& lockGuard,
         case Peer::CallStatus::OK:
             break;
         case Peer::CallStatus::FAILED:
-            peer.backoffUntil = start +
-                std::chrono::milliseconds(RPC_FAILURE_BACKOFF_MS);
+            peer.suppressBulkData = true;
+            peer.backoffUntil = start + RPC_FAILURE_BACKOFF;
             return;
         case Peer::CallStatus::INVALID_REQUEST:
             PANIC("The server's RaftService doesn't support the "
@@ -2413,15 +2441,25 @@ RaftConsensus::installSnapshot(std::unique_lock<Mutex>& lockGuard,
         assert(response.term() == currentTerm);
         peer.lastAckEpoch = epoch;
         stateChanged.notify_all();
-        peer.nextHeartbeatTime = start +
-            std::chrono::milliseconds(HEARTBEAT_PERIOD_MS);
-        peer.snapshotFileOffset += numDataBytes;
-        if (request.done()) {
-            peer.lastAgreeIndex = peer.lastSnapshotIndex;
+        peer.nextHeartbeatTime = start + HEARTBEAT_PERIOD;
+        peer.suppressBulkData = false;
+        if (response.has_bytes_stored()) {
+            // Normal path (since InstallSnapshot version 2).
+            peer.snapshotFileOffset = response.bytes_stored();
+        } else {
+            // This is the old path for InstallSnapshot version 1 followers
+            // only. The leader would just assume the snapshot chunk was always
+            // appended to the file if the terms matched.
+            peer.snapshotFileOffset += numDataBytes;
+        }
+        if (peer.snapshotFileOffset == peer.snapshotFile->getFileLength()) {
+            NOTICE("Done sending snapshot through index %lu to follower",
+                   peer.lastSnapshotIndex);
+            peer.matchIndex = peer.lastSnapshotIndex;
             peer.nextIndex = peer.lastSnapshotIndex + 1;
             // These entries are already committed if they're in a snapshot, so
             // the commitIndex shouldn't advance, but let's just follow the
-            // simple rule that bumping lastAgreeIndex should always be
+            // simple rule that bumping matchIndex should always be
             // followed by a call to advanceCommitIndex():
             advanceCommitIndex();
             peer.snapshotFile.reset();
@@ -2435,7 +2473,9 @@ void
 RaftConsensus::becomeLeader()
 {
     assert(state == State::CANDIDATE);
-    NOTICE("Now leader for term %lu", currentTerm);
+    NOTICE("Now leader for term %lu (appending no-op at index %lu)",
+           currentTerm,
+           log->getLastLogIndex() + 1);
     state = State::LEADER;
     leaderId = serverId;
     printElectionState();
@@ -2449,7 +2489,7 @@ RaftConsensus::becomeLeader()
     clusterClock.newEpoch(clusterClock.clusterTimeAtEpoch);
 
     // The ordering is pretty important here: First set nextIndex and
-    // lastAgreeIndex for ourselves and each follower, then append the no op.
+    // matchIndex for ourselves and each follower, then append the no op.
     // Otherwise we'll set our localServer's last agree index too high.
     configuration->forEach(&Server::beginLeadership);
 
@@ -2505,6 +2545,70 @@ RaftConsensus::interruptAll()
     // A configuration is sometimes missing for unit tests.
     if (configuration)
         configuration->forEach(&Server::interrupt);
+}
+
+uint64_t
+RaftConsensus::packEntries(
+        uint64_t nextIndex,
+        Protocol::Raft::AppendEntries::Request& request) const
+{
+    // Add as many as entries as will fit comfortably in the request. It's
+    // easiest to add one entry at a time until the RPC gets too big, then back
+    // the last one out.
+
+    // Calculating the size of the request ProtoBuf is a bit expensive, so this
+    // estimates high, then if it reaches the size limit, corrects the estimate
+    // and keeps going. This is a dumb algorithm but does well enough. It gets
+    // the number of calls to request.ByteSize() down to about 15 even with
+    // extremely small entries (10 bytes of payload data in each of 50,000
+    // entries filling to a 1MB max).
+
+    // Processing 19000 entries here with 10 bytes of data each (total request
+    // size of 1MB) still takes about 42 milliseconds on an overloaded laptop
+    // when compiling in DEBUG mode. That's a bit slow, in case someone has
+    // aggressive election timeouts. As a result, the total number of entries
+    // in a request is now limited to MAX_LOG_ENTRIES_PER_REQUEST=5000, which
+    // amortizes RPC overhead well enough anyhow. This limit will only kick in
+    // when the entry size drops below 200 bytes, since 1M/5K=200.
+
+    using Core::Util::downCast;
+    uint64_t lastIndex = std::min(log->getLastLogIndex(),
+                                  nextIndex + MAX_LOG_ENTRIES_PER_REQUEST - 1);
+    google::protobuf::RepeatedPtrField<Protocol::Raft::Entry>& requestEntries =
+        *request.mutable_entries();
+
+    uint64_t numEntries = 0;
+    uint64_t currentSize = downCast<uint64_t>(request.ByteSize());
+
+    for (uint64_t index = nextIndex; index <= lastIndex; ++index) {
+        const Log::Entry& entry = log->getEntry(index);
+        *requestEntries.Add() = entry;
+
+        // Each member of a repeated message field is encoded with a tag
+        // and a length. We conservatively assume the tag and length will
+        // be up to 10 bytes each (2^64), though in practice the tag is
+        // probably one byte and the length is probably two.
+        currentSize += uint64_t(entry.ByteSize()) + 20;
+
+        if (currentSize >= SOFT_RPC_SIZE_LIMIT) {
+            // The message might be too big: calculate more exact but more
+            // expensive size.
+            uint64_t actualSize = downCast<uint64_t>(request.ByteSize());
+            assert(currentSize >= actualSize);
+            currentSize = actualSize;
+            if (currentSize >= SOFT_RPC_SIZE_LIMIT && numEntries > 0) {
+                // This entry doesn't fit and we've already got some
+                // entries to send: discard this one and stop adding more.
+                requestEntries.RemoveLast();
+                break;
+            }
+        }
+        // This entry fit, so we'll send it.
+        ++numEntries;
+    }
+
+    assert(numEntries == uint64_t(requestEntries.size()));
+    return numEntries;
 }
 
 void
@@ -2656,8 +2760,8 @@ RaftConsensus::requestVote(std::unique_lock<Mutex>& lockGuard, Peer& peer)
         case Peer::CallStatus::OK:
             break;
         case Peer::CallStatus::FAILED:
-            peer.backoffUntil = start +
-                std::chrono::milliseconds(RPC_FAILURE_BACKOFF_MS);
+            peer.suppressBulkData = true;
+            peer.backoffUntil = start + RPC_FAILURE_BACKOFF;
             return;
         case Peer::CallStatus::INVALID_REQUEST:
             PANIC("The server's RaftService doesn't support the RequestVote "
@@ -2697,10 +2801,13 @@ RaftConsensus::requestVote(std::unique_lock<Mutex>& lockGuard, Peer& peer)
 void
 RaftConsensus::setElectionTimer()
 {
-    uint64_t ms = Core::Random::randomRange(ELECTION_TIMEOUT_MS,
-                                            ELECTION_TIMEOUT_MS * 2);
-    VERBOSE("Will become candidate in %lu ms", ms);
-    startElectionAt = Clock::now() + std::chrono::milliseconds(ms);
+    std::chrono::nanoseconds duration(
+        Core::Random::randomRange(
+            uint64_t(std::chrono::nanoseconds(ELECTION_TIMEOUT).count()),
+            uint64_t(std::chrono::nanoseconds(ELECTION_TIMEOUT).count()) * 2));
+    VERBOSE("Will become candidate in %s",
+            Core::StringUtil::toString(duration).c_str());
+    startElectionAt = Clock::now() + duration;
     stateChanged.notify_all();
 }
 

@@ -27,29 +27,10 @@
 #include "include/LogCabin/Client.h"
 
 namespace LogCabin {
-
-namespace Client {
-namespace Internal {
-
-ClientImpl::TimePoint absTimeout(uint64_t relTimeoutNanos);
-
-} // namespace LogCabin::Client::Internal
-} // namespace LogCabin::Client
-
 namespace {
 
 using Core::ProtoBuf::fromString;
 using Core::StringUtil::format;
-
-TEST(ClientInternalTest, absTimeout)
-{
-    using Client::Internal::absTimeout;
-    EXPECT_EQ(Client::ClientImpl::TimePoint::max(), absTimeout(0));
-    EXPECT_EQ(Client::ClientImpl::TimePoint::max(), absTimeout(~0UL));
-    auto t = absTimeout(35UL * 1000 * 1000 * 1000);
-    EXPECT_LT(Client::ClientImpl::Clock::now() + std::chrono::seconds(30), t);
-    EXPECT_GT(Client::ClientImpl::Clock::now() + std::chrono::seconds(40), t);
-}
 
 
 #if DEBUG
@@ -144,7 +125,13 @@ TEST_F(ClientTreeTest, getCondition)
     EXPECT_EQ((Client::Condition {"", ""}),
               tree.getCondition());
     tree.setCondition("a", "b");
-    EXPECT_EQ((Client::Condition {"a", "b"}),
+    EXPECT_EQ((Client::Condition {"/a", "b"}),
+              tree.getCondition());
+    tree.setCondition("", "asdf");
+    EXPECT_EQ((Client::Condition {"", ""}),
+              tree.getCondition());
+    tree.setCondition("", "");
+    EXPECT_EQ((Client::Condition {"", ""}),
               tree.getCondition());
 }
 
@@ -255,6 +242,8 @@ TEST_F(ClientTreeTest, removeFile)
 TEST_F(ClientTreeTest, conditions)
 {
     tree.setCondition("/a", "c");
+    EXPECT_EQ((std::pair<std::string, std::string> {"/a", "c"}),
+              tree.getCondition());
     EXPECT_EQ(Status::CONDITION_NOT_MET,
               tree.makeDirectory("/foo").status);
     std::vector<std::string> children;
@@ -269,6 +258,61 @@ TEST_F(ClientTreeTest, conditions)
               tree.read("/a", contents).status);
     EXPECT_EQ(Status::CONDITION_NOT_MET,
               tree.removeFile("/a").status);
+
+    tree.setCondition("", "");
+    tree.writeEx("/a", "c");
+    tree.setCondition("/a", "c");
+    EXPECT_EQ(Status::OK,
+              tree.makeDirectory("/foo").status);
+    EXPECT_EQ(Status::OK,
+              tree.listDirectory("/foo", children).status);
+    EXPECT_EQ(Status::OK,
+              tree.removeDirectory("/foo").status);
+    EXPECT_EQ(Status::OK,
+              tree.write("/b", "c").status);
+    EXPECT_EQ(Status::OK,
+              tree.read("/b", contents).status);
+    EXPECT_EQ(Status::OK,
+              tree.removeFile("/b").status);
+}
+
+TEST_F(ClientTreeTest, conditions_withWorkingDirectory)
+{
+    tree.setWorkingDirectory("/baz");
+    tree.writeEx("bar", "d");
+    tree.setCondition("bar", "c");
+    EXPECT_EQ((std::pair<std::string, std::string> {"/baz/bar", "c"}),
+              tree.getCondition());
+    EXPECT_EQ(Status::CONDITION_NOT_MET,
+              tree.makeDirectory("foo").status);
+    std::vector<std::string> children;
+    EXPECT_EQ(Status::CONDITION_NOT_MET,
+              tree.listDirectory("", children).status);
+    EXPECT_EQ(Status::CONDITION_NOT_MET,
+              tree.removeDirectory("").status);
+    EXPECT_EQ(Status::CONDITION_NOT_MET,
+              tree.write("a", "c").status);
+    std::string contents;
+    EXPECT_EQ(Status::CONDITION_NOT_MET,
+              tree.read("a", contents).status);
+    EXPECT_EQ(Status::CONDITION_NOT_MET,
+              tree.removeFile("a").status);
+
+    tree.setCondition("bar", "d");
+    EXPECT_EQ((std::pair<std::string, std::string> {"/baz/bar", "d"}),
+              tree.getCondition());
+    EXPECT_EQ(Status::OK,
+              tree.makeDirectory("foo").status);
+    EXPECT_EQ(Status::OK,
+              tree.listDirectory("foo", children).status);
+    EXPECT_EQ(Status::OK,
+              tree.removeDirectory("foo").status);
+    EXPECT_EQ(Status::OK,
+              tree.write("a", "c").status);
+    EXPECT_EQ(Status::OK,
+              tree.read("a", contents).status);
+    EXPECT_EQ(Status::OK,
+              tree.removeFile("a").status);
 }
 
 } // namespace LogCabin::<anonymous>

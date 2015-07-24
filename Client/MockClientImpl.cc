@@ -51,9 +51,9 @@ typedef RAIISwap<std::shared_ptr<TestingCallbacks>> CallbackSwap;
  */
 class TreeLeaderRPC : public LeaderRPCBase {
   public:
-    explicit TreeLeaderRPC(MockClientImpl& mockClientImpl)
-        : mockClientImpl(mockClientImpl)
-        , mutex()
+    explicit TreeLeaderRPC(std::shared_ptr<TestingCallbacks> callbacks)
+        : mutex()
+        , callbacks(callbacks)
         , tree()
     {
     }
@@ -67,12 +67,14 @@ class TreeLeaderRPC : public LeaderRPCBase {
             qrequest.CopyFrom(request);
             auto& qresponse =
                 static_cast<PC::StateMachineQuery::Response&>(response);
-            auto callbacks = std::make_shared<TestingCallbacks>();
+            auto localCallbacks = std::make_shared<TestingCallbacks>();
             // set to noop for recursive calls, then restore
-            CallbackSwap s(mockClientImpl.callbacks, callbacks);
-            if (callbacks->stateMachineQuery(qrequest, qresponse))
+            CallbackSwap s(callbacks, localCallbacks);
+            if (localCallbacks->stateMachineQuery(qrequest, qresponse))
                 return Status::OK;
             qresponse.Clear();
+            if (timeout < Clock::now())
+                return Status::TIMEOUT;
             if (qrequest.has_tree()) {
                 LogCabin::Tree::ProtoBuf::readOnlyTreeRPC(
                     tree, qrequest.tree(), *qresponse.mutable_tree());
@@ -83,12 +85,14 @@ class TreeLeaderRPC : public LeaderRPCBase {
             crequest.CopyFrom(request);
             auto& cresponse =
                 static_cast<PC::StateMachineCommand::Response&>(response);
-            auto callbacks = std::make_shared<TestingCallbacks>();
+            auto localCallbacks = std::make_shared<TestingCallbacks>();
             // set to noop for recursive calls, then restore
-            CallbackSwap s(mockClientImpl.callbacks, callbacks);
-            if (callbacks->stateMachineCommand(crequest, cresponse))
+            CallbackSwap s(callbacks, localCallbacks);
+            if (localCallbacks->stateMachineCommand(crequest, cresponse))
                 return Status::OK;
             cresponse.Clear();
+            if (timeout < Clock::now())
+                return Status::TIMEOUT;
             if (crequest.has_tree()) {
                 LogCabin::Tree::ProtoBuf::readWriteTreeRPC(
                     tree, crequest.tree(), *cresponse.mutable_tree());
@@ -96,6 +100,8 @@ class TreeLeaderRPC : public LeaderRPCBase {
             } else if (crequest.has_open_session()) {
                 cresponse.mutable_open_session()->
                     set_client_id(1);
+                return Status::OK;
+            } else if (crequest.has_close_session()) {
                 return Status::OK;
             }
         }
@@ -140,20 +146,20 @@ class TreeLeaderRPC : public LeaderRPCBase {
         return std::unique_ptr<LeaderRPCBase::Call>(new Call(*this));
     }
 
-    MockClientImpl& mockClientImpl;
     /**
-     * Prevents concurrent access to 'tree'. It's recursive so that you can
-     * call the client library from within MockCallbacks, if you're that
-     * insane.
+     * Prevents concurrent access to callbacks and tree. It's recursive so that
+     * you can call the client library from within MockCallbacks, if you're
+     * that insane.
      */
     std::recursive_mutex mutex;
+    std::shared_ptr<TestingCallbacks> callbacks;
     LogCabin::Tree::Tree tree;
 };
 } // anonymous namespace
 
 MockClientImpl::MockClientImpl(std::shared_ptr<TestingCallbacks> callbacks)
-    : callbacks(callbacks)
 {
+    leaderRPC.reset(new TreeLeaderRPC(callbacks));
 }
 
 MockClientImpl::~MockClientImpl()
@@ -163,7 +169,6 @@ MockClientImpl::~MockClientImpl()
 void
 MockClientImpl::initDerived()
 {
-    leaderRPC.reset(new TreeLeaderRPC(*this));
 }
 
 std::pair<uint64_t, Configuration>

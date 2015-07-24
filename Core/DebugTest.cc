@@ -15,11 +15,13 @@
  */
 
 #include <gtest/gtest.h>
+#include <sys/stat.h>
 #include <unordered_map>
 
 #include "Core/Debug.h"
 #include "Core/STLUtil.h"
 #include "Core/Util.h"
+#include "Storage/FilesystemUtil.h"
 #include "include/LogCabin/Debug.h"
 
 namespace LogCabin {
@@ -27,8 +29,8 @@ namespace Core {
 namespace Debug {
 
 namespace Internal {
-extern const char* logLevelToString[];
 extern std::unordered_map<const char*, LogLevel> isLoggingCache;
+const char* logLevelToString(LogLevel);
 LogLevel logLevelFromString(const std::string& level);
 LogLevel getLogLevel(const char* fileName);
 const char* relativeFileName(const char* fileName);
@@ -38,23 +40,32 @@ namespace {
 
 class CoreDebugTest : public ::testing::Test {
   public:
-    CoreDebugTest() {
+    CoreDebugTest()
+        : tmpdir(Storage::FilesystemUtil::mkdtemp())
+    {
         setLogPolicy({});
+        setLogFile(stderr);
     }
+    ~CoreDebugTest() {
+        setLogFile(stderr);
+        Storage::FilesystemUtil::remove(tmpdir);
+    }
+
+    std::string tmpdir;
 };
 
 
 TEST_F(CoreDebugTest, logLevelToString) {
     EXPECT_STREQ("SILENT",
-                 Internal::logLevelToString[uint32_t(LogLevel::SILENT)]);
+                 Internal::logLevelToString(LogLevel::SILENT));
     EXPECT_STREQ("ERROR",
-                 Internal::logLevelToString[uint32_t(LogLevel::ERROR)]);
+                 Internal::logLevelToString(LogLevel::ERROR));
     EXPECT_STREQ("WARNING",
-                 Internal::logLevelToString[uint32_t(LogLevel::WARNING)]);
+                 Internal::logLevelToString(LogLevel::WARNING));
     EXPECT_STREQ("NOTICE",
-                 Internal::logLevelToString[uint32_t(LogLevel::NOTICE)]);
+                 Internal::logLevelToString(LogLevel::NOTICE));
     EXPECT_STREQ("VERBOSE",
-                 Internal::logLevelToString[uint32_t(LogLevel::VERBOSE)]);
+                 Internal::logLevelToString(LogLevel::VERBOSE));
 }
 
 TEST_F(CoreDebugTest, logLevelFromString) {
@@ -101,9 +112,43 @@ TEST_F(CoreDebugTest, isLogging) {
               STLUtil::getItems(Internal::isLoggingCache));
 }
 
+TEST_F(CoreDebugTest, getLogFilename) {
+    EXPECT_EQ("", getLogFilename());
+    EXPECT_EQ("", setLogFilename(tmpdir + "/x"));
+    EXPECT_EQ(tmpdir + "/x", getLogFilename());
+    EXPECT_NE("", setLogFilename(tmpdir + "/bogus/x"));
+    EXPECT_EQ(tmpdir + "/x", getLogFilename());
+}
+
+TEST_F(CoreDebugTest, setLogFilename) {
+    EXPECT_EQ("", setLogFilename(tmpdir + "/x"));
+    EXPECT_EQ(std::string() +
+              "Could not open " + tmpdir + "/bogus/x for writing debug "
+              "log messages: No such file or directory",
+              setLogFilename(tmpdir + "/bogus/x"));
+
+    EXPECT_EQ(tmpdir + "/x", getLogFilename());
+    ERROR("If you see this on your terminal, this test has failed");
+    struct stat stats;
+    EXPECT_EQ(0, stat((tmpdir + "/x").c_str(), &stats)) << strerror(errno);
+    EXPECT_LT(10, stats.st_size);
+}
+
+TEST_F(CoreDebugTest, reopenLogFromFilename) {
+    EXPECT_EQ("", reopenLogFromFilename());
+    EXPECT_EQ("", setLogFilename(tmpdir + "/x"));
+    EXPECT_EQ("", reopenLogFromFilename());
+}
+
 TEST_F(CoreDebugTest, setLogFile) {
     EXPECT_EQ(stderr, setLogFile(stdout));
     EXPECT_EQ(stdout, setLogFile(stderr));
+}
+
+TEST_F(CoreDebugTest, setLogFile_clearsFilename) {
+    EXPECT_EQ("", setLogFilename(tmpdir + "/x"));
+    EXPECT_EQ(0, fclose(setLogFile(stderr)));
+    EXPECT_EQ("", getLogFilename());
 }
 
 struct VectorHandler {
@@ -137,6 +182,50 @@ TEST_F(CoreDebugTest, setLogHandler) {
     EXPECT_STREQ("ERROR", m.logLevelString);
     EXPECT_EQ("Hello, world! 9", m.message);
 }
+
+TEST_F(CoreDebugTest, setLogPolicy) {
+    setLogPolicy({{"prefix", "VERBOSE"},
+                  {"suffix", "ERROR"},
+                  {"", "WARNING"}});
+    EXPECT_EQ(LogLevel::VERBOSE, Internal::getLogLevel("prefixabcsuffix"));
+    EXPECT_EQ(LogLevel::ERROR, Internal::getLogLevel("abcsuffix"));
+    EXPECT_EQ(LogLevel::WARNING, Internal::getLogLevel("asdf"));
+}
+
+std::string normalize(const std::string& in) {
+    return logPolicyToString(logPolicyFromString(in));
+}
+
+
+TEST_F(CoreDebugTest, logPolicyFromString) {
+    EXPECT_EQ("NOTICE", normalize(""));
+    EXPECT_EQ("ERROR", normalize("ERROR"));
+    EXPECT_EQ("ERROR", normalize("@ERROR"));
+    EXPECT_EQ("prefix@VERBOSE,suffix@ERROR,WARNING",
+              normalize("prefix@VERBOSE,suffix@ERROR,WARNING"));
+    EXPECT_EQ("prefix@VERBOSE,suffix@ERROR,NOTICE",
+              normalize("prefix@VERBOSE,suffix@ERROR,@NOTICE"));
+    EXPECT_EQ("prefix@VERBOSE,suffix@ERROR,NOTICE",
+              normalize("prefix@VERBOSE,suffix@ERROR,NOTICE"));
+}
+
+TEST_F(CoreDebugTest, logPolicyToString) {
+    EXPECT_EQ("NOTICE",
+              logPolicyToString(getLogPolicy()));
+    setLogPolicy({{"", "ERROR"}});
+    EXPECT_EQ("ERROR",
+              logPolicyToString(getLogPolicy()));
+    setLogPolicy({{"prefix", "VERBOSE"},
+                  {"suffix", "ERROR"},
+                  {"", "WARNING"}});
+    EXPECT_EQ("prefix@VERBOSE,suffix@ERROR,WARNING",
+              logPolicyToString(getLogPolicy()));
+    setLogPolicy({{"prefix", "VERBOSE"},
+                  {"suffix", "ERROR"}});
+    EXPECT_EQ("prefix@VERBOSE,suffix@ERROR,NOTICE",
+              logPolicyToString(getLogPolicy()));
+}
+
 
 // log: low cost-benefit in testing
 

@@ -26,7 +26,6 @@
 #include "Core/Util.h"
 #include "Server/Globals.h"
 #include "Server/RaftConsensus.h"
-#include "include/LogCabin/Debug.h"
 
 namespace {
 
@@ -104,6 +103,9 @@ class OptionParser {
             << "Runs a LogCabin server."
             << std::endl
             << std::endl
+            << "This program was released in LogCabin v1.0.0."
+            << std::endl
+            << std::endl
 
             << "Usage: " << argv[0] << " [options]"
             << std::endl
@@ -153,6 +155,18 @@ class OptionParser {
             << std::endl
             << "                               "
             << "and exit"
+            << std::endl
+            << std::endl
+
+            << "Signals:"
+            << std::endl
+
+            << "  SIGUSR1                      "
+            << "Dump ServerStats to debug log (experimental)"
+            << std::endl
+
+            << "  SIGUSR2                      "
+            << "Reopen the debug log file"
             << std::endl;
     }
 
@@ -186,7 +200,7 @@ class PidFile {
             return;
         FILE* file = fopen(filename.c_str(), "w");
         if (file == NULL) {
-            PANIC("Could not open %s for writing process ID: %s",
+            ERROR("Could not open %s for writing process ID: %s",
                   filename.c_str(),
                   strerror(errno));
         }
@@ -221,7 +235,6 @@ class PidFile {
                     strerror(errno));
             return;
         }
-        LogCabin::Core::Util::Finally _(std::bind(fclose, file));
         char readbuf[10];
         memset(readbuf, 0, sizeof(readbuf));
         size_t bytesRead = fread(readbuf, 1, sizeof(readbuf), file);
@@ -229,6 +242,7 @@ class PidFile {
             WARNING("PID could not be read from pidfile: "
                     "will not remove file %s",
                     filename.c_str());
+            fclose(file);
             return;
         }
         int pidRead = atoi(readbuf);
@@ -236,15 +250,18 @@ class PidFile {
             WARNING("PID read from pidfile (%d) does not match PID written "
                     "earlier (%d): will not remove file %s",
                     pidRead, written, filename.c_str());
+            fclose(file);
             return;
         }
         int r = unlink(filename.c_str());
         if (r != 0) {
             WARNING("Could not unlink %s: %s",
                     filename.c_str(), strerror(errno));
+            fclose(file);
             return;
         }
         written = -1;
+        fclose(file);
         NOTICE("Removed pidfile %s", filename.c_str());
     }
 
@@ -259,77 +276,88 @@ main(int argc, char** argv)
 {
     using namespace LogCabin;
 
-    Core::ThreadId::setName("evloop");
-    //Core::Debug::setLogPolicy({{"Server", "VERBOSE"}});
+    try {
+        Core::ThreadId::setName("evloop");
 
-    // Parse command line args.
-    OptionParser options(argc, argv);
+        // Parse command line args.
+        OptionParser options(argc, argv);
 
-    if (options.testConfig) {
-        Server::Globals globals;
-        globals.config.readFile(options.configFilename.c_str());
-        // The following settings are required, and Config::read() throws an
-        // exception with an OK error message if they aren't found:
-        globals.config.read<uint64_t>("serverId");
-        globals.config.read<std::string>("listenAddresses");
+        if (options.testConfig) {
+            Server::Globals globals;
+            globals.config.readFile(options.configFilename.c_str());
+            // The following settings are required, and Config::read() throws
+            // an exception with an OK error message if they aren't found:
+            globals.config.read<uint64_t>("serverId");
+            globals.config.read<std::string>("listenAddresses");
+            return 0;
+        }
+
+        // Set debug log file
+        if (!options.debugLogFilename.empty()) {
+            std::string error =
+                Core::Debug::setLogFilename(options.debugLogFilename);
+            if (!error.empty()) {
+                ERROR("Failed to set debug log file: %s",
+                      error.c_str());
+            }
+        }
+
+        NOTICE("Using config file %s", options.configFilename.c_str());
+
+        // Detach as daemon
+        if (options.daemon) {
+            if (options.debugLogFilename.empty()) {
+                ERROR("Refusing to run as daemon without a log file "
+                      "(use /dev/null if you insist)");
+            }
+            NOTICE("Detaching");
+            bool chdir = false; // leave the current working directory in case
+                                // the user has specified relative paths for
+                                // the config file, etc
+            bool close = true;  // close stdin, stdout, stderr
+            if (daemon(!chdir, !close) != 0) {
+                PANIC("Call to daemon() failed: %s", strerror(errno));
+            }
+            int pid = getpid();
+            Core::Debug::processName = Core::StringUtil::format("%d", pid);
+            NOTICE("Detached as daemon with pid %d", pid);
+        }
+
+        // Write PID file, removed upon destruction
+        PidFile pidFile(options.pidFilename);
+        pidFile.writePid(getpid());
+
+        {
+            // Initialize and run Globals.
+            Server::Globals globals;
+            globals.config.readFile(options.configFilename.c_str());
+
+            // Set debug log policy.
+            // A few log messages above already got through; oh well.
+            Core::Debug::setLogPolicy(
+                Core::Debug::logPolicyFromString(
+                    globals.config.read<std::string>("logPolicy", "NOTICE")));
+
+            NOTICE("Config file settings:\n"
+                   "# begin config\n"
+                   "%s"
+                   "# end config",
+                   Core::StringUtil::toString(globals.config).c_str());
+            globals.init();
+            if (options.bootstrap) {
+                globals.raft->bootstrapConfiguration();
+                NOTICE("Done bootstrapping configuration. Exiting.");
+            } else {
+                globals.leaveSignalsBlocked();
+                globals.run();
+            }
+        }
+
+        google::protobuf::ShutdownProtobufLibrary();
         return 0;
+
+    } catch (const Core::Config::Exception& e) {
+        ERROR("Fatal exception from config file: %s",
+              e.what());
     }
-
-    // Set debug log file
-    if (!options.debugLogFilename.empty()) {
-        FILE* debugLog = fopen(options.debugLogFilename.c_str(), "a");
-        if (debugLog == NULL) {
-            PANIC("Could not open %s for writing debug log messages: %s",
-                  options.debugLogFilename.c_str(),
-                  strerror(errno));
-        }
-        Core::Debug::setLogFile(debugLog);
-    }
-
-    NOTICE("Using config file %s", options.configFilename.c_str());
-
-    // Detach as daemon
-    if (options.daemon) {
-        if (options.debugLogFilename.empty()) {
-            PANIC("Refusing to run as daemon without a log file "
-                  "(use /dev/null if you insist)");
-        }
-        NOTICE("Detaching");
-        bool chdir = false; // leave the current working directory in case the
-                            // user has specified relative paths for the
-                            // config file, etc
-        bool close = true;  // close stdin, stdout, stderr
-        if (daemon(!chdir, !close) != 0) {
-            PANIC("Call to daemon() failed: %s", strerror(errno));
-        }
-        int pid = getpid();
-        Core::Debug::processName = Core::StringUtil::format("%d", pid);
-        NOTICE("Detached as daemon with pid %d", pid);
-    }
-
-    // Write PID file, removed upon destruction
-    PidFile pidFile(options.pidFilename);
-    pidFile.writePid(getpid());
-
-    {
-        // Initialize and run Globals.
-        Server::Globals globals;
-        globals.config.readFile(options.configFilename.c_str());
-        NOTICE("Config file settings:\n"
-               "# begin config\n"
-               "%s"
-               "# end config",
-               Core::StringUtil::toString(globals.config).c_str());
-        globals.init();
-        if (options.bootstrap) {
-            globals.raft->bootstrapConfiguration();
-            NOTICE("Done bootstrapping configuration. Exiting.");
-        } else {
-            globals.leaveSignalsBlocked();
-            globals.run();
-        }
-    }
-
-    google::protobuf::ShutdownProtobufLibrary();
-    return 0;
 }

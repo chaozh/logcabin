@@ -33,7 +33,8 @@
 #include <unistd.h>
 
 #include <LogCabin/Client.h>
-#include "Examples/Util.h"
+#include <LogCabin/Debug.h>
+#include <LogCabin/Util.h>
 
 namespace {
 
@@ -41,7 +42,7 @@ using LogCabin::Client::Cluster;
 using LogCabin::Client::Result;
 using LogCabin::Client::Status;
 using LogCabin::Client::Tree;
-using LogCabin::Examples::Util::parseTime;
+using LogCabin::Client::Util::parseNonNegativeDuration;
 
 /**
  * Parses argv for the main function.
@@ -52,10 +53,11 @@ class OptionParser {
         : argc(argc)
         , argv(argv)
         , cluster("logcabin:5254")
+        , logPolicy("")
         , size(1024)
         , writers(1)
         , totalWrites(1000)
-        , timeout(parseTime("30s"))
+        , timeout(parseNonNegativeDuration("30s"))
     {
         while (true) {
             static struct option longOptions[] = {
@@ -65,9 +67,11 @@ class OptionParser {
                {"threads",  required_argument, NULL, 't'},
                {"timeout",  required_argument, NULL, 'd'},
                {"writes",  required_argument, NULL, 'w'},
+               {"verbose",  no_argument, NULL, 'v'},
+               {"verbosity",  required_argument, NULL, 256},
                {0, 0, 0, 0}
             };
-            int c = getopt_long(argc, argv, "c:hs:t:w:", longOptions, NULL);
+            int c = getopt_long(argc, argv, "c:hs:t:w:v", longOptions, NULL);
 
             // Detect the end of the options.
             if (c == -1)
@@ -78,7 +82,7 @@ class OptionParser {
                     cluster = optarg;
                     break;
                 case 'd':
-                    timeout = parseTime(optarg);
+                    timeout = parseNonNegativeDuration(optarg);
                     break;
                 case 'h':
                     usage();
@@ -91,6 +95,12 @@ class OptionParser {
                     break;
                 case 'w':
                     totalWrites = uint64_t(atol(optarg));
+                    break;
+                case 'v':
+                    logPolicy = "VERBOSE";
+                    break;
+                case 256:
+                    logPolicy = optarg;
                     break;
                 case '?':
                 default:
@@ -107,6 +117,10 @@ class OptionParser {
             << "the given number of"
             << std::endl
             << "writes or the timeout, whichever comes first."
+            << std::endl
+            << std::endl
+            << "This program is subject to change (it is not part of "
+            << "LogCabin's stable API)."
             << std::endl
             << std::endl
 
@@ -145,12 +159,33 @@ class OptionParser {
 
             << "  --writes <num>          "
             << "Number of total writes [default: 1000]"
+            << std::endl
+
+            << "  -v, --verbose           "
+            << "Same as --verbosity=VERBOSE"
+            << std::endl
+
+            << "  --verbosity=<policy>    "
+            << "Set which log messages are shown."
+            << std::endl
+            << "                          "
+            << "Comma-separated LEVEL or PATTERN@LEVEL rules."
+            << std::endl
+            << "                          "
+            << "Levels: SILENT, ERROR, WARNING, NOTICE, VERBOSE."
+            << std::endl
+            << "                          "
+            << "Patterns match filename prefixes or suffixes."
+            << std::endl
+            << "                          "
+            << "Example: Client@NOTICE,Test.cc@SILENT,VERBOSE."
             << std::endl;
     }
 
     int& argc;
     char**& argv;
     std::string cluster;
+    std::string logPolicy;
     uint64_t size;
     uint64_t writers;
     uint64_t totalWrites;
@@ -233,39 +268,51 @@ timerThreadMain(uint64_t timeout, std::atomic<bool>& exit)
 int
 main(int argc, char** argv)
 {
-    OptionParser options(argc, argv);
-    Cluster cluster = Cluster(options.cluster);
-    Tree tree = cluster.getTree();
+    try {
 
-    std::string key("/bench");
-    std::string value(options.size, 'v');
+        OptionParser options(argc, argv);
+        LogCabin::Client::Debug::setLogPolicy(
+            LogCabin::Client::Debug::logPolicyFromString(
+                options.logPolicy));
+        Cluster cluster = Cluster(options.cluster);
+        Tree tree = cluster.getTree();
 
-    uint64_t startNanos = timeNanos();
-    std::atomic<bool> exit(false);
-    std::vector<uint64_t> writesDonePerThread(options.writers);
-    uint64_t totalWritesDone = 0;
-    std::vector<std::thread> threads;
-    std::thread timer(timerThreadMain, options.timeout, std::ref(exit));
-    for (uint64_t i = 0; i < options.writers; ++i) {
-        threads.emplace_back(writeThreadMain, i, std::ref(options),
-                             tree, std::ref(key), std::ref(value),
-                             std::ref(exit),
-                             std::ref(writesDonePerThread.at(i)));
+        std::string key("/bench");
+        std::string value(options.size, 'v');
+
+        uint64_t startNanos = timeNanos();
+        std::atomic<bool> exit(false);
+        std::vector<uint64_t> writesDonePerThread(options.writers);
+        uint64_t totalWritesDone = 0;
+        std::vector<std::thread> threads;
+        std::thread timer(timerThreadMain, options.timeout, std::ref(exit));
+        for (uint64_t i = 0; i < options.writers; ++i) {
+            threads.emplace_back(writeThreadMain, i, std::ref(options),
+                                 tree, std::ref(key), std::ref(value),
+                                 std::ref(exit),
+                                 std::ref(writesDonePerThread.at(i)));
+        }
+        for (uint64_t i = 0; i < options.writers; ++i) {
+            threads.at(i).join();
+            totalWritesDone += writesDonePerThread.at(i);
+        }
+        uint64_t endNanos = timeNanos();
+        exit = true;
+        timer.join();
+
+        tree.removeFile(key);
+        std::cout << "Benchmark took "
+                  << static_cast<double>(endNanos - startNanos) / 1e6
+                  << " ms to write "
+                  << totalWritesDone
+                  << " objects"
+                  << std::endl;
+        return 0;
+
+    } catch (const LogCabin::Client::Exception& e) {
+        std::cerr << "Exiting due to LogCabin::Client::Exception: "
+                  << e.what()
+                  << std::endl;
+        exit(1);
     }
-    for (uint64_t i = 0; i < options.writers; ++i) {
-        threads.at(i).join();
-        totalWritesDone += writesDonePerThread.at(i);
-    }
-    uint64_t endNanos = timeNanos();
-    exit = true;
-    timer.join();
-
-    tree.removeFile(key);
-    std::cout << "Benchmark took "
-              << static_cast<double>(endNanos - startNanos) / 1e6
-              << " ms to write "
-              << totalWritesDone
-              << " objects"
-              << std::endl;
-    return 0;
 }

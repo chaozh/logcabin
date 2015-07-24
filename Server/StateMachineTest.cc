@@ -30,7 +30,6 @@
 #include "Storage/FilesystemUtil.h"
 #include "Storage/MemoryLog.h"
 #include "Storage/SnapshotFile.h"
-#include "include/LogCabin/Debug.h"
 
 namespace LogCabin {
 namespace Server {
@@ -68,7 +67,8 @@ class ServerStateMachineTest : public ::testing::Test {
         consensus->advanceCommitIndex();
 
         stateMachineSuppressThreads = true;
-        stateMachine.reset(new StateMachine(consensus, globals.config));
+        stateMachine.reset(new StateMachine(consensus, globals.config,
+                                            globals));
     }
     ~ServerStateMachineTest() {
         stateMachineSuppressThreads = false;
@@ -118,11 +118,11 @@ struct WaitHelper {
     void operator()() {
         ++iter;
         if (iter == 1) {
-            EXPECT_EQ(0U, stateMachine.lastIndex);
-            stateMachine.lastIndex = 2;
+            EXPECT_EQ(0U, stateMachine.lastApplied);
+            stateMachine.lastApplied = 2;
         } else if (iter == 2) {
-            EXPECT_EQ(2U, stateMachine.lastIndex);
-            stateMachine.lastIndex = 3;
+            EXPECT_EQ(2U, stateMachine.lastApplied);
+            stateMachine.lastApplied = 3;
         }
     }
     StateMachine& stateMachine;
@@ -186,10 +186,25 @@ TEST_F(ServerStateMachineTest, waitForResponse_openSession)
     StateMachine::Command::Request request;
     request.mutable_open_session();
     StateMachine::Command::Response response;
-    stateMachine->lastIndex = 3;
+    stateMachine->lastApplied = 3;
     EXPECT_TRUE(stateMachine->waitForResponse(3, request, response));
     EXPECT_EQ("open_session { "
               "  client_id: 3 "
+              "}",
+              response);
+}
+
+TEST_F(ServerStateMachineTest, waitForResponse_closeSession)
+{
+    stateMachine->lastApplied = 3;
+    StateMachine::Command::Request request;
+    request.mutable_close_session()->set_client_id(3);
+    StateMachine::Command::Response response;
+    stateMachine->versionHistory.insert({3, 2});
+    EXPECT_FALSE(stateMachine->waitForResponse(2, request, response));
+    EXPECT_FALSE(response.has_close_session());
+    EXPECT_TRUE(stateMachine->waitForResponse(3, request, response));
+    EXPECT_EQ("close_session { "
               "}",
               response);
 }
@@ -200,7 +215,7 @@ TEST_F(ServerStateMachineTest, waitForResponse_advanceVersion)
     request.mutable_advance_version()->
         set_requested_version(90);
     StateMachine::Command::Response response;
-    stateMachine->lastIndex = 3;
+    stateMachine->lastApplied = 3;
     EXPECT_TRUE(stateMachine->waitForResponse(3, request, response));
     EXPECT_EQ("advance_version { "
               "  running_version: 1 "
@@ -212,9 +227,159 @@ TEST_F(ServerStateMachineTest, waitForResponse_unknown)
 {
     StateMachine::Command::Request request; // empty
     StateMachine::Command::Response response;
-    stateMachine->lastIndex = 3;
+    stateMachine->lastApplied = 3;
     EXPECT_FALSE(stateMachine->waitForResponse(3, request, response));
     EXPECT_EQ("", response);
+}
+
+struct IsTakingSnapshotHelper {
+    explicit IsTakingSnapshotHelper(StateMachine& stateMachine)
+        : stateMachine(stateMachine)
+        , count(0)
+    {
+    }
+    void operator()() {
+        std::function<void()> callback;
+        std::swap(callback, stateMachine.mutex.callback);
+        if (count == 1) {
+            stateMachine.mutex.unlock();
+            EXPECT_TRUE(stateMachine.isTakingSnapshot());
+            stateMachine.mutex.lock();
+        }
+        std::swap(callback, stateMachine.mutex.callback);
+        ++count;
+    }
+    StateMachine& stateMachine;
+    uint64_t count;
+};
+
+TEST_F(ServerStateMachineTest, isTakingSnapshot)
+{
+    IsTakingSnapshotHelper helper(*stateMachine);
+    EXPECT_FALSE(stateMachine->isTakingSnapshot());
+    {
+        std::unique_lock<Core::Mutex> lockGuard(stateMachine->mutex);
+        stateMachine->mutex.callback = std::ref(helper);
+        stateMachine->takeSnapshot(1, lockGuard);
+    }
+    EXPECT_FALSE(stateMachine->isTakingSnapshot());
+}
+
+struct StartTakingSnapshotHelper {
+    explicit StartTakingSnapshotHelper(StateMachine& stateMachine)
+        : stateMachine(stateMachine)
+        , count(0)
+    {
+    }
+    void operator()() {
+        if (count == 0) {
+            std::unique_lock<Core::Mutex> lockGuard(stateMachine.mutex);
+            stateMachine.takeSnapshot(1, lockGuard);
+        }
+        ++count;
+
+    }
+    StateMachine& stateMachine;
+    uint64_t count;
+};
+
+TEST_F(ServerStateMachineTest, startTakingSnapshot)
+{
+    EXPECT_FALSE(stateMachine->isSnapshotRequested);
+    EXPECT_EQ(0U, stateMachine->snapshotSuggested.notificationCount);
+    StartTakingSnapshotHelper helper(*stateMachine);
+    stateMachine->snapshotStarted.callback = std::ref(helper);
+    stateMachine->startTakingSnapshot();
+    EXPECT_TRUE(stateMachine->isSnapshotRequested);
+    EXPECT_EQ(1U, stateMachine->snapshotSuggested.notificationCount);
+}
+
+TEST_F(ServerStateMachineTest, startTakingSnapshot_alreadyStarted)
+{
+    stateMachine->childPid = 1000;
+    stateMachine->startTakingSnapshot();
+    EXPECT_FALSE(stateMachine->isSnapshotRequested);
+    EXPECT_EQ(0U, stateMachine->snapshotSuggested.notificationCount);
+    stateMachine->childPid = 0;
+}
+
+struct StopTakingSnapshotHelper {
+    explicit StopTakingSnapshotHelper(StateMachine& stateMachine)
+        : stateMachine(stateMachine)
+        , count(0)
+    {
+    }
+    void operator()() {
+        if (count == 3) {
+            int status = 0;
+            EXPECT_EQ(stateMachine.childPid,
+                      waitpid(stateMachine.childPid, &status, 0))
+                << strerror(errno);
+            EXPECT_TRUE(WIFSIGNALED(status));
+            EXPECT_EQ(SIGTERM, WTERMSIG(status));
+            stateMachine.childPid = 0;
+        }
+        ++count;
+    }
+    StateMachine& stateMachine;
+    uint64_t count;
+};
+
+TEST_F(ServerStateMachineTest, stopTakingSnapshot)
+{
+    // start a snapshot
+    errno = 0;
+    pid_t pid = fork();
+    ASSERT_NE(pid, -1) << strerror(errno); // error
+    if (pid == 0) { // child
+        stateMachine->globals.unblockAllSignals();
+        while (true)
+            usleep(5000);
+    }
+    // parent continues here
+    stateMachine->childPid = pid;
+    StopTakingSnapshotHelper helper(*stateMachine);
+    stateMachine->snapshotCompleted.callback = std::ref(helper);
+    stateMachine->stopTakingSnapshot();
+    EXPECT_EQ(4U, helper.count);
+}
+
+TEST_F(ServerStateMachineTest, stopTakingSnapshot_noSnapshot)
+{
+    stateMachine->stopTakingSnapshot();
+}
+
+TEST_F(ServerStateMachineTest, getInhibit)
+{
+    // time is mocked
+    EXPECT_EQ(std::chrono::nanoseconds::zero(),
+              stateMachine->getInhibit());
+    stateMachine->setInhibit(std::chrono::nanoseconds(0));
+    EXPECT_EQ(std::chrono::nanoseconds::zero(),
+              stateMachine->getInhibit());
+    stateMachine->setInhibit(std::chrono::nanoseconds(1));
+    EXPECT_EQ(std::chrono::nanoseconds(1),
+              stateMachine->getInhibit());
+    stateMachine->setInhibit(std::chrono::seconds(10000));
+    EXPECT_EQ(std::chrono::seconds(10000),
+              stateMachine->getInhibit());
+}
+
+TEST_F(ServerStateMachineTest, setInhibit)
+{
+    stateMachine->setInhibit(std::chrono::nanoseconds::zero());
+    EXPECT_EQ(std::chrono::nanoseconds::zero(),
+              stateMachine->getInhibit());
+    stateMachine->setInhibit(std::chrono::nanoseconds(100));
+    EXPECT_EQ(std::chrono::nanoseconds(100),
+              stateMachine->getInhibit());
+    stateMachine->setInhibit(std::chrono::nanoseconds(-100));
+    EXPECT_EQ(std::chrono::nanoseconds::zero(),
+              stateMachine->getInhibit());
+    stateMachine->setInhibit(std::chrono::nanoseconds::max());
+    EXPECT_LT(std::chrono::seconds(60L * 60L * 24L * 365L * 100L),
+              stateMachine->getInhibit());
+    EXPECT_LT(0U, stateMachine->snapshotSuggested.notificationCount);
 }
 
 TEST_F(ServerStateMachineTest, apply_tree)
@@ -302,34 +467,85 @@ TEST_F(ServerStateMachineTest, apply_openSession)
     EXPECT_EQ(0U, session.responses.size());
 }
 
+TEST_F(ServerStateMachineTest, apply_closeSession)
+{
+    stateMachine->sessions.insert({2, {}});
+    stateMachine->sessions.insert({3, {}});
+    stateMachine->sessions.insert({4, {}});
+    StateMachine::Command::Request command;
+    command.mutable_close_session()->set_client_id(3);
+
+    RaftConsensus::Entry entry;
+    entry.index = 6;
+    entry.type = RaftConsensus::Entry::DATA;
+    entry.command = serialize(command);
+    entry.clusterTime = 2;
+
+
+    // first apply will have no effect (only warning) because state machine
+    // version 1 does not support the CloseSession command
+    Core::Debug::setLogPolicy({
+        {"Server/StateMachine.cc", "ERROR"},
+        {"", "WARNING"},
+    });
+    stateMachine->versionHistory.insert({4, 1});
+    stateMachine->apply(entry);
+    ASSERT_EQ((std::vector<uint64_t>{2, 3, 4}),
+              Core::STLUtil::sorted(
+                  Core::STLUtil::getKeys(stateMachine->sessions)));
+    Core::Debug::setLogPolicy({
+        {"", "WARNING"},
+    });
+
+    // second apply will work
+    stateMachine->versionHistory.insert({5, 2});
+    stateMachine->apply(entry);
+    ASSERT_EQ((std::vector<uint64_t>{2, 4}),
+              Core::STLUtil::sorted(
+                  Core::STLUtil::getKeys(stateMachine->sessions)));
+
+    // third apply will have no effect since the session was already closed
+    stateMachine->apply(entry);
+    ASSERT_EQ((std::vector<uint64_t>{2, 4}),
+              Core::STLUtil::sorted(
+                  Core::STLUtil::getKeys(stateMachine->sessions)));
+}
+
+
 TEST_F(ServerStateMachineTest, apply_advanceVersion)
 {
-    StateMachine::Command::Request command =
-        Core::ProtoBuf::fromString<StateMachine::Command::Request>(
-            "advance_version: { "
-            "  requested_version: 1 "
-            "}");
     RaftConsensus::Entry entry;
     entry.index = 6;
     entry.type = RaftConsensus::Entry::DATA;
     entry.clusterTime = 2;
 
+    // stay at version 1
+    StateMachine::Command::Request command;
+    command.mutable_advance_version()->set_requested_version(1);
     entry.command = serialize(command);
     stateMachine->apply(entry);
     stateMachine->apply(entry);
     stateMachine->apply(entry); // should silently succeed
+    EXPECT_EQ(1U, stateMachine->getVersion(10000));
 
-    command = Core::ProtoBuf::fromString<StateMachine::Command::Request>(
-            "advance_version: { "
-            "  requested_version: 1 "
-            "}");
+    // up to version 2
+    command.mutable_advance_version()->set_requested_version(2);
+    entry.command = serialize(command);
+    stateMachine->apply(entry);
+    EXPECT_EQ(2U, stateMachine->getVersion(10000));
+
+    // downgrade to version 1 should give warning
+    command.mutable_advance_version()->set_requested_version(1);
     entry.command = serialize(command);
     Core::Debug::setLogPolicy({
         {"Server/StateMachine.cc", "ERROR"},
         {"", "WARNING"},
     });
-    stateMachine->apply(entry); // expect warning
-    EXPECT_EQ(1U, stateMachine->getVersion(10000));
+    stateMachine->apply(entry);
+    Core::Debug::setLogPolicy({
+        {"", "WARNING"},
+    });
+    EXPECT_EQ(2U, stateMachine->getVersion(10000));
 }
 
 TEST_F(ServerStateMachineTest, apply_unknown)
@@ -359,7 +575,7 @@ TEST_F(ServerStateMachineTest, applyThreadMain_exiting_TimingSensitive)
     consensus->exit();
     {
         // applyThread won't be able to kill() yet due to mutex
-        std::unique_lock<std::mutex> lockGuard(stateMachine->mutex);
+        std::unique_lock<Core::Mutex> lockGuard(stateMachine->mutex);
         stateMachine->applyThread = std::thread(&StateMachine::applyThreadMain,
                                                 stateMachine.get());
         struct timeval startTime;
@@ -539,12 +755,87 @@ TEST_F(ServerStateMachineTest, loadSnapshot_unknownFormatVersion)
 
 TEST_F(ServerStateMachineTest, loadVersionHistory_unknownVersion)
 {
-    stateMachine->versionHistory.insert({1, 2});
+    stateMachine->versionHistory.insert({1, 3});
     SnapshotStateMachine::Header header;
     stateMachine->serializeVersionHistory(header);
     EXPECT_DEATH(stateMachine->loadVersionHistory(header),
-                 "State machine version read from snapshot was 2, but this "
-                 "code only supports 1 through 1");
+                 "State machine version read from snapshot was 3, but this "
+                 "code only supports 1 through 2");
+}
+
+struct SnapshotThreadMainHelper {
+    explicit SnapshotThreadMainHelper(StateMachine& stateMachine)
+        : stateMachine(stateMachine)
+        , count(0)
+    {
+    }
+    void operator()() {
+        // append a new entry every iteration so that shouldTakeSnapshot can
+        // return true
+        Storage::Log::Entry entry;
+        entry.set_term(1);
+        entry.set_type(Protocol::Raft::EntryType::CONFIGURATION);
+        *entry.mutable_configuration() =
+            Core::ProtoBuf::fromString<Protocol::Raft::Configuration>(
+                "prev_configuration {"
+                "    servers { server_id: 1, addresses: '127.0.0.1:5254' }"
+                "}");
+        stateMachine.consensus->append({&entry});
+        stateMachine.consensus->commitIndex =
+            stateMachine.consensus->log->getLastLogIndex();
+        stateMachine.lastApplied = stateMachine.consensus->commitIndex;
+
+        if (count == 0) {
+            // not inhibited, shouldn't take snapshot, no snapshot requested:
+            // slept
+            EXPECT_EQ(0U, stateMachine.numSnapshotsAttempted);
+
+            stateMachine.setInhibit(std::chrono::nanoseconds(1));
+            stateMachine.isSnapshotRequested = true;
+            EXPECT_FALSE(
+                    stateMachine.shouldTakeSnapshot(stateMachine.lastApplied));
+        } else if (count == 1) {
+            // inhibited and snapshot requested:
+            // took snapshot
+            EXPECT_EQ(1U, stateMachine.numSnapshotsAttempted);
+            EXPECT_FALSE(stateMachine.isSnapshotRequested);
+
+            EXPECT_FALSE(
+                    stateMachine.shouldTakeSnapshot(stateMachine.lastApplied));
+            stateMachine.snapshotMinLogSize = 1U;
+            stateMachine.snapshotRatio = 0U;
+            EXPECT_TRUE(
+                    stateMachine.shouldTakeSnapshot(stateMachine.lastApplied));
+        } else if (count == 2) {
+            // inhibited, should take snapshot, and no snapshot requested:
+            // slept
+            EXPECT_EQ(1U, stateMachine.numSnapshotsAttempted);
+
+            EXPECT_TRUE(
+                    stateMachine.shouldTakeSnapshot(stateMachine.lastApplied));
+            stateMachine.setInhibit(std::chrono::nanoseconds(0));
+        } else if (count == 3) {
+            // not inhibited, should take snapshot, and no snapshot requested:
+            // took snapshot
+            EXPECT_EQ(2U, stateMachine.numSnapshotsAttempted);
+
+            stateMachine.exiting = true;
+        }
+        ++count;
+
+    }
+    StateMachine& stateMachine;
+    uint64_t count;
+};
+
+TEST_F(ServerStateMachineTest, snapshotThreadMain)
+{
+    // time is mocked
+    stateMachine->lastApplied = 1;
+    SnapshotThreadMainHelper helper(*stateMachine);
+    stateMachine->snapshotSuggested.callback = std::ref(helper);
+    stateMachine->snapshotThreadMain();
+    EXPECT_EQ(4U, helper.count);
 }
 
 
@@ -564,6 +855,7 @@ struct SnapshotWatchdogThreadMainHelper {
             pid_t pid = fork();
             ASSERT_NE(pid, -1) << strerror(errno); // error
             if (pid == 0) { // child
+                stateMachine.globals.unblockAllSignals();
                 while (true)
                     usleep(5000);
             }
@@ -600,13 +892,13 @@ struct SnapshotWatchdogThreadMainHelper {
             Core::Debug::setLogPolicy({
                 {"", "WARNING"},
             });
-            // child should be receiving SIGHUP
+            // child should be receiving SIGKILL
             int status = 0;
             EXPECT_EQ(stateMachine.childPid,
                       waitpid(stateMachine.childPid, &status, 0))
                 << strerror(errno);
             EXPECT_TRUE(WIFSIGNALED(status));
-            EXPECT_EQ(SIGHUP, WTERMSIG(status));
+            EXPECT_EQ(SIGKILL, WTERMSIG(status));
             stateMachine.childPid = 0;
             stateMachine.writer->discard();
             stateMachine.writer.reset();
@@ -638,7 +930,7 @@ TEST_F(ServerStateMachineTest, takeSnapshot)
     stateMachine->tree.makeDirectory("/foo");
     stateMachine->sessions.insert({4, {}});
     {
-        std::unique_lock<std::mutex> lockGuard(stateMachine->mutex);
+        std::unique_lock<Core::Mutex> lockGuard(stateMachine->mutex);
         stateMachine->takeSnapshot(1, lockGuard);
     }
     stateMachine->tree.removeDirectory("/foo");

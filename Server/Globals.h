@@ -36,9 +36,10 @@ class Server;
 namespace Server {
 
 // forward declarations
+class ClientService;
+class ControlService;
 class RaftConsensus;
 class RaftService;
-class ClientService;
 class StateMachine;
 
 /**
@@ -55,6 +56,16 @@ class Globals {
     class ExitHandler : public Event::Signal {
       public:
         ExitHandler(Event::Loop& eventLoop, int signalNumber);
+        void handleSignalEvent();
+        Event::Loop& eventLoop;
+    };
+
+    /**
+     * Re-opens the log file upon receiving a UNIX signal.
+     */
+    class LogRotateHandler : public Event::Signal {
+      public:
+        LogRotateHandler(Event::Loop& eventLoop, int signalNumber);
         void handleSignalEvent();
         Event::Loop& eventLoop;
     };
@@ -96,9 +107,22 @@ class Globals {
     void run();
 
     /**
+     * Enable asynchronous signal delivery for all signals that this class is
+     * in charge of. This should be called in a child process after invoking
+     * fork(), as the StateMachine does.
+     */
+    void unblockAllSignals();
+
+    /**
      * Global configuration options.
      */
     Core::Config config;
+
+    /**
+     * Statistics and information about the server's current state. Useful for
+     * diagnostics.
+     */
+    Server::ServerStats serverStats;
 
     /**
      * The event loop that runs the RPC system.
@@ -115,17 +139,18 @@ class Globals {
 
     /**
      * Block SIGTERM, which is handled by sigTermHandler.
-     * Signals are blocked early on in the startup process so that newly
-     * spawned threads also have them blocked.
      */
     Event::Signal::Blocker sigTermBlocker;
 
     /**
      * Block SIGUSR1, which is handled by serverStats.
-     * Signals are blocked early on in the startup process so that newly
-     * spawned threads also have them blocked.
      */
     Event::Signal::Blocker sigUsr1Blocker;
+
+    /**
+     * Block SIGUSR2, which is handled by sigUsr2Handler.
+     */
+    Event::Signal::Blocker sigUsr2Blocker;
 
     /**
      * Exits the event loop upon receiving SIGINT (keyboard interrupt).
@@ -147,13 +172,18 @@ class Globals {
      */
     Event::Signal::Monitor sigTermMonitor;
 
-  public:
     /**
-     * Statistics and information about the server's current state. Useful for
-     * diagnostics.
+     * Re-opens log files upon receiving SIGUSR2 (user-defined signal). This
+     * should normally be invoked by tools like logrotate.
      */
-    Server::ServerStats serverStats;
+    LogRotateHandler sigUsr2Handler;
 
+    /**
+     * Registers sigUsr2Handler with the event loop.
+     */
+    Event::Signal::Monitor sigUsr2Monitor;
+
+  public:
     /**
      * A unique ID for the cluster that this server may connect to. This is
      * initialized to a value from the config file. If it's not set then, it
@@ -177,6 +207,12 @@ class Globals {
     std::shared_ptr<Server::StateMachine> stateMachine;
 
   private:
+
+    /**
+     * Service used by logcabinctl to query and change a server's internal
+     * state.
+     */
+    std::shared_ptr<Server::ControlService> controlService;
 
     /**
      * Service used to communicate between servers.

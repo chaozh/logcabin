@@ -221,7 +221,13 @@ ClientImpl::ExactlyOnceRPCHelper::ExactlyOnceRPCHelper(ClientImpl* client)
     , exiting(false)
     , lastKeepAliveStart(TimePoint::min())
       // TODO(ongaro): set dynamically based on cluster configuration
-    , keepAliveIntervalMs(60 * 1000)
+    , keepAliveInterval(std::chrono::milliseconds(60 * 1000))
+    , sessionCloseTimeout(std::chrono::milliseconds(
+        client->config.read<uint64_t>(
+            "sessionCloseTimeoutMilliseconds",
+            client->config.read<uint64_t>(
+                "tcpConnectTimeoutMilliseconds",
+                1000))))
     , keepAliveCall()
     , keepAliveThread()
 {
@@ -240,6 +246,37 @@ ClientImpl::ExactlyOnceRPCHelper::exit()
         keepAliveCV.notify_all();
         if (keepAliveCall)
             keepAliveCall->cancel();
+        if (clientId > 0) {
+            Protocol::Client::StateMachineCommand::Request request;
+            Protocol::Client::StateMachineCommand::Response response;
+            request.mutable_close_session()->set_client_id(clientId);
+            LeaderRPC::Status status = client->leaderRPC->call(
+                    OpCode::STATE_MACHINE_COMMAND,
+                    request,
+                    response,
+                    ClientImpl::Clock::now() + sessionCloseTimeout);
+            switch (status) {
+                case LeaderRPC::Status::OK:
+                    break;
+                case LeaderRPC::Status::TIMEOUT:
+                    using Core::StringUtil::toString;
+                    WARNING("Could not definitively close client session %lu "
+                            "within timeout (%s). It may remain open until it "
+                            "expires.",
+                            clientId,
+                            toString(sessionCloseTimeout).c_str());
+                    break;
+                case LeaderRPC::Status::INVALID_REQUEST:
+                    WARNING("The server and/or replicated state machine "
+                            "doesn't support the CloseSession command or "
+                            "claims the request is malformed. This client's "
+                            "session (%lu) will remain open until it expires. "
+                            "Consider upgrading your servers (this command "
+                            "was introduced in state machine version 2).",
+                            clientId);
+                    break;
+            }
+        }
     }
     if (keepAliveThread.joinable())
         keepAliveThread.join();
@@ -324,9 +361,8 @@ ClientImpl::ExactlyOnceRPCHelper::keepAliveThreadMain()
     std::unique_lock<Core::Mutex> lockGuard(mutex);
     while (!exiting) {
         TimePoint nextKeepAlive;
-        if (keepAliveIntervalMs > 0) {
-            nextKeepAlive = (lastKeepAliveStart +
-                             std::chrono::milliseconds(keepAliveIntervalMs));
+        if (keepAliveInterval.count() > 0) {
+            nextKeepAlive = lastKeepAliveStart + keepAliveInterval;
         } else {
             nextKeepAlive = TimePoint::max();
         }
@@ -384,6 +420,20 @@ ClientImpl::ExactlyOnceRPCHelper::keepAliveThreadMain()
 
 ////////// class ClientImpl //////////
 
+ClientImpl::TimePoint
+ClientImpl::absTimeout(uint64_t relTimeoutNanos)
+{
+    if (relTimeoutNanos == 0)
+        return ClientImpl::TimePoint::max();
+    ClientImpl::TimePoint now = ClientImpl::Clock::now();
+    ClientImpl::TimePoint then =
+        now + std::chrono::nanoseconds(relTimeoutNanos);
+    if (then < now) // overflow
+        return ClientImpl::TimePoint::max();
+    else
+        return then;
+}
+
 ClientImpl::ClientImpl(const std::map<std::string, std::string>& options)
     : config(options)
     , eventLoop()
@@ -408,10 +458,10 @@ ClientImpl::ClientImpl(const std::map<std::string, std::string>& options)
 
 ClientImpl::~ClientImpl()
 {
+    exactlyOnceRPCHelper.exit();
     eventLoop.exit();
     if (eventLoopThread.joinable())
         eventLoopThread.join();
-    exactlyOnceRPCHelper.exit();
 }
 
 void
@@ -550,69 +600,6 @@ ClientImpl::getServerInfo(const std::string& host,
             case RPCStatus::INVALID_REQUEST:
                 PANIC("The server's ClientService doesn't support the "
                       "GetServerInfo RPC or claims the request is malformed");
-        }
-        if (timeout < Clock::now())
-            return timeoutResult;
-        else
-            continue;
-    }
-}
-
-Result
-ClientImpl::getServerStats(const std::string& host,
-                           TimePoint timeout,
-                           Protocol::ServerStats& stats)
-{
-    Result timeoutResult;
-    timeoutResult.status = Client::Status::TIMEOUT;
-    timeoutResult.error = "Client-specified timeout elapsed";
-
-    while (true) {
-        sessionCreationBackoff.delayAndBegin(timeout);
-
-        RPC::Address address(host, Protocol::Common::DEFAULT_PORT);
-        address.refresh(timeout);
-
-        std::shared_ptr<RPC::ClientSession> session =
-            sessionManager.createSession(address, timeout, &clusterUUID);
-
-        Protocol::Client::GetServerStats::Request request;
-        RPC::ClientRPC rpc(session,
-                           Protocol::Common::ServiceId::CLIENT_SERVICE,
-                           1,
-                           OpCode::GET_SERVER_STATS,
-                           request);
-
-        typedef RPC::ClientRPC::Status RPCStatus;
-        Protocol::Client::GetServerStats::Response response;
-        Protocol::Client::Error error;
-        RPCStatus status = rpc.waitForReply(&response, &error, timeout);
-
-        // Decode the response
-        switch (status) {
-            case RPCStatus::OK:
-                stats = response.server_stats();
-                return Result();
-            case RPCStatus::RPC_FAILED:
-                break;
-            case RPCStatus::TIMEOUT:
-                return timeoutResult;
-            case RPCStatus::SERVICE_SPECIFIC_ERROR:
-                // Hmm, we don't know what this server is trying to tell us,
-                // but something is wrong. The server shouldn't reply back with
-                // error codes we don't understand. That's why we gave it a
-                // serverSpecificErrorVersion number in the request header.
-                PANIC("Unknown error code %u returned in service-specific "
-                      "error. This probably indicates a bug in the server",
-                      error.error_code());
-                break;
-            case RPCStatus::RPC_CANCELED:
-                PANIC("RPC canceled unexpectedly");
-            case RPCStatus::INVALID_SERVICE:
-                PANIC("The server isn't running the ClientService");
-            case RPCStatus::INVALID_REQUEST:
-                PANIC("The server's ClientService doesn't support the "
-                      "GetServerStats RPC or claims the request is malformed");
         }
         if (timeout < Clock::now())
             return timeoutResult;
@@ -824,6 +811,73 @@ ClientImpl::removeFile(const std::string& path,
         return treeError(response);
     return Result();
 }
+
+Result
+ClientImpl::serverControl(const std::string& host,
+                          TimePoint timeout,
+                          Protocol::ServerControl::OpCode opCode,
+                          const google::protobuf::Message& request,
+                          google::protobuf::Message& response)
+{
+    Result timeoutResult;
+    timeoutResult.status = Client::Status::TIMEOUT;
+    timeoutResult.error = "Client-specified timeout elapsed";
+
+    while (true) {
+        sessionCreationBackoff.delayAndBegin(timeout);
+
+        RPC::Address address(host, Protocol::Common::DEFAULT_PORT);
+        address.refresh(timeout);
+
+        // TODO(ongaro): Ideally we'd learn the serverID the same way we learn
+        // the cluster UUID and then assert that in future calls. In practice,
+        // we're only making one call for now, so it doesn't matter.
+        std::shared_ptr<RPC::ClientSession> session =
+            sessionManager.createSession(address, timeout, &clusterUUID);
+
+        RPC::ClientRPC rpc(session,
+                           Protocol::Common::ServiceId::CONTROL_SERVICE,
+                           1,
+                           opCode,
+                           request);
+
+        typedef RPC::ClientRPC::Status RPCStatus;
+        Protocol::Client::Error error;
+        RPCStatus status = rpc.waitForReply(&response, &error, timeout);
+
+        // Decode the response
+        switch (status) {
+            case RPCStatus::OK:
+                return Result();
+            case RPCStatus::RPC_FAILED:
+                break;
+            case RPCStatus::TIMEOUT:
+                return timeoutResult;
+            case RPCStatus::SERVICE_SPECIFIC_ERROR:
+                // Hmm, we don't know what this server is trying to tell us,
+                // but something is wrong. The server shouldn't reply back with
+                // error codes we don't understand. That's why we gave it a
+                // serverSpecificErrorVersion number in the request header.
+                PANIC("Unknown error code %u returned in service-specific "
+                      "error. This probably indicates a bug in the server",
+                      error.error_code());
+                break;
+            case RPCStatus::RPC_CANCELED:
+                PANIC("RPC canceled unexpectedly");
+            case RPCStatus::INVALID_SERVICE:
+                PANIC("The server isn't running the ControlService");
+            case RPCStatus::INVALID_REQUEST:
+                // ControlService was added in v1.1.0.
+                EXIT("The server's ControlService doesn't support the "
+                     "RPC or claims the request is malformed");
+        }
+        if (timeout < Clock::now())
+            return timeoutResult;
+        else
+            continue;
+    }
+}
+
 
 } // namespace LogCabin::Client
 } // namespace LogCabin

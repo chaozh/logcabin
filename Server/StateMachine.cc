@@ -24,6 +24,7 @@
 #include "Core/Random.h"
 #include "Core/ThreadId.h"
 #include "Core/Util.h"
+#include "Server/Globals.h"
 #include "Server/RaftConsensus.h"
 #include "Server/StateMachine.h"
 #include "Storage/SnapshotFile.h"
@@ -40,8 +41,10 @@ bool stateMachineSuppressThreads = false;
 uint32_t stateMachineChildSleepMs = 0;
 
 StateMachine::StateMachine(std::shared_ptr<RaftConsensus> consensus,
-                           Core::Config& config)
+                           Core::Config& config,
+                           Globals& globals)
     : consensus(consensus)
+    , globals(globals)
       // This configuration option isn't advertised as part of the public API:
       // it's only useful for testing.
     , snapshotBlockPercentage(
@@ -66,10 +69,12 @@ StateMachine::StateMachine(std::shared_ptr<RaftConsensus> consensus,
     , entriesApplied()
     , snapshotSuggested()
     , snapshotStarted()
+    , snapshotCompleted()
     , exiting(false)
     , childPid(0)
-    , lastIndex(0)
+    , lastApplied(0)
     , lastUnknownRequestMessage(TimePoint::min())
+    , numUnknownRequests(0)
     , numUnknownRequestsSinceLastMessage(0)
     , numSnapshotsAttempted(0)
     , numSnapshotsFailed(0)
@@ -77,6 +82,8 @@ StateMachine::StateMachine(std::shared_ptr<RaftConsensus> consensus,
     , numRejectedAdvanceVersionEntries(0)
     , numSuccessfulAdvanceVersionEntries(0)
     , numTotalAdvanceVersionEntries(0)
+    , isSnapshotRequested(false)
+    , maySnapshotAt(TimePoint::min())
     , sessions()
     , tree()
     , versionHistory()
@@ -114,27 +121,29 @@ bool
 StateMachine::query(const Query::Request& request,
                     Query::Response& response) const
 {
-    std::lock_guard<std::mutex> lockGuard(mutex);
+    std::lock_guard<Core::Mutex> lockGuard(mutex);
     if (request.has_tree()) {
         Tree::ProtoBuf::readOnlyTreeRPC(tree,
                                         request.tree(),
                                         *response.mutable_tree());
         return true;
     }
-    warnUnknownRequest(request);
+    warnUnknownRequest(request, "does not understand the given request");
     return false;
 }
 
 void
 StateMachine::updateServerStats(Protocol::ServerStats& serverStats) const
 {
-    std::lock_guard<std::mutex> lockGuard(mutex);
+    std::lock_guard<Core::Mutex> lockGuard(mutex);
+    Core::Time::SteadyTimeConverter time;
     serverStats.clear_state_machine();
     Protocol::ServerStats::StateMachine& smStats =
         *serverStats.mutable_state_machine();
     smStats.set_snapshotting(childPid != 0);
-    smStats.set_last_applied(lastIndex);
+    smStats.set_last_applied(lastApplied);
     smStats.set_num_sessions(sessions.size());
+    smStats.set_num_unknown_requests(numUnknownRequests);
     smStats.set_num_snapshots_attempted(numSnapshotsAttempted);
     smStats.set_num_snapshots_failed(numSnapshotsFailed);
     smStats.set_num_redundant_advance_version_entries(
@@ -147,15 +156,16 @@ StateMachine::updateServerStats(Protocol::ServerStats& serverStats) const
         numTotalAdvanceVersionEntries);
     smStats.set_min_supported_version(MIN_SUPPORTED_VERSION);
     smStats.set_max_supported_version(MAX_SUPPORTED_VERSION);
-    smStats.set_running_version(getVersion(lastIndex));
+    smStats.set_running_version(getVersion(lastApplied));
+    smStats.set_may_snapshot_at(time.unixNanos(maySnapshotAt));
     tree.updateServerStats(*smStats.mutable_tree());
 }
 
 void
 StateMachine::wait(uint64_t index) const
 {
-    std::unique_lock<std::mutex> lockGuard(mutex);
-    while (lastIndex < index)
+    std::unique_lock<Core::Mutex> lockGuard(mutex);
+    while (lastApplied < index)
         entriesApplied.wait(lockGuard);
 }
 
@@ -164,14 +174,15 @@ StateMachine::waitForResponse(uint64_t logIndex,
                               const Command::Request& command,
                               Command::Response& response) const
 {
-    std::unique_lock<std::mutex> lockGuard(mutex);
-    while (lastIndex < logIndex)
+    std::unique_lock<Core::Mutex> lockGuard(mutex);
+    while (lastApplied < logIndex)
         entriesApplied.wait(lockGuard);
 
     // Need to check whether we understood the request at the time it
     // was applied using getVersion(logIndex), then reply and return true/false
     // based on that. Existing commands have been around since version 1, so we
     // skip this check for now.
+    uint16_t versionThen = getVersion(logIndex);
 
     if (command.has_tree()) {
         const PC::ExactlyOnceRPCInfo& rpcInfo = command.tree().exactly_once();
@@ -201,13 +212,86 @@ StateMachine::waitForResponse(uint64_t logIndex,
         response.mutable_open_session()->
             set_client_id(logIndex);
         return true;
+    } else if (versionThen >= 2 && command.has_close_session()) {
+        response.mutable_close_session(); // no fields to set
+        return true;
     } else if (command.has_advance_version()) {
         response.mutable_advance_version()->
-            set_running_version(getVersion(logIndex));
+            set_running_version(versionThen);
         return true;
     }
     // don't warnUnknownRequest here, since we already did so in apply()
     return false;
+}
+
+bool
+StateMachine::isTakingSnapshot() const
+{
+    std::lock_guard<Core::Mutex> lockGuard(mutex);
+    return childPid != 0;
+}
+
+void
+StateMachine::startTakingSnapshot()
+{
+    std::unique_lock<Core::Mutex> lockGuard(mutex);
+    if (childPid == 0) {
+        NOTICE("Administrator requested snapshot");
+        isSnapshotRequested = true;
+        snapshotSuggested.notify_all();
+        // This waits on numSnapshotsAttempted to change, since waiting on
+        // childPid != 0 would risk missing an entire snapshot that started and
+        // completed before this thread was scheduled.
+        uint64_t nextSnapshot = numSnapshotsAttempted + 1;
+        while (!exiting && numSnapshotsAttempted < nextSnapshot) {
+            snapshotStarted.wait(lockGuard);
+        }
+    }
+}
+
+void
+StateMachine::stopTakingSnapshot()
+{
+    std::unique_lock<Core::Mutex> lockGuard(mutex);
+    int pid = childPid;
+    if (pid != 0) {
+        NOTICE("Administrator aborted snapshot");
+        killSnapshotProcess(Core::HoldingMutex(lockGuard), SIGTERM);
+        while (!exiting && pid == childPid) {
+            snapshotCompleted.wait(lockGuard);
+        }
+    }
+}
+
+std::chrono::nanoseconds
+StateMachine::getInhibit() const
+{
+    std::lock_guard<Core::Mutex> lockGuard(mutex);
+    TimePoint now = Clock::now();
+    if (maySnapshotAt <= now) {
+        return std::chrono::nanoseconds::zero();
+    } else {
+        return maySnapshotAt - now;
+    }
+}
+
+void
+StateMachine::setInhibit(std::chrono::nanoseconds duration)
+{
+    std::lock_guard<Core::Mutex> lockGuard(mutex);
+    if (duration <= std::chrono::nanoseconds::zero()) {
+        maySnapshotAt = TimePoint::min();
+        NOTICE("Administrator permitted snapshotting");
+    } else {
+        TimePoint now = Clock::now();
+        maySnapshotAt = now + duration;
+        if (maySnapshotAt < now) { // overflow
+            maySnapshotAt = TimePoint::max();
+        }
+        NOTICE("Administrator inhibited snapshotting for the next %s",
+               Core::StringUtil::toString(maySnapshotAt - now).c_str());
+    }
+    snapshotSuggested.notify_all();
 }
 
 
@@ -221,6 +305,7 @@ StateMachine::apply(const RaftConsensus::Entry& entry)
         PANIC("Failed to parse protobuf for entry %lu",
               entry.index);
     }
+    uint16_t runningVersion = getVersion(entry.index - 1);
     if (command.has_tree()) {
         PC::ExactlyOnceRPCInfo rpcInfo = command.tree().exactly_once();
         auto it = sessions.find(rpcInfo.client_id());
@@ -251,42 +336,49 @@ StateMachine::apply(const RaftConsensus::Entry& entry)
         uint64_t clientId = entry.index;
         Session& session = sessions.insert({clientId, {}}).first->second;
         session.lastModified = entry.clusterTime;
+    } else if (command.has_close_session()) {
+        if (runningVersion >= 2) {
+            sessions.erase(command.close_session().client_id());
+        } else {
+            // Command is ignored in version < 2.
+            warnUnknownRequest(command, "may not process the given request, "
+                               "which was introduced in version 2");
+        }
     } else if (command.has_advance_version()) {
         uint16_t requested = Core::Util::downCast<uint16_t>(
                 command.advance_version(). requested_version());
-        uint16_t running = getVersion(entry.index - 1);
-        if (requested < running) {
+        if (requested < runningVersion) {
             WARNING("Rejecting downgrade of state machine version "
                     "(running version %u but command at log index %lu wants "
                     "to switch to version %u)",
-                    running,
+                    runningVersion,
                     entry.index,
                     requested);
             ++numRejectedAdvanceVersionEntries;
-        } else if (requested > running) {
+        } else if (requested > runningVersion) {
             if (requested > MAX_SUPPORTED_VERSION) {
                 PANIC("Cannot upgrade state machine to version %u (from %u) "
                       "because this code only supports up to version %u",
                       requested,
-                      running,
+                      runningVersion,
                       MAX_SUPPORTED_VERSION);
             } else {
-                // someday, maybe we'll get here
-                // versionHistory.insert(...)
-                PANIC("state machine version > 1 not supported");
+                NOTICE("Upgrading state machine to version %u (from %u)",
+                       requested,
+                       runningVersion);
+                versionHistory.insert({entry.index, requested});
             }
             ++numSuccessfulAdvanceVersionEntries;
-        } else { // requested == running
+        } else { // requested == runningVersion
             // nothing to do
             // If this stat is high, see note in RaftConsensus.cc.
             ++numRedundantAdvanceVersionEntries;
         }
         ++numTotalAdvanceVersionEntries;
     } else { // unknown command
-        // This could be because the state machine hasn't been upgraded yet to
-        // handle the command. These are (deterministically) ignored by all
-        // state machines running the current version.
-        warnUnknownRequest(command);
+        // This is (deterministically) ignored by all state machines running
+        // the current version.
+        warnUnknownRequest(command, "does not understand the given request");
     }
 }
 
@@ -296,8 +388,8 @@ StateMachine::applyThreadMain()
     Core::ThreadId::setName("StateMachine");
     try {
         while (true) {
-            RaftConsensus::Entry entry = consensus->getNextEntry(lastIndex);
-            std::lock_guard<std::mutex> lockGuard(mutex);
+            RaftConsensus::Entry entry = consensus->getNextEntry(lastApplied);
+            std::lock_guard<Core::Mutex> lockGuard(mutex);
             switch (entry.type) {
                 case RaftConsensus::Entry::SKIP:
                     break;
@@ -312,19 +404,22 @@ StateMachine::applyThreadMain()
                     break;
             }
             expireSessions(entry.clusterTime);
-            lastIndex = entry.index;
+            lastApplied = entry.index;
             entriesApplied.notify_all();
-            if (shouldTakeSnapshot(lastIndex))
+            if (shouldTakeSnapshot(lastApplied) &&
+                maySnapshotAt <= Clock::now()) {
                 snapshotSuggested.notify_all();
+            }
         }
     } catch (const Core::Util::ThreadInterruptedException&) {
         NOTICE("exiting");
-        std::lock_guard<std::mutex> lockGuard(mutex);
+        std::lock_guard<Core::Mutex> lockGuard(mutex);
         exiting = true;
         entriesApplied.notify_all();
         snapshotSuggested.notify_all();
         snapshotStarted.notify_all();
-        killSnapshotProcess(Core::HoldingMutex(lockGuard));
+        snapshotCompleted.notify_all();
+        killSnapshotProcess(Core::HoldingMutex(lockGuard), SIGTERM);
     }
 }
 
@@ -392,12 +487,15 @@ StateMachine::getVersion(uint64_t logIndex) const
 }
 
 void
-StateMachine::killSnapshotProcess(Core::HoldingMutex holdingMutex)
+StateMachine::killSnapshotProcess(Core::HoldingMutex holdingMutex,
+                                  int signum)
 {
     if (childPid != 0) {
-        int r = kill(childPid, SIGHUP);
+        int r = kill(childPid, signum);
         if (r != 0) {
-            WARNING("Could not send SIGHUP to child process: %s",
+            WARNING("Could not send %s to child process (%d): %s",
+                    strsignal(signum),
+                    childPid,
                     strerror(errno));
         }
     }
@@ -525,12 +623,28 @@ void
 StateMachine::snapshotThreadMain()
 {
     Core::ThreadId::setName("SnapshotStateMachine");
-    std::unique_lock<std::mutex> lockGuard(mutex);
+    std::unique_lock<Core::Mutex> lockGuard(mutex);
+    bool wasInhibited = false;
     while (!exiting) {
-        if (shouldTakeSnapshot(lastIndex))
-            takeSnapshot(lastIndex, lockGuard);
-        else
-            snapshotSuggested.wait(lockGuard);
+        bool inhibited = (maySnapshotAt > Clock::now());
+
+        TimePoint waitUntil = TimePoint::max();
+        if (inhibited)
+            waitUntil = maySnapshotAt;
+
+        if (wasInhibited && !inhibited)
+            NOTICE("Now permitted to take snapshots");
+        wasInhibited = inhibited;
+
+        if (isSnapshotRequested ||
+            (!inhibited && shouldTakeSnapshot(lastApplied))) {
+
+            isSnapshotRequested = false;
+            takeSnapshot(lastApplied, lockGuard);
+            continue;
+        }
+
+        snapshotSuggested.wait_until(lockGuard, waitUntil);
     }
 }
 
@@ -539,7 +653,7 @@ StateMachine::snapshotWatchdogThreadMain()
 {
     using Core::StringUtil::toString;
     Core::ThreadId::setName("SnapshotStateMachineWatchdog");
-    std::unique_lock<std::mutex> lockGuard(mutex);
+    std::unique_lock<Core::Mutex> lockGuard(mutex);
 
     // The snapshot process that this thread is currently tracking, based on
     // numSnapshotsAttempted. If set to ~0UL, this thread is not currently
@@ -569,7 +683,8 @@ StateMachine::snapshotWatchdogThreadMain()
                               numSnapshotsAttempted,
                               childPid,
                               toString(snapshotWatchdogInterval).c_str());
-                        killSnapshotProcess(Core::HoldingMutex(lockGuard));
+                        killSnapshotProcess(Core::HoldingMutex(lockGuard),
+                                            SIGKILL);
                         // Don't kill for another interval,
                         // hopefully child will be reaped by then.
                     }
@@ -603,7 +718,7 @@ StateMachine::snapshotWatchdogThreadMain()
 
 void
 StateMachine::takeSnapshot(uint64_t lastIncludedIndex,
-                           std::unique_lock<std::mutex>& lockGuard)
+                           std::unique_lock<Core::Mutex>& lockGuard)
 {
     // Open a snapshot file, then fork a child to write a consistent view of
     // the state machine to the snapshot file while this process continues
@@ -621,6 +736,7 @@ StateMachine::takeSnapshot(uint64_t lastIncludedIndex,
         PANIC("Couldn't fork: %s", strerror(errno));
     } else if (pid == 0) { // child
         Core::Debug::processName += "-child";
+        globals.unblockAllSignals();
         usleep(stateMachineChildSleepMs * 1000); // for testing purposes
         if (snapshotBlockPercentage > 0) { // for testing purposes
             if (Core::Random::randomRange(0, 100) < snapshotBlockPercentage) {
@@ -655,7 +771,7 @@ StateMachine::takeSnapshot(uint64_t lastIncludedIndex,
         {
             // release the lock while blocking on the child to allow
             // parallelism
-            Core::MutexUnlock<std::mutex> unlockGuard(lockGuard);
+            Core::MutexUnlock<Core::Mutex> unlockGuard(lockGuard);
             pid = waitpid(pid, &status, 0);
         }
         childPid = 0;
@@ -667,10 +783,10 @@ StateMachine::takeSnapshot(uint64_t lastIncludedIndex,
             writer->seekToEnd();
             consensus->snapshotDone(lastIncludedIndex, std::move(writer));
         } else if (exiting &&
-                   WIFSIGNALED(status) && WTERMSIG(status) == SIGHUP) {
+                   WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM) {
             writer->discard();
             writer.reset();
-            NOTICE("Child exited from SIGHUP since this process is "
+            NOTICE("Child exited from SIGTERM since this process is "
                    "exiting");
         } else {
             writer->discard();
@@ -683,27 +799,31 @@ StateMachine::takeSnapshot(uint64_t lastIncludedIndex,
                   numSnapshotsFailed,
                   numSnapshotsAttempted);
         }
+        snapshotCompleted.notify_all();
     }
 }
 
 void
 StateMachine::warnUnknownRequest(
-        const google::protobuf::Message& request) const
+        const google::protobuf::Message& request,
+        const char* reason) const
 {
+    ++numUnknownRequests;
     TimePoint now = Clock::now();
     if (lastUnknownRequestMessage + unknownRequestMessageBackoff < now) {
         lastUnknownRequestMessage = now;
         if (numUnknownRequestsSinceLastMessage > 0) {
-            WARNING("This version of the state machine (%u) does not "
-                    "understand the given request (and %lu similar warnings "
+            WARNING("This version of the state machine (%u) %s "
+                    "(and %lu similar warnings "
                     "were suppressed since the last message): %s",
                     getVersion(~0UL),
+                    reason,
                     numUnknownRequestsSinceLastMessage,
                     Core::ProtoBuf::dumpString(request).c_str());
         } else {
-            WARNING("This version of the state machine (%u) does not "
-                    "understand the given request: %s",
+            WARNING("This version of the state machine (%u) %s: %s",
                     getVersion(~0UL),
+                    reason,
                     Core::ProtoBuf::dumpString(request).c_str());
         }
         numUnknownRequestsSinceLastMessage = 0;

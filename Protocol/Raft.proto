@@ -111,8 +111,10 @@ message Entry {
      */
     required uint64 term = 1;
     /**
-     * The index for the entry. It's not used over the network, but it's here
-     * because some storage backends might want to use it.
+     * The index for the entry. It's truly optional (if you receive an entry
+     * over the network, you shouldn't rely on this). It's used for followers
+     * to check that they've got the entry at the right index and also used
+     * internally in some storage backends such as SegmentedLog.
      */
     optional uint64 index = 5;
 
@@ -229,8 +231,8 @@ message AppendEntries {
         required bool success = 2;
         /**
          * The recipient's last log index (after it's applied this RPC's
-         * changes to the log), which might be useful later to speed up finding
-         * where the leader and a behind follower have diverged.
+         * changes to the log). This is used to speed up finding the correct
+         * value for nextIndex with a follower that is far behind the leader.
          */
         optional uint64 last_log_index = 3;
 
@@ -294,11 +296,43 @@ message InstallSnapshot {
          * should now load the contents; false otherwise.
          */
         required bool done = 7;
+
+        /**
+         * Explains which version of this RPC the leader (caller) supports.
+         * - Servers speaking version 1 of this RPC (corresponding to LogCabin
+         *   release v1.0.0 and up to a few weeks after) did not set this
+         *   field.
+         * - Version 2 introduced the bytes_stored field in responses. Before
+         *   this, leaders assumed that InstallSnapshot always succeeded if the
+         *   term matched.
+         */
+        optional uint32 version = 8;
     }
     message Response {
         /**
          * Callee's term, for the caller to update itself.
          */
         required uint64 term = 1;
+
+        /**
+         * The total number of bytes in the snapshot that the follower has
+         * stored (after applying the request).
+         *
+         * This was introduced to fix
+         * https://github.com/logcabin/logcabin/issues/174 .
+         * Before, followers could only receive snapshot chunks in sequence. If
+         * they restarted, they'd have discarded their previous chunks and they
+         * would just repeatedly PANIC. This is now used to signal to the
+         * leader how many bytes the follower actually has saved. The leader
+         * considers the snapshot transfer complete when bytes_stored equals
+         * the full size of the snapshot. The leader should use bytes_stored
+         * as the value for byte_offset in the next request (most importantly,
+         * when a follower reboots, it returns 0 here and the leader starts at
+         * offset 0 in the next request).
+         *
+         * Leaders that do not support InstallSnapshot version 2 entirely
+         * ignore this field.
+         */
+        optional uint64 bytes_stored = 2;
     }
 }

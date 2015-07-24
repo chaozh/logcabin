@@ -24,26 +24,6 @@
 namespace LogCabin {
 namespace Client {
 
-namespace Internal {
-/**
- * Return the absolute time when the calling operation should timeout.
- */
-ClientImpl::TimePoint
-absTimeout(uint64_t relTimeoutNanos)
-{
-    if (relTimeoutNanos == 0)
-        return ClientImpl::TimePoint::max();
-    ClientImpl::TimePoint now = ClientImpl::Clock::now();
-    ClientImpl::TimePoint then =
-        now + std::chrono::nanoseconds(relTimeoutNanos);
-    if (then < now) // overflow
-        return ClientImpl::TimePoint::max();
-    else
-        return then;
-}
-} // LogCabin::Client::Internal
-using Internal::absTimeout;
-
 namespace {
 void throwException(const Result& result)
 {
@@ -247,7 +227,8 @@ Tree::setWorkingDirectory(const std::string& newWorkingDirectory)
     // will result in errors instead of operating on the prior working
     // directory.
 
-    ClientImpl::TimePoint timeout = absTimeout(treeDetails->timeoutNanos);
+    ClientImpl::TimePoint timeout =
+        ClientImpl::absTimeout(treeDetails->timeoutNanos);
 
     std::lock_guard<std::mutex> lockGuard(mutex);
     std::string realPath;
@@ -294,24 +275,28 @@ Tree::setCondition(const std::string& path, const std::string& value)
 
     std::lock_guard<std::mutex> lockGuard(mutex);
     std::string realPath;
-    Result result = treeDetails->clientImpl->canonicalize(
-                                path,
-                                treeDetails->workingDirectory,
-                                realPath);
     std::shared_ptr<TreeDetails> newTreeDetails(new TreeDetails(*treeDetails));
-    if (result.status != Status::OK) {
-        newTreeDetails->condition = {
-            Core::StringUtil::format(
-                    "invalid from prior call to setCondition('%s') "
-                    "relative to '%s'",
-                    path.c_str(),
-                    treeDetails->workingDirectory.c_str()),
-            value,
-        };
-        treeDetails = newTreeDetails;
-        return result;
+    if (path.empty()) {
+        newTreeDetails->condition = {"", ""};
+    } else {
+        Result result = treeDetails->clientImpl->canonicalize(
+                                    path,
+                                    treeDetails->workingDirectory,
+                                    realPath);
+        if (result.status != Status::OK) {
+            newTreeDetails->condition = {
+                Core::StringUtil::format(
+                        "invalid from prior call to setCondition('%s') "
+                        "relative to '%s'",
+                        path.c_str(),
+                        treeDetails->workingDirectory.c_str()),
+                value,
+            };
+            treeDetails = newTreeDetails;
+            return result;
+        }
+        newTreeDetails->condition = {realPath, value};
     }
-    newTreeDetails->condition = {path, value};
     treeDetails = newTreeDetails;
     return Result();
 }
@@ -353,7 +338,7 @@ Tree::makeDirectory(const std::string& path)
         path,
         treeDetails->workingDirectory,
         treeDetails->condition,
-        absTimeout(treeDetails->timeoutNanos));
+        ClientImpl::absTimeout(treeDetails->timeoutNanos));
 }
 
 void
@@ -371,7 +356,7 @@ Tree::listDirectory(const std::string& path,
         path,
         treeDetails->workingDirectory,
         treeDetails->condition,
-        absTimeout(treeDetails->timeoutNanos),
+        ClientImpl::absTimeout(treeDetails->timeoutNanos),
         children);
 }
 
@@ -391,7 +376,7 @@ Tree::removeDirectory(const std::string& path)
         path,
         treeDetails->workingDirectory,
         treeDetails->condition,
-        absTimeout(treeDetails->timeoutNanos));
+        ClientImpl::absTimeout(treeDetails->timeoutNanos));
 }
 
 void
@@ -409,7 +394,7 @@ Tree::write(const std::string& path, const std::string& contents)
         treeDetails->workingDirectory,
         contents,
         treeDetails->condition,
-        absTimeout(treeDetails->timeoutNanos));
+        ClientImpl::absTimeout(treeDetails->timeoutNanos));
 }
 
 void
@@ -426,7 +411,7 @@ Tree::read(const std::string& path, std::string& contents) const
         path,
         treeDetails->workingDirectory,
         treeDetails->condition,
-        absTimeout(treeDetails->timeoutNanos),
+        ClientImpl::absTimeout(treeDetails->timeoutNanos),
         contents);
 }
 
@@ -446,7 +431,7 @@ Tree::removeFile(const std::string& path)
         path,
         treeDetails->workingDirectory,
         treeDetails->condition,
-        absTimeout(treeDetails->timeoutNanos));
+        ClientImpl::absTimeout(treeDetails->timeoutNanos));
 }
 
 void
@@ -537,7 +522,7 @@ Cluster::getServerInfo(const std::string& host,
 {
     return clientImpl->getServerInfo(
                 host,
-                absTimeout(timeoutNanoseconds),
+                ClientImpl::absTimeout(timeoutNanoseconds),
                 info);
 }
 
@@ -555,10 +540,17 @@ Cluster::getServerStats(const std::string& host,
                         uint64_t timeoutNanoseconds,
                         Protocol::ServerStats& stats)
 {
-    return clientImpl->getServerStats(
+
+    Protocol::ServerControl::ServerStatsGet::Request request;
+    Protocol::ServerControl::ServerStatsGet::Response response;
+    Result result = clientImpl->serverControl(
                 host,
-                absTimeout(timeoutNanoseconds),
-                stats);
+                ClientImpl::absTimeout(timeoutNanoseconds),
+                Protocol::ServerControl::OpCode::SERVER_STATS_GET,
+                request,
+                response);
+    stats = response.server_stats();
+    return result;
 }
 
 Protocol::ServerStats

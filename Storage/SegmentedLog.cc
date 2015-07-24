@@ -190,11 +190,31 @@ SegmentedLog::Sync::~Sync()
 }
 
 void
+SegmentedLog::Sync::optimize()
+{
+    if (ops.size() < 3)
+        return;
+    auto prev = ops.begin();
+    auto it = prev + 1;
+    auto next = it + 1;
+    while (next != ops.end()) {
+        if (prev->opCode == Op::FDATASYNC &&
+            it->opCode == Op::WRITE &&
+            next->opCode == Op::FDATASYNC &&
+            prev->fd == it->fd &&
+            it->fd == next->fd) {
+            prev->opCode = Op::NOOP;
+        }
+        prev = it;
+        it = next;
+        ++next;
+    }
+}
+
+void
 SegmentedLog::Sync::wait()
 {
-    // This used to skip back-to-back fdatasync calls, presumably for
-    // performance reasons. I removed it, since I have no reason to believe
-    // that it's useful or sufficient.
+    optimize();
 
     waitStart = Clock::now();
     uint64_t writes = 0;
@@ -254,6 +274,9 @@ SegmentedLog::Sync::wait()
                 ++unlinks;
                 break;
             }
+            case Op::NOOP: {
+                break;
+            }
         }
         f.release();
         ops.pop_front();
@@ -282,9 +305,9 @@ void
 SegmentedLog::Sync::updateStats(Core::RollingStat& nanos) const
 {
     std::chrono::nanoseconds elapsed = waitEnd - waitStart;
-    nanos.push(elapsed.count());
+    nanos.push(uint64_t(elapsed.count()));
     if (elapsed > diskWriteDurationThreshold)
-        nanos.noteExceptional(waitStart, elapsed.count());
+        nanos.noteExceptional(waitStart, uint64_t(elapsed.count()));
 }
 
 
@@ -329,7 +352,7 @@ SegmentedLog::SegmentedLog(const FS::File& parentDir,
                                              8 * 1024 * 1024))
     , shouldCheckInvariants(config.read<bool>("storageDebug", false))
     , diskWriteDurationThreshold(config.read<uint64_t>(
-        "electionTimeoutMilliseconds", 500) / 2)
+        "electionTimeoutMilliseconds", 500) / 4)
     , metadata()
     , dir(FS::openDir(parentDir,
                       (encoding == Encoding::BINARY
@@ -474,7 +497,11 @@ SegmentedLog::append(const std::vector<const Entry*>& entries)
         Segment::Record record(openSegment->bytes);
         // Note that record.offset may change later, if this entry doesn't fit.
         record.entry = **it;
-        record.entry.set_index(index);
+        if (record.entry.has_index()) {
+            assert(index == record.entry.index());
+        } else {
+            record.entry.set_index(index);
+        }
         Core::Buffer buf = serializeProto(record.entry);
 
         // See if we need to roll over to a new head segment. If someone is
@@ -762,13 +789,13 @@ SegmentedLog::updateMetadata()
 
     TimePoint end = Clock::now();
     std::chrono::nanoseconds elapsed = end - start;
-    metadataWriteNanos.push(elapsed.count());
+    metadataWriteNanos.push(uint64_t(elapsed.count()));
     if (elapsed > diskWriteDurationThreshold) {
         WARNING("Writing metadata file took longer than expected "
                 "(%s for %lu bytes)",
                 Core::StringUtil::toString(elapsed).c_str(),
                 record.getLength());
-        metadataWriteNanos.noteExceptional(start, elapsed.count());
+        metadataWriteNanos.noteExceptional(start, uint64_t(elapsed.count()));
     }
 }
 

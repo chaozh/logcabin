@@ -20,13 +20,14 @@
 #include <sstream>
 
 #include <LogCabin/Client.h>
-#include "Examples/Util.h"
+#include <LogCabin/Debug.h>
+#include <LogCabin/Util.h>
 
 namespace {
 
 using LogCabin::Client::Cluster;
 using LogCabin::Client::Tree;
-using LogCabin::Examples::Util::parseTime;
+using LogCabin::Client::Util::parseNonNegativeDuration;
 
 /**
  * Parses argv for the main function.
@@ -37,16 +38,19 @@ class OptionParser {
         : argc(argc)
         , argv(argv)
         , cluster("logcabin:5254")
-        , timeout(parseTime("10s"))
+        , logPolicy("")
+        , timeout(parseNonNegativeDuration("10s"))
     {
         while (true) {
             static struct option longOptions[] = {
                {"cluster",  required_argument, NULL, 'c'},
-               {"timeout",  required_argument, NULL, 't'},
                {"help",  no_argument, NULL, 'h'},
+               {"timeout",  required_argument, NULL, 't'},
+               {"verbose",  no_argument, NULL, 'v'},
+               {"verbosity",  required_argument, NULL, 256},
                {0, 0, 0, 0}
             };
-            int c = getopt_long(argc, argv, "c:t:h", longOptions, NULL);
+            int c = getopt_long(argc, argv, "c:t:hv", longOptions, NULL);
 
             // Detect the end of the options.
             if (c == -1)
@@ -57,11 +61,17 @@ class OptionParser {
                     cluster = optarg;
                     break;
                 case 't':
-                    timeout = parseTime(optarg);
+                    timeout = parseNonNegativeDuration(optarg);
                     break;
                 case 'h':
                     usage();
                     exit(0);
+                case 'v':
+                    logPolicy = "VERBOSE";
+                    break;
+                case 256:
+                    logPolicy = optarg;
+                    break;
                 case '?':
                 default:
                     // getopt_long already printed an error message.
@@ -80,6 +90,10 @@ class OptionParser {
             << std::endl
             << "scripts/failovertest.py, which kills LogCabin servers in the "
             << "meantime."
+            << std::endl
+            << std::endl
+            << "This program is subject to change (it is not part of "
+            << "LogCabin's stable API)."
             << std::endl
             << std::endl
 
@@ -109,12 +123,33 @@ class OptionParser {
             << std::endl
             << "                                 "
             << "operations [default: 10s]"
+            << std::endl
+
+            << "  -v, --verbose                  "
+            << "Same as --verbosity=VERBOSE"
+            << std::endl
+
+            << "  --verbosity=<policy>           "
+            << "Set which log messages are shown."
+            << std::endl
+            << "                                 "
+            << "Comma-separated LEVEL or PATTERN@LEVEL rules."
+            << std::endl
+            << "                                 "
+            << "Levels: SILENT ERROR WARNING NOTICE VERBOSE."
+            << std::endl
+            << "                                 "
+            << "Patterns match filename prefixes or suffixes."
+            << std::endl
+            << "                                 "
+            << "Example: Client@NOTICE,Test.cc@SILENT,VERBOSE."
             << std::endl;
     }
 
     int& argc;
     char**& argv;
     std::string cluster;
+    std::string logPolicy;
     uint64_t timeout;
 };
 
@@ -163,23 +198,35 @@ verify(Tree& tree)
 int
 main(int argc, char** argv)
 {
-    OptionParser options(argc, argv);
-    Cluster cluster(options.cluster);
-    Tree tree = cluster.getTree();
-    tree.setTimeout(options.timeout);
-    tree.setWorkingDirectoryEx("/failovertest");
-    tree.writeEx("0000000000000000", "0000000000000001");
-    tree.writeEx("0000000000000001", "0000000000000001");
-    uint64_t i = 2;
-    while (true) {
-        if ((i & (i-1)) == 0) { // powers of two
-            std::cout << "i=" << i << std::endl;
-            verify(tree);
+    try {
+
+        OptionParser options(argc, argv);
+        LogCabin::Client::Debug::setLogPolicy(
+            LogCabin::Client::Debug::logPolicyFromString(
+                options.logPolicy));
+        Cluster cluster(options.cluster);
+        Tree tree = cluster.getTree();
+        tree.setTimeout(options.timeout);
+        tree.setWorkingDirectoryEx("/failovertest");
+        tree.writeEx("0000000000000000", "0000000000000001");
+        tree.writeEx("0000000000000001", "0000000000000001");
+        uint64_t i = 2;
+        while (true) {
+            if ((i & (i-1)) == 0) { // powers of two
+                std::cout << "i=" << i << std::endl;
+                verify(tree);
+            }
+            std::string key = toString(i);
+            uint64_t a = toU64(tree.readEx(toString(i - 2)));
+            uint64_t b = toU64(tree.readEx(toString(i - 1)));
+            tree.writeEx(key, toString(a + b));
+            ++i;
         }
-        std::string key = toString(i);
-        uint64_t a = toU64(tree.readEx(toString(i - 2)));
-        uint64_t b = toU64(tree.readEx(toString(i - 1)));
-        tree.writeEx(key, toString(a + b));
-        ++i;
+
+    } catch (const LogCabin::Client::Exception& e) {
+        std::cerr << "Exiting due to LogCabin::Client::Exception: "
+                  << e.what()
+                  << std::endl;
+        exit(1);
     }
 }

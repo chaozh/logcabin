@@ -30,8 +30,8 @@ except AttributeError:
 # Access through env['VERSION'], env['RPM_VERSION'], and env['RPM_RELEASE'] to
 # allow users to override these. RPM versioning is explained here:
 # https://fedoraproject.org/wiki/Packaging:NamingGuidelines#NonNumericRelease
-_VERSION = '1.0.1-alpha.0'
-_RPM_VERSION = '1.0.1'
+_VERSION = '1.1.0-alpha.0'
+_RPM_VERSION = '1.1.0'
 _RPM_RELEASE = '0.1.alpha.0'
 
 opts = Variables('Local.sc')
@@ -165,14 +165,17 @@ elif env['CXX_FAMILY'] == 'clang':
 env.Prepend(CXXFLAGS = [
     "-std=%s" % CXX_STANDARD,
     "-fno-strict-overflow",
+    "-fPIC",
 ])
 env.Prepend(PROTOCXXFLAGS = [
     "-std=%s" % CXX_STANDARD,
     "-fno-strict-overflow",
+    "-fPIC",
 ])
 env.Prepend(GTESTCXXFLAGS = [
     "-std=%s" % CXX_STANDARD,
     "-fno-strict-overflow",
+    "-fPIC",
 ])
 
 if env["BUILDTYPE"] == "DEBUG":
@@ -282,19 +285,24 @@ storageTool = env.Program("build/Storage/Tool",
             LIBS = [ "pthread", "protobuf", "rt", "cryptopp" ])
 env.Default(storageTool)
 
+# Create empty directory so that it can be installed to /var/log/logcabin
+try:
+    os.mkdir("build/emptydir")
+except OSError:
+    pass # directory exists
 
 ### scons install target
 
 env.InstallAs('/etc/init.d/logcabin',           'scripts/logcabin-init-redhat')
+env.InstallAs('/usr/bin/logcabinctl',           'build/Client/ServerControl')
 env.InstallAs('/usr/bin/logcabind',             'build/LogCabin')
 env.InstallAs('/usr/bin/logcabin',              'build/Examples/TreeOps')
 env.InstallAs('/usr/bin/logcabin-benchmark',    'build/Examples/Benchmark')
-env.InstallAs('/usr/bin/logcabin-helloworld',   'build/Examples/HelloWorld')
 env.InstallAs('/usr/bin/logcabin-reconfigure',  'build/Examples/Reconfigure')
-env.InstallAs('/usr/bin/logcabin-serverstats',  'build/Examples/ServerStats')
 env.InstallAs('/usr/bin/logcabin-smoketest',    'build/Examples/SmokeTest')
 env.InstallAs('/usr/bin/logcabin-storage',      'build/Storage/Tool')
-env.Alias('install', ['/etc', '/usr'])
+env.InstallAs('/var/log/logcabin',              'build/emptydir')
+env.Alias('install', ['/etc', '/usr', '/var'])
 
 
 #### 'scons rpm' target
@@ -326,7 +334,20 @@ for target in env.FindInstalledFiles():
     parent = target.get_dir()
     source = target.sources[0]
     install_commands.append('mkdir -p $RPM_BUILD_ROOT%s' % parent)
-    install_commands.append('cp %s $RPM_BUILD_ROOT%s' % (source, target))
+    install_commands.append('cp -r %s $RPM_BUILD_ROOT%s' % (source, target))
+
+pre_commands = [
+    ('/usr/bin/getent group logcabin ||' +
+     '/usr/sbin/groupadd -r logcabin'),
+    ('/usr/bin/getent passwd logcabin ||' +
+     '/usr/sbin/useradd -r -g logcabin -d / -s /sbin/nologin logcabin'),
+]
+
+post_commands = [
+    'chown -R logcabin:logcabin /var/log/logcabin',
+    'mkdir -p /var/lib/logcabin',
+    'chown logcabin:logcabin /var/lib/logcabin',
+]
 
 # We probably don't want rpm to strip binaries.
 # This is kludged into the spec file.
@@ -356,18 +377,20 @@ skip_stripping_binaries_commands = [
 PACKAGEROOT = 'logcabin-%s' % env['RPM_VERSION']
 
 rpms=RPMPackager.package(env,
-    target         = ['logcabin-%s' % env['RPM_VERSION']],
-    source         = env.FindInstalledFiles(),
-    X_RPM_INSTALL  = '\n'.join(install_commands),
-    PACKAGEROOT    = PACKAGEROOT,
-    NAME           = 'logcabin',
-    VERSION        = env['RPM_VERSION'],
-    PACKAGEVERSION = env['RPM_RELEASE'],
-    LICENSE        = 'ISC',
-    SUMMARY        = 'LogCabin is clustered consensus deamon',
-    X_RPM_GROUP    = ('Application/logcabin' + '\n' +
-                      '\n'.join(skip_stripping_binaries_commands)),
-    DESCRIPTION    =
+    target            = ['logcabin-%s' % env['RPM_VERSION']],
+    source            = env.FindInstalledFiles(),
+    X_RPM_INSTALL     = '\n'.join(install_commands),
+    X_RPM_PREINSTALL  = '\n'.join(pre_commands),
+    X_RPM_POSTINSTALL = '\n'.join(post_commands),
+    PACKAGEROOT       = PACKAGEROOT,
+    NAME              = 'logcabin',
+    VERSION           = env['RPM_VERSION'],
+    PACKAGEVERSION    = env['RPM_RELEASE'],
+    LICENSE           = 'ISC',
+    SUMMARY           = 'LogCabin is clustered consensus deamon',
+    X_RPM_GROUP       = ('Application/logcabin' + '\n' +
+                         '\n'.join(skip_stripping_binaries_commands)),
+    DESCRIPTION       =
     'LogCabin is a distributed system that provides a small amount of\n'
     'highly replicated, consistent storage. It is a reliable place for\n'
     'other distributed systems to store their core metadata and\n'
@@ -392,7 +415,10 @@ def remove_sources(env, target, source):
     for g in garbage:
         if env['VERBOSE'] == '1':
             print 'rm %s' % g
-        os.remove(str(g))
+        try:
+            os.remove(str(g))
+        except OSError:
+            os.rmdir(str(g))
 
 # Rename PACKAGEROOT directory and subdirectories (should be empty)
 def remove_packageroot(env, target, source):

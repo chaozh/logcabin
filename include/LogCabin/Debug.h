@@ -38,6 +38,43 @@ namespace Core {
 namespace Debug {
 
 /**
+ * The levels of verbosity for log messages. Higher values are noisier.
+ *
+ * \since LogCabin v1.1.0. New levels may be added in future minor releases
+ * (adding a new level is considered backwards-compatible), so use 'default'
+ * values in switch statements.
+ */
+enum class LogLevel {
+    // If you change this enum, you should also update logLevelToString() and
+    // logLevelFromString() in Core/Debug.cc.
+    /**
+     * This log level is just used for disabling all log messages, which is
+     * really only useful in unit tests.
+     */
+    SILENT = 0,
+    /**
+     * Bad stuff that shouldn't happen. The system broke its contract to users
+     * in some way or some major assumption was violated.
+     */
+    ERROR = 10,
+    /**
+     * Messages at the WARNING level indicate that, although something went
+     * wrong or something unexpected happened, it was transient and
+     * recoverable.
+     */
+    WARNING = 20,
+    /**
+     * A system message that might be useful for administrators and developers.
+     */
+    NOTICE = 30,
+    /**
+     * Messages at the VERBOSE level don't necessarily indicate that anything
+     * went wrong, but they could be useful in diagnosing problems.
+     */
+    VERBOSE = 40,
+};
+
+/**
  * When LogCabin wants to print a log message, this is the information that
  * gets included.
  */
@@ -61,7 +98,9 @@ struct DebugMessage {
     int linenum;
     /// The output of __FUNCTION__.
     const char* function;
-    /// The level of importance of the message as an integer.
+    /// The level of importance of the message as an integer. This should have
+    /// been of type LogLevel but int was exposed originally; int is used for
+    /// backwards compatibility.
     int logLevel;
     /// The level of importance of the message as a static string.
     const char* logLevelString;
@@ -74,9 +113,44 @@ struct DebugMessage {
 };
 
 /**
- * Change the file on which debug log messages are written.
+ * Return the filename given to the last successful call to setLogFilename(),
+ * or the empty string if none.
+ * \since LogCabin v1.1.0.
+ */
+std::string getLogFilename();
+
+/**
+ * Open the given file by name and append future debug log messages to it.
  * Note that if a handler is set with setLogHandler, this file will not be
  * used.
+ * \param filename
+ *      Name of file. If it already exists, new messages will be appended at
+ *      the end. If the file is already open, this will re-open it (useful for
+ *      rotating logs).
+ * \return
+ *      Error message if errors were encountered opening the file, otherwise an
+ *      empty string indicates success.
+ * \since LogCabin v1.1.0.
+ */
+std::string setLogFilename(const std::string& filename);
+
+/**
+ * Called to rotate the log file.
+ * If there was a previous call to setLogFilename(), this will reopen that file
+ * by name, returning any errors. Otherwise, it will do nothing.
+ * \return
+ *      Error message if errors were encountered in reopening the file,
+ *      otherwise an empty string indicates success.
+ * \since LogCabin v1.1.0.
+ */
+std::string reopenLogFromFilename();
+
+/**
+ * Change the file on which debug log messages are written.
+ *
+ * Note that if a handler is set with setLogHandler, this file will not be
+ * used. If a filename has been set with setLogFilename(), this will clear it.
+ *
  * \param newFile
  *      Handle to open file where log messages will be written.
  * \return
@@ -98,6 +172,15 @@ std::function<void(DebugMessage)>
 setLogHandler(std::function<void(DebugMessage)> newHandler);
 
 /**
+ * Return the current log policy (as set by a previous call to setLogPolicy).
+ * Note that this may be empty, indicating that the default level of NOTICE is
+ * in use.
+ * \since LogCabin v1.1.0.
+ */
+std::vector<std::pair<std::string, std::string>>
+getLogPolicy();
+
+/**
  * Specify the log messages that should be displayed for each filename.
  * This first component is a pattern; the second is a log level.
  * A filename is matched against each pattern in order: if the filename starts
@@ -115,6 +198,31 @@ void
 setLogPolicy(const std::initializer_list<
                         std::pair<std::string, std::string>>& newPolicy);
 
+/**
+ * Build a log policy from its string representation.
+ * \param in
+ *      A string of the form "pattern@level,pattern@level,level".
+ *      The pattern is separated from the level by an at symbol. Multiple rules
+ *      are separated by comma. A rule with an empty pattern (match all) does
+ *      not need an at symbol.
+ * \return
+ *      Logging policy based on string description.
+ * \since LogCabin v1.1.0.
+ */
+std::vector<std::pair<std::string, std::string>>
+logPolicyFromString(const std::string& in);
+
+/**
+ * Serialize a log policy into a string representation.
+ * \param policy
+ *      Logging policy in the format required by setLogPolicy.
+ * \return
+ *      String representation as accepted by logPolicyFromString.
+ * \since LogCabin v1.1.0.
+ */
+std::string
+logPolicyToString(const std::vector<
+                            std::pair<std::string, std::string>>& policy);
 
 } // namespace LogCabin::Core::Debug
 } // namespace LogCabin::Core

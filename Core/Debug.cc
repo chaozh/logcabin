@@ -108,21 +108,7 @@ std::string processName = Core::StringUtil::format("%u", getpid());
 namespace Internal {
 
 /**
- * Used to convert LogLevels into strings that will be printed.
- * This array must match the LogLevel enum in Core/Debug.h.
- */
-const char* logLevelToString[] =
-{
-    "SILENT",
-    "ERROR",
-    "WARNING",
-    "NOTICE",
-    "VERBOSE",
-    NULL // must be the last element in the array
-};
-
-/**
- * Protects #policy and #isLoggingCache.
+ * Protects #logPolicy, #isLoggingCache, and #logFilename.
  */
 std::mutex mutex;
 
@@ -136,17 +122,23 @@ std::mutex mutex;
  *
  * Protected by #mutex.
  */
-std::vector<std::pair<std::string, std::string>> policy;
+std::vector<std::pair<std::string, std::string>> logPolicy;
 
 /**
  * A cache of the results of getLogLevel(), since that function is slow.
- * This needs to be cleared when the policy changes.
+ * This needs to be cleared when the logPolicy changes.
  * The key to the map is a pointer to the absolute filename, which should be a
  * string literal.
  *
  * Protected by #mutex.
  */
 std::unordered_map<const char*, LogLevel> isLoggingCache;
+
+/**
+ * Filename of currently open stream, if known.
+ * Protected by #mutex.
+ */
+std::string logFilename;
 
 /**
  * Where log messages go (unless logHandler is set).
@@ -161,17 +153,38 @@ FILE* stream = stderr;
 std::function<void(DebugMessage)> logHandler;
 
 /**
+ * Convert a log level to a (static) string.
+ * PANICs if the string is not a valid log level (case insensitive).
+ */
+const char*
+logLevelToString(LogLevel level)
+{
+    switch (level) {
+        case LogLevel::SILENT:  return "SILENT";
+        case LogLevel::ERROR:   return "ERROR";
+        case LogLevel::WARNING: return "WARNING";
+        case LogLevel::NOTICE:  return "NOTICE";
+        case LogLevel::VERBOSE: return "VERBOSE";
+    }
+    log(LogLevel::ERROR, __FILE__, __LINE__, __FUNCTION__,
+        "%d is not a valid log level.\n",
+        static_cast<int>(level));
+    abort();
+}
+
+/**
  * Convert a string to a log level.
  * PANICs if the string is not a valid log level (case insensitive).
  */
 LogLevel
 logLevelFromString(const std::string& level)
 {
-    for (uint32_t i = 0; logLevelToString[i] != NULL; ++i) {
-        if (strcasecmp(logLevelToString[i], level.c_str()) == 0)
-            return LogLevel(i);
-    }
-    log((LogLevel::ERROR), __FILE__, __LINE__, __FUNCTION__,
+    if (strcasecmp(level.c_str(), "SILENT")  == 0)  return LogLevel::SILENT;
+    if (strcasecmp(level.c_str(), "ERROR")   == 0)   return LogLevel::ERROR;
+    if (strcasecmp(level.c_str(), "WARNING") == 0) return LogLevel::WARNING;
+    if (strcasecmp(level.c_str(), "NOTICE")  == 0)  return LogLevel::NOTICE;
+    if (strcasecmp(level.c_str(), "VERBOSE") == 0) return LogLevel::VERBOSE;
+    log(LogLevel::ERROR, __FILE__, __LINE__, __FUNCTION__,
         "'%s' is not a valid log level.\n", level.c_str());
     abort();
 }
@@ -189,7 +202,7 @@ logLevelFromString(const std::string& level)
 LogLevel
 getLogLevel(const char* fileName)
 {
-    for (auto it = policy.begin(); it != policy.end(); ++it) {
+    for (auto it = logPolicy.begin(); it != logPolicy.end(); ++it) {
         const std::string& pattern = it->first;
         const std::string& logLevel = it->second;
         if (Core::StringUtil::startsWith(fileName, pattern) ||
@@ -240,10 +253,54 @@ relativeFileName(const char* fileName)
 } // namespace Internal
 using namespace Internal; // NOLINT
 
+std::string
+getLogFilename()
+{
+    std::lock_guard<std::mutex> lockGuard(mutex);
+    return logFilename;
+}
+
+std::string
+setLogFilename(const std::string& filename)
+{
+    FILE* next = fopen(filename.c_str(), "a");
+    if (next == NULL) {
+        return Core::StringUtil::format(
+            "Could not open %s for writing debug log messages: %s",
+            filename.c_str(),
+            strerror(errno));
+    }
+    FILE* old;
+    {
+        std::lock_guard<std::mutex> lockGuard(mutex);
+        old = stream;
+        stream = next;
+        logFilename = filename;
+    }
+    if (old != stdout && old != stderr) {
+        if (fclose(old) != 0) {
+            WARNING("Failed to close previous debug log file descriptor: %s",
+                    strerror(errno));
+        }
+    }
+    return {};
+}
+
+std::string
+reopenLogFromFilename()
+{
+    std::string filename = getLogFilename();
+    if (filename.empty())
+        return {};
+    else
+        return setLogFilename(filename);
+}
+
 FILE*
 setLogFile(FILE* newFile)
 {
     std::lock_guard<std::mutex> lockGuard(mutex);
+    logFilename.clear();
     FILE* old = stream;
     stream = newFile;
     return old;
@@ -258,12 +315,19 @@ setLogHandler(std::function<void(DebugMessage)> handler)
     return old;
 }
 
+std::vector<std::pair<std::string, std::string>>
+getLogPolicy()
+{
+    std::lock_guard<std::mutex> lockGuard(mutex);
+    return logPolicy;
+}
+
 void
 setLogPolicy(const std::vector<std::pair<std::string,
                                          std::string>>& newPolicy)
 {
     std::lock_guard<std::mutex> lockGuard(mutex);
-    policy = newPolicy;
+    logPolicy = newPolicy;
     isLoggingCache.clear();
 }
 
@@ -275,10 +339,62 @@ setLogPolicy(const std::initializer_list<std::pair<std::string,
                                          std::string>>(newPolicy));
 }
 
+std::vector<std::pair<std::string, std::string>>
+logPolicyFromString(const std::string& in)
+{
+    std::vector<std::pair<std::string, std::string>> policy;
+    std::vector<std::string> rules = Core::StringUtil::split(in, ',');
+    for (auto it = rules.begin(); it != rules.end(); ++it) {
+        std::vector<std::string> pair = Core::StringUtil::split(*it, '@');
+        if (pair.size() == 1) {
+            policy.emplace_back("", pair.at(0));
+        } else if (pair.size() == 2) {
+            policy.emplace_back(pair.at(0), pair.at(1));
+        } else {
+            // someone put an @ in their pattern? odd
+            assert(pair.size() >= 3);
+            std::string level = pair.back();
+            pair.pop_back();
+            policy.emplace_back(Core::StringUtil::join(pair, "@"),
+                                level);
+        }
+    }
+    return policy;
+}
+
+std::string
+logPolicyToString(const std::vector<std::pair<std::string,
+                                              std::string>>& policy)
+{
+    std::stringstream ss;
+    if (policy.empty()) {
+        ss << LogLevel::NOTICE;
+    } else {
+        bool lastPatternEmpty = false;
+        for (uint64_t i = 0; i < policy.size(); ++i) {
+            if (policy.at(i).first.empty()) {
+                lastPatternEmpty = true;
+            } else {
+                lastPatternEmpty = false;
+                ss << policy.at(i).first;
+                ss << "@";
+            }
+            ss << policy.at(i).second;
+            if (i < policy.size() - 1)
+                ss << ",";
+        }
+        if (!lastPatternEmpty) {
+            ss << ",";
+            ss << LogLevel::NOTICE;
+        }
+    }
+    return ss.str();
+}
+
 std::ostream&
 operator<<(std::ostream& ostream, LogLevel level)
 {
-    ostream << logLevelToString[uint32_t(level)];
+    ostream << logLevelToString(level);
     return ostream;
 }
 
@@ -310,7 +426,7 @@ log(LogLevel level,
         d.linenum = int(lineNum);
         d.function = functionName;
         d.logLevel = int(level);
-        d.logLevelString = logLevelToString[uint32_t(level)];
+        d.logLevelString = logLevelToString(level);
         d.processName = processName;
         d.threadName = ThreadId::getName();
 
@@ -373,7 +489,7 @@ log(LogLevel level,
     fprintf(stream, "%s.%06lu %s:%d in %s() %s[%s:%s]: ",
             formattedSeconds, now.tv_nsec / 1000,
             relativeFileName(fileName), lineNum, functionName,
-            logLevelToString[uint32_t(level)],
+            logLevelToString(level),
             processName.c_str(), ThreadId::getName().c_str());
 
     va_start(ap, format);

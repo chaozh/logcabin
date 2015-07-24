@@ -19,6 +19,7 @@
 #include <string>
 #include <thread>
 
+#include "build/Protocol/ServerControl.pb.h"
 #include "include/LogCabin/Client.h"
 #include "Client/Backoff.h"
 #include "Client/LeaderRPC.h"
@@ -55,6 +56,14 @@ class ClientImpl {
     /// Type for absolute time values used for timeouts.
     typedef LeaderRPC::TimePoint TimePoint;
 
+    /**
+     * Return the absolute time when the calling operation should timeout.
+     * \param relTimeoutNanos
+     *      The number of nanoseconds from now to time out, or 0 for no
+     *      timeout.
+     */
+    static TimePoint absTimeout(uint64_t relTimeoutNanos);
+
     /// Constructor.
     explicit ClientImpl(const std::map<std::string, std::string>& options =
                             std::map<std::string, std::string>());
@@ -86,11 +95,6 @@ class ClientImpl {
     Result getServerInfo(const std::string& host,
                          TimePoint timeout,
                          Server& info);
-
-    /// See Cluster::getServerStats.
-    Result getServerStats(const std::string& host,
-                          TimePoint timeout,
-                          Protocol::ServerStats& stats);
 
     /**
      * Return the canonicalized path name resulting from accessing path
@@ -145,6 +149,15 @@ class ClientImpl {
                       const Condition& condition,
                       TimePoint timeout);
 
+    /**
+     * Low-level interface to ServerControl service used by
+     * Client/ServerControl.cc.
+     */
+    Result serverControl(const std::string& host,
+                         TimePoint timeout,
+                         Protocol::ServerControl::OpCode opCode,
+                         const google::protobuf::Message& request,
+                         google::protobuf::Message& response);
 
   protected:
 
@@ -286,9 +299,13 @@ class ClientImpl {
         TimePoint lastKeepAliveStart;
         /**
          * How often session keep-alive requests are sent during periods of
-         * inactivity, in milliseconds.
+         * inactivity.
          */
-        uint64_t keepAliveIntervalMs;
+        std::chrono::milliseconds keepAliveInterval;
+        /**
+         * How long to wait for the CloseSession RPC before giving up.
+         */
+        std::chrono::milliseconds sessionCloseTimeout;
 
         /**
          * If set, this is an ongoing keep-alive RPC. This call is canceled to

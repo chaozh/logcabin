@@ -1,5 +1,7 @@
 Import('env', 'object_files')
 
+libs = [ "pthread", "protobuf", "rt", "cryptopp" ]
+
 src = [
     "Backoff.cc",
     "Client.cc",
@@ -7,5 +9,12 @@ src = [
     "LeaderRPC.cc",
     "MockClientImpl.cc",
     "SessionManager.cc",
+    "Util.cc",
 ]
 object_files['Client'] = env.StaticObject(src)
+
+env.Default([
+    env.Program("ServerControl",
+                (["ServerControl.cc", "#build/liblogcabin.a"]),
+                LIBS = libs),
+])

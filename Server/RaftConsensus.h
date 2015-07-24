@@ -143,7 +143,7 @@ class Server {
      * \warning
      *      Only valid when we're leader.
      */
-    virtual uint64_t getLastAgreeIndex() const = 0;
+    virtual uint64_t getMatchIndex() const = 0;
     /**
      * Return true if this Server has awarded us its vote for this term.
      */
@@ -228,7 +228,7 @@ class LocalServer : public Server {
     void exit();
     void beginRequestVote();
     void beginLeadership();
-    uint64_t getLastAgreeIndex() const;
+    uint64_t getMatchIndex() const;
     bool haveVote() const;
     uint64_t getLastAckEpoch() const;
     void interrupt();
@@ -240,7 +240,7 @@ class LocalServer : public Server {
     RaftConsensus& consensus;
     /**
      * The index of the last log entry that has been flushed to disk.
-     * Valid for leaders only. Returned by getLastAgreeIndex() and used to
+     * Valid for leaders only. Returned by getMatchIndex() and used to
      * advance the leader's commitIndex.
      */
     uint64_t lastSyncedIndex;
@@ -272,7 +272,7 @@ class Peer : public Server {
     void beginLeadership();
     void exit();
     uint64_t getLastAckEpoch() const;
-    uint64_t getLastAgreeIndex() const;
+    uint64_t getMatchIndex() const;
     bool haveVote() const;
     bool isCaughtUp() const;
     void interrupt();
@@ -373,22 +373,29 @@ class Peer : public Server {
     bool haveVote_;
 
     /**
-     * Indicates that nextIndex is still a (poor) guess: the leader should
-     * send heartbeats to save bandwidth until it finds where the follower's
-     * log diverges from its own. Only used when leader.
+     * Indicates that the leader and the follower aren't necessarily
+     * synchronized. The leader should not send large amounts of data (with
+     * many log entries or large chunks of a snapshot file) to the follower
+     * while this flag is true. For example, the follower might have been
+     * disconnected, or the leader might not know where the follower's log
+     * diverges from its own. It's better to sync up using small RPCs like
+     * heartbeats, then begin/resume sending bulk data after receiving an
+     * acknowledgment.
+     *
+     * Only used when leader.
      */
-    bool forceHeartbeat;
+    bool suppressBulkData;
 
     /**
      * The index of the next entry to send to the follower. Only used when
-     * leader.
+     * leader. Minimum value of 1.
      */
     uint64_t nextIndex;
 
     /**
-     * See #getLastAgreeIndex().
+     * See #getMatchIndex().
      */
-    uint64_t lastAgreeIndex;
+    uint64_t matchIndex;
 
     /**
      * See #getLastAckEpoch().
@@ -401,7 +408,7 @@ class Peer : public Server {
      * if it has no new data to send, to stop the follower from starting a new
      * election.
      * \invariant
-     *      This is never more than HEARTBEAT_PERIOD_MS in the future, since
+     *      This is never more than HEARTBEAT_PERIOD in the future, since
      *      new leaders don't reset it.
      */
     TimePoint nextHeartbeatTime;
@@ -1301,6 +1308,20 @@ class RaftConsensus {
     void interruptAll();
 
     /**
+     * Helper for #appendEntries() to put the right number of entries into the
+     * request.
+     * \param nextIndex
+     *      First entry to send to the follower.
+     * \param request
+     *      AppendEntries request ProtoBuf in which to pack the entries.
+     * \return
+     *      Number of entries in the request.
+     */
+    uint64_t
+    packEntries(uint64_t nextIndex,
+                Protocol::Raft::AppendEntries::Request& request) const;
+
+    /**
      * Try to read the latest good snapshot from disk. Loads the header of the
      * snapshot file, which is used internally by the consensus module. The
      * rest of the file reader is kept in #snapshotReader for the state machine
@@ -1339,7 +1360,7 @@ class RaftConsensus {
 
     /**
      * Set the timer to start a new election and notify #stateChanged.
-     * The timer is set for ELECTION_TIMEOUT_MS plus some random jitter from
+     * The timer is set for ELECTION_TIMEOUT plus some random jitter from
      * now.
      */
     void setElectionTimer();
@@ -1374,7 +1395,7 @@ class RaftConsensus {
      * on any leader is marked committed on this leader by the time this call
      * returns.
      * This is used to provide non-stale read operations to
-     * clients. It gives up after ELECTION_TIMEOUT_MS, since stepDownThread
+     * clients. It gives up after ELECTION_TIMEOUT, since stepDownThread
      * will return to the follower state after that time.
      */
     bool upToDateLeader(std::unique_lock<Mutex>& lockGuard) const;
@@ -1394,19 +1415,27 @@ class RaftConsensus {
      * A follower waits for about this much inactivity before becoming a
      * candidate and starting a new election.
      */
-    const uint64_t ELECTION_TIMEOUT_MS;
+    const std::chrono::nanoseconds ELECTION_TIMEOUT;
 
     /**
      * A leader sends RPCs at least this often, even if there is no data to
      * send.
      */
-    const uint64_t HEARTBEAT_PERIOD_MS;
+    const std::chrono::nanoseconds HEARTBEAT_PERIOD;
+
+    /**
+     * A leader will pack at most this many entries into an AppendEntries
+     * request message. This helps bound processing time when entries are very
+     * small in size.
+     * Const except for unit tests.
+     */
+    uint64_t MAX_LOG_ENTRIES_PER_REQUEST;
 
     /**
      * A candidate or leader waits this long after an RPC fails before sending
      * another one, so as to not overwhelm the network with retries.
      */
-    const uint64_t RPC_FAILURE_BACKOFF_MS;
+    const std::chrono::nanoseconds RPC_FAILURE_BACKOFF;
 
     /**
      * How long the state machine updater thread should sleep if:
@@ -1416,7 +1445,7 @@ class RaftConsensus {
      * - An advance state machine entry failed to commit (probably due to lost
      *   leadership).
      */
-    const std::chrono::milliseconds STATE_MACHINE_UPDATER_BACKOFF;
+    const std::chrono::nanoseconds STATE_MACHINE_UPDATER_BACKOFF;
 
     /**
      * Prefer to keep RPC requests under this size.

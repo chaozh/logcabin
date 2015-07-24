@@ -14,6 +14,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <stdexcept>
 
 #include "Core/StringUtil.h"
 #include "Core/Time.h"
@@ -130,6 +131,121 @@ TEST(CoreTime, SteadyClock_now_progressTimingSensitive) {
     EXPECT_LT(b, a + std::chrono::microseconds(1500));
 }
 
+TEST(CoreTime, parseSignedDuration) {
+    EXPECT_EQ(10000000000L, Time::parseSignedDuration("10s"));
+    EXPECT_EQ(182000000L, Time::parseSignedDuration("182ms"));
+    EXPECT_EQ(9000L, Time::parseSignedDuration("9us"));
+    EXPECT_EQ(9000L, Time::parseSignedDuration("9 us "));
+    EXPECT_EQ(10L, Time::parseSignedDuration("10ns"));
+    EXPECT_EQ(10L, Time::parseSignedDuration("10ns"));
+    EXPECT_EQ(0L, Time::parseSignedDuration("0s"));
+    EXPECT_EQ(0L, Time::parseSignedDuration("0"));
+    EXPECT_THROW(Time::parseSignedDuration("10e"), std::runtime_error);
+    EXPECT_THROW(Time::parseSignedDuration("10 seconds now"),
+                 std::runtime_error);
+    EXPECT_THROW(Time::parseSignedDuration(""),
+                 std::runtime_error);
+    EXPECT_THROW(Time::parseSignedDuration(" "),
+                 std::runtime_error);
+}
+
+TEST(CoreTime, parseSignedDurationOverflowPositive) {
+    int64_t nearly = 1L << 62L;
+    EXPECT_LT(nearly,
+              Time::parseSignedDuration("9223372036854775807 nanoseconds"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::max(),
+              Time::parseSignedDuration("9223372036854775808 nanoseconds"));
+    EXPECT_LT(nearly,
+              Time::parseSignedDuration("9223372036854775 microseconds"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::max(),
+              Time::parseSignedDuration("9223372036854776 microseconds"));
+    EXPECT_LT(nearly,
+              Time::parseSignedDuration("9223372036854 milliseconds"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::max(),
+              Time::parseSignedDuration("9223372036855 milliseconds"));
+    EXPECT_LT(nearly,
+              Time::parseSignedDuration("9223372036 seconds"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::max(),
+              Time::parseSignedDuration("9223372037 seconds"));
+    EXPECT_LT(nearly,
+              Time::parseSignedDuration("153722867 minutes"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::max(),
+              Time::parseSignedDuration("153722868 minutes"));
+    EXPECT_LT(nearly,
+              Time::parseSignedDuration("2562047 hours"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::max(),
+              Time::parseSignedDuration("2562048 hours"));
+    EXPECT_LT(nearly,
+              Time::parseSignedDuration("106751 days"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::max(),
+              Time::parseSignedDuration("106752 days"));
+    EXPECT_LT(nearly,
+              Time::parseSignedDuration("15250 weeks"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::max(),
+              Time::parseSignedDuration("15251 weeks"));
+    EXPECT_LT(nearly,
+              Time::parseSignedDuration("3507 months"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::max(),
+              Time::parseSignedDuration("3508 months"));
+    EXPECT_LT(nearly,
+              Time::parseSignedDuration("292 years"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::max(),
+              Time::parseSignedDuration("293 years"));
+}
+
+TEST(CoreTime, parseSignedDurationOverflowNegative) {
+    int64_t nearly = (1L << 62L) * -1L;
+    EXPECT_GT(nearly,
+              Time::parseSignedDuration("-9223372036854775808 nanoseconds"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::min(),
+              Time::parseSignedDuration("-9223372036854775809 nanoseconds"));
+    EXPECT_GT(nearly,
+              Time::parseSignedDuration("-9223372036854775 microseconds"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::min(),
+              Time::parseSignedDuration("-9223372036854776 microseconds"));
+    EXPECT_GT(nearly,
+              Time::parseSignedDuration("-9223372036854 milliseconds"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::min(),
+              Time::parseSignedDuration("-9223372036855 milliseconds"));
+    EXPECT_GT(nearly,
+              Time::parseSignedDuration("-9223372036 seconds"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::min(),
+              Time::parseSignedDuration("-9223372037 seconds"));
+    EXPECT_GT(nearly,
+              Time::parseSignedDuration("-153722867 minutes"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::min(),
+              Time::parseSignedDuration("-153722868 minutes"));
+    EXPECT_GT(nearly,
+              Time::parseSignedDuration("-2562047 hours"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::min(),
+              Time::parseSignedDuration("-2562048 hours"));
+    EXPECT_GT(nearly,
+              Time::parseSignedDuration("-106751 days"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::min(),
+              Time::parseSignedDuration("-106752 days"));
+    EXPECT_GT(nearly,
+              Time::parseSignedDuration("-15250 weeks"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::min(),
+              Time::parseSignedDuration("-15251 weeks"));
+    EXPECT_GT(nearly,
+              Time::parseSignedDuration("-3507 months"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::min(),
+              Time::parseSignedDuration("-3508 months"));
+    EXPECT_GT(nearly,
+              Time::parseSignedDuration("-292 years"));
+    EXPECT_EQ(std::numeric_limits<int64_t>::min(),
+              Time::parseSignedDuration("-293 years"));
+}
+
+TEST(CoreTime, parseNonNegativeDuration) {
+    EXPECT_EQ(31557600000000000UL,
+              Time::parseNonNegativeDuration("1 year"));
+    EXPECT_EQ(0UL,
+              Time::parseNonNegativeDuration("0"));
+    EXPECT_THROW(Time::parseNonNegativeDuration("-1 year"),
+                 std::runtime_error);
+}
+
 TEST(CoreTime, rdtsc_increasing) {
     uint64_t a = Time::rdtsc();
     uint64_t b = Time::rdtsc();
@@ -145,7 +261,7 @@ TEST(CoreTime, rdtsc_progressTimingSensitive) {
     EXPECT_LT(b, a + 10 * 1000 * 1000);
 }
 
-TEST(CoreTime, sleep_immediate_TimingSensitive) {
+TEST(CoreTime, sleepAbsolute_immediate_TimingSensitive) {
     Time::SteadyClock::time_point start = Time::SteadyClock::now();
     Time::sleep(Time::SteadyClock::time_point::min());
     Time::sleep(Time::SteadyClock::time_point());
@@ -155,9 +271,27 @@ TEST(CoreTime, sleep_immediate_TimingSensitive) {
               Time::SteadyClock::now());
 }
 
-TEST(CoreTime, sleep_later_TimingSensitive) {
+TEST(CoreTime, sleepAbsolute_later_TimingSensitive) {
     Time::SteadyClock::time_point start = Time::SteadyClock::now();
     Time::sleep(start + std::chrono::milliseconds(12));
+    Time::SteadyClock::time_point end = Time::SteadyClock::now();
+    EXPECT_LT(start + std::chrono::milliseconds(12), end);
+    EXPECT_GT(start + std::chrono::milliseconds(17), end);
+}
+
+TEST(CoreTime, sleepRelative_immediate_TimingSensitive) {
+    Time::SteadyClock::time_point start = Time::SteadyClock::now();
+    Time::sleep(std::chrono::nanoseconds::min());
+    Time::sleep(std::chrono::nanoseconds(-10));
+    Time::sleep(std::chrono::nanoseconds(0));
+    Time::sleep(std::chrono::nanoseconds(10));
+    EXPECT_GT(start + std::chrono::milliseconds(5),
+              Time::SteadyClock::now());
+}
+
+TEST(CoreTime, sleepRelative_later_TimingSensitive) {
+    Time::SteadyClock::time_point start = Time::SteadyClock::now();
+    Time::sleep(std::chrono::milliseconds(12));
     Time::SteadyClock::time_point end = Time::SteadyClock::now();
     EXPECT_LT(start + std::chrono::milliseconds(12), end);
     EXPECT_GT(start + std::chrono::milliseconds(17), end);
@@ -211,7 +345,6 @@ TEST(CoreTimeSteadyTimeConverter, unixNanos) {
               conv.unixNanos(Time::SteadyClock::time_point::min() +
                              std::chrono::hours(1)));
 }
-
 
 TEST(CoreTime, padFraction) {
     EXPECT_EQ("5 s", toString(nanoseconds(5000000000)));

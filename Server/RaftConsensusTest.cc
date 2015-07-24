@@ -82,12 +82,6 @@ Protocol::Raft::SimpleConfiguration sdesc(const std::string& description) {
     return fromString<Protocol::Raft::SimpleConfiguration>(description);
 }
 
-TimePoint round(TimePoint x) {
-    milliseconds msSinceEpoch = std::chrono::duration_cast<milliseconds>(
-                                                        x.time_since_epoch());
-    return TimePoint(msSinceEpoch);
-}
-
 /**
  * Custom ServiceMock handler that increases Raft's currentTerm before
  * responding to a request.
@@ -577,8 +571,7 @@ TEST_F(ServerRaftConsensusTest, init_blanklog)
     EXPECT_EQ(0U, consensus->clusterClock.clusterTimeAtEpoch);
     EXPECT_EQ(Clock::mockValue, consensus->clusterClock.localTimeAtEpoch);
     EXPECT_LT(Clock::mockValue, consensus->startElectionAt);
-    EXPECT_GT(Clock::mockValue +
-              milliseconds(consensus->ELECTION_TIMEOUT_MS * 2),
+    EXPECT_GT(Clock::mockValue + consensus->ELECTION_TIMEOUT * 2,
               consensus->startElectionAt);
 }
 
@@ -895,8 +888,7 @@ TEST_F(ServerRaftConsensusTest, handleAppendEntries_newLeaderAndCommitIndex)
     EXPECT_EQ(0U, consensus->votedFor);
     EXPECT_EQ(10U, consensus->currentTerm);
     EXPECT_LT(Clock::mockValue, consensus->startElectionAt);
-    EXPECT_GT(Clock::mockValue +
-              milliseconds(consensus->ELECTION_TIMEOUT_MS * 2),
+    EXPECT_GT(Clock::mockValue + consensus->ELECTION_TIMEOUT * 2,
               consensus->startElectionAt);
     EXPECT_EQ(1U, consensus->commitIndex);
     EXPECT_EQ("term: 10 "
@@ -1174,10 +1166,10 @@ TEST_F(ServerRaftConsensusTest, handleSnapshotChunk_newLeader)
     EXPECT_EQ(0U, consensus->votedFor);
     EXPECT_EQ(10U, consensus->currentTerm);
     EXPECT_LT(Clock::mockValue, consensus->startElectionAt);
-    EXPECT_GT(Clock::mockValue +
-              milliseconds(consensus->ELECTION_TIMEOUT_MS * 2),
+    EXPECT_GT(Clock::mockValue + consensus->ELECTION_TIMEOUT * 2,
               consensus->startElectionAt);
-    EXPECT_EQ("term: 10 ", response);
+    EXPECT_EQ("term: 10 "
+              "bytes_stored: 5", response);
     consensus->snapshotWriter->discard();
 }
 
@@ -1208,7 +1200,8 @@ TEST_F(ServerRaftConsensusTest, handleInstallSnapshot)
 
     // useful data, but not done yet
     consensus->handleInstallSnapshot(request, response);
-    EXPECT_EQ("term: 10 ", response);
+    EXPECT_EQ("term: 10 "
+              "bytes_stored: 37", response);
     EXPECT_EQ(0U, consensus->lastSnapshotIndex);
     EXPECT_TRUE(bool(consensus->snapshotWriter));
 
@@ -1220,7 +1213,8 @@ TEST_F(ServerRaftConsensusTest, handleInstallSnapshot)
     LogCabin::Core::Debug::setLogPolicy({
         {"Server/RaftConsensus.cc", "WARNING"}
     });
-    EXPECT_EQ("term: 10 ", response);
+    EXPECT_EQ("term: 10 "
+              "bytes_stored: 37", response);
     EXPECT_EQ(0U, consensus->lastSnapshotIndex);
     EXPECT_TRUE(bool(consensus->snapshotWriter));
 
@@ -1229,7 +1223,8 @@ TEST_F(ServerRaftConsensusTest, handleInstallSnapshot)
     request.set_data("hello world!");
     request.set_done(true);
     consensus->handleInstallSnapshot(request, response);
-    EXPECT_EQ("term: 10 ", response);
+    EXPECT_EQ("term: 10 "
+              "bytes_stored: 49", response);
     EXPECT_EQ(1U, consensus->lastSnapshotIndex);
     EXPECT_FALSE(bool(consensus->snapshotWriter));
     char helloWorld[13];
@@ -1240,6 +1235,54 @@ TEST_F(ServerRaftConsensusTest, handleInstallSnapshot)
     EXPECT_STREQ("hello world!", helloWorld);
 
     // TODO(ongaro): Test that the configuration is update accordingly
+}
+
+TEST_F(ServerRaftConsensusTest, handleInstallSnapshot_byteOffsetHigh)
+{
+    init();
+    consensus->stepDown(10);
+    consensus->append({&entry1});
+    consensus->commitIndex = 1;
+
+    // Take a snapshot, saving it directly instead of calling snapshotDone().
+    // This way, the consensus module does not know about the snapshot file.
+    std::unique_ptr<Storage::SnapshotFile::Writer> writer =
+        consensus->beginSnapshot(1);
+    writer->save();
+    std::string snapshotContents =
+        readEntireFileAsString(consensus->storageLayout.snapshotDir,
+                               "snapshot");
+
+    Protocol::Raft::InstallSnapshot::Request request;
+    Protocol::Raft::InstallSnapshot::Response response;
+    request.set_server_id(3);
+    request.set_term(10);
+    request.set_last_snapshot_index(1);
+    request.set_byte_offset(1);
+    request.set_data(snapshotContents);
+    request.set_done(false);
+
+    // expect warnings
+    LogCabin::Core::Debug::setLogPolicy({
+        {"Server/RaftConsensus.cc", "ERROR"}
+    });
+
+    // byte offset higher than offset written,
+    // version 2 behavior
+    request.set_version(2);
+    consensus->handleInstallSnapshot(request, response);
+    EXPECT_EQ("term: 10 "
+              "bytes_stored: 0",
+              response);
+    request.clear_version();
+
+    // byte offset higher than offset written,
+    // version 1 compatibility
+    consensus->handleInstallSnapshot(request, response);
+    EXPECT_EQ("term: 11 "
+              "bytes_stored: 0",
+              response);
+    EXPECT_EQ(11U, consensus->currentTerm);
 }
 
 TEST_F(ServerRaftConsensusTest, handleRequestVote)
@@ -1354,12 +1397,10 @@ TEST_F(ServerRaftConsensusTest, setConfiguration_changed)
 void
 setConfigurationHelper(RaftConsensus* consensus)
 {
-    TimePoint waitUntil(
-                consensus->stateChanged.lastWaitUntilTimeSinceEpoch);
-    EXPECT_EQ(round(Clock::mockValue) +
-              milliseconds(consensus->ELECTION_TIMEOUT_MS),
+    TimePoint waitUntil(consensus->stateChanged.lastWaitUntil);
+    EXPECT_EQ(Clock::mockValue + consensus->ELECTION_TIMEOUT,
               waitUntil);
-    Clock::mockValue += milliseconds(consensus->ELECTION_TIMEOUT_MS);
+    Clock::mockValue += consensus->ELECTION_TIMEOUT;
 }
 
 TEST_F(ServerRaftConsensusTest, setConfiguration_catchupFail)
@@ -1472,15 +1513,15 @@ class SetConfigurationHelper3 {
             peer->isCaughtUp_ = true;
         } else if (iter == 2) { // no-op entry
             drainDiskQueue(*consensus);
-            peer->lastAgreeIndex = 2;
+            peer->matchIndex = 2;
             consensus->advanceCommitIndex();
         } else if (iter == 3) { // transitional entry
             drainDiskQueue(*consensus);
-            peer->lastAgreeIndex = 3;
+            peer->matchIndex = 3;
             consensus->advanceCommitIndex();
         } else if (iter == 4) { // new configuration entry
             drainDiskQueue(*consensus);
-            peer->lastAgreeIndex = 4;
+            peer->matchIndex = 4;
             consensus->advanceCommitIndex();
         } else {
             FAIL();
@@ -1711,7 +1752,7 @@ class StateMachineUpdaterThreadMainHelper {
             EXPECT_EQ("advance_version { "
                       "  requested_version: 4 "
                       "}", command);
-            peer.lastAgreeIndex = 5;
+            peer.matchIndex = 5;
             consensus.commitIndex = 5;
             consensus.stateChanged.notify_all(); // to satisfy RaftInvariants
         // leader and all info and servers overlap on current version: go to
@@ -1875,29 +1916,28 @@ class FollowerThreadMainHelper {
     {
     }
     void operator()() {
-        TimePoint waitUntil(
-                    consensus.stateChanged.lastWaitUntilTimeSinceEpoch);
+        TimePoint waitUntil(consensus.stateChanged.lastWaitUntil);
 
         if (iter == 1) {
             // expect to block forever as a follower
-            EXPECT_EQ(round(TimePoint::max()), waitUntil);
+            EXPECT_EQ(TimePoint::max(), waitUntil);
             // set the peer's backoff to prepare for next iteration
             peer.backoffUntil = Clock::mockValue + milliseconds(1);
         } else if (iter == 2) {
             // still a follower so nothing to do, but this time we have to
             // block until backoff is over
-            EXPECT_EQ(round(Clock::mockValue + milliseconds(1)), waitUntil);
+            EXPECT_EQ(Clock::mockValue + milliseconds(1), waitUntil);
             Clock::mockValue += milliseconds(2);
             // move to candidacy
             consensus.startNewElection();
         } else if (iter == 3) {
             // we should have just requested peer's vote, so expect to return
             // immediately
-            EXPECT_EQ(round(TimePoint::min()), waitUntil);
+            EXPECT_EQ(TimePoint::min(), waitUntil);
         } else if (iter == 4) {
             // the vote was granted, so there's nothing left to do for this
             // peer as a candidate, sleep forever
-            EXPECT_EQ(round(TimePoint::max()), waitUntil);
+            EXPECT_EQ(TimePoint::max(), waitUntil);
             // move to leader state
             consensus.becomeLeader();
             // This test was written assuming peer's nextIndex starts one past
@@ -1908,18 +1948,18 @@ class FollowerThreadMainHelper {
         } else if (iter == 5) {
             // we should have just sent a heartbeat, so expect to return
             // immediately
-            EXPECT_EQ(round(TimePoint::min()), waitUntil);
+            EXPECT_EQ(TimePoint::min(), waitUntil);
         } else if (iter == 6) {
             // expect to block until the next heartbeat
-            EXPECT_EQ(round(peer.nextHeartbeatTime), waitUntil);
+            EXPECT_EQ(peer.nextHeartbeatTime, waitUntil);
             Clock::mockValue = peer.nextHeartbeatTime + milliseconds(1);
         } else if (iter == 7) {
             // we should have just sent a heartbeat, so expect to return
             // immediately
-            EXPECT_EQ(round(TimePoint::min()), waitUntil);
+            EXPECT_EQ(TimePoint::min(), waitUntil);
         } else if (iter == 8) {
             // expect to block until the next heartbeat
-            EXPECT_EQ(round(peer.nextHeartbeatTime), waitUntil);
+            EXPECT_EQ(peer.nextHeartbeatTime, waitUntil);
             // exit
             consensus.exit();
             EXPECT_TRUE(peer.exiting);
@@ -2033,8 +2073,7 @@ class StepDownThreadMainHelper2 {
             peer.lastAckEpoch = 2;
         } else if (iter == 3) {
             EXPECT_EQ(3U, consensus.currentEpoch);
-            Clock::mockValue +=
-                milliseconds(consensus.ELECTION_TIMEOUT_MS);
+            Clock::mockValue += consensus.ELECTION_TIMEOUT;
         } else if (iter == 4) {
             EXPECT_EQ(3U, consensus.currentEpoch);
             consensus.exit();
@@ -2086,11 +2125,11 @@ TEST_F(ServerRaftConsensusTest,
     consensus->startNewElection();
     consensus->becomeLeader();
     drainDiskQueue(*consensus);
-    getPeer(2)->lastAgreeIndex = 2;
+    getPeer(2)->matchIndex = 2;
     consensus->advanceCommitIndex();
     EXPECT_EQ(State::LEADER, consensus->state);
     EXPECT_EQ(0U, consensus->commitIndex);
-    getPeer(2)->lastAgreeIndex = 3;
+    getPeer(2)->matchIndex = 3;
     consensus->advanceCommitIndex();
     EXPECT_EQ(3U, consensus->commitIndex);
 }
@@ -2116,13 +2155,13 @@ TEST_F(ServerRaftConsensusTest, advanceCommitIndex_commitCfgWithoutSelf)
         "}");
     consensus->append({&entry1});
     drainDiskQueue(*consensus);
-    getPeer(2)->lastAgreeIndex = 3;
+    getPeer(2)->matchIndex = 3;
     consensus->advanceCommitIndex();
     EXPECT_EQ(3U, consensus->commitIndex);
     EXPECT_EQ(4U, consensus->log->getLastLogIndex());
     EXPECT_EQ(State::LEADER, consensus->state);
 
-    getPeer(2)->lastAgreeIndex = 4;
+    getPeer(2)->matchIndex = 4;
     consensus->advanceCommitIndex();
     EXPECT_EQ(4U, consensus->commitIndex);
     EXPECT_EQ(State::FOLLOWER, consensus->state);
@@ -2205,9 +2244,9 @@ class ServerRaftConsensusPATest : public ServerRaftConsensusPTest {
         // leader has determined that peer and it diverge on the first log
         // entry.
         EXPECT_EQ(5U, peer->nextIndex);
-        EXPECT_TRUE(peer->forceHeartbeat);
+        EXPECT_TRUE(peer->suppressBulkData);
         peer->nextIndex = 1;
-        peer->forceHeartbeat = false;
+        peer->suppressBulkData = false;
 
         request.set_server_id(1);
         request.set_term(6);
@@ -2253,9 +2292,11 @@ TEST_F(ServerRaftConsensusPATest, appendEntries_rpcFailed)
     std::unique_lock<Mutex> lockGuard(consensus->mutex);
     consensus->appendEntries(lockGuard, *peer);
     EXPECT_LT(Clock::now(), peer->backoffUntil);
-    EXPECT_EQ(0U, peer->lastAgreeIndex);
+    EXPECT_EQ(0U, peer->matchIndex);
 }
 
+// Mostly a test for packEntries now that that function has been split out of
+// AppendEntries.
 TEST_F(ServerRaftConsensusPATest, appendEntries_limitSizeAndIgnoreResult)
 {
     consensus->SOFT_RPC_SIZE_LIMIT = 1;
@@ -2268,19 +2309,63 @@ TEST_F(ServerRaftConsensusPATest, appendEntries_limitSizeAndIgnoreResult)
                        request, response);
     std::unique_lock<Mutex> lockGuard(consensus->mutex);
     consensus->appendEntries(lockGuard, *peer);
-    EXPECT_EQ(0U, peer->lastAgreeIndex);
+    EXPECT_EQ(0U, peer->matchIndex);
 }
 
-TEST_F(ServerRaftConsensusPATest, appendEntries_forceHeartbeat)
+// Mostly a test for packEntries now that that function has been split out of
+// AppendEntries.
+//
+// In #160, an entry that wouldn't fit in the request didn't cause the loop to
+// exit. If an entry later in the log would fit in the request, it would be
+// added to the request invalidly. This test targets that specific behavior (it
+// fails before the 'break' statement was added and passes after).
+TEST_F(ServerRaftConsensusPATest, appendEntries_limitSizeRegression)
 {
-    peer->forceHeartbeat = true;
+    // First we determine the sizes contributed by the various entries in
+    // 'request'.
+    Protocol::Raft::AppendEntries::Request r2;
+    r2.CopyFrom(request);
+    r2.clear_entries();
+    // size of request with no entries
+    uint64_t baseSize = uint64_t(r2.ByteSize());
+    std::vector<uint64_t> entrySizes; // size of each entry
+    uint64_t totalSize = baseSize; // size of full request
+    for (int i = 0; i < request.entries_size(); ++i) {
+        *r2.add_entries() = request.entries(i);
+        uint64_t entrySize = uint64_t(r2.ByteSize()) - baseSize;
+        entrySizes.push_back(entrySize);
+        totalSize += entrySize;
+        r2.clear_entries();
+    }
+    EXPECT_EQ((std::vector<uint64_t> { 32, 15, 8, 52 }),
+              entrySizes);
+    EXPECT_EQ(totalSize, uint64_t(request.ByteSize()));
+
+    // We now cap request sizes so that entry 2 doesn't fit but entry 3 would.
+    consensus->SOFT_RPC_SIZE_LIMIT = (baseSize +
+                                      entrySizes.at(0) +
+                                      entrySizes.at(2) +
+                                      5);
+    *r2.add_entries() = request.entries(0);
+    r2.set_commit_index(1);
+    peer->exiting = true;
+    peerService->reply(Protocol::Raft::OpCode::APPEND_ENTRIES,
+                       r2, response);
+    std::unique_lock<Mutex> lockGuard(consensus->mutex);
+    consensus->appendEntries(lockGuard, *peer);
+    EXPECT_EQ(0U, peer->matchIndex);
+}
+
+TEST_F(ServerRaftConsensusPATest, appendEntries_suppressBulkData)
+{
+    peer->suppressBulkData = true;
     request.mutable_entries()->Clear();
     request.set_commit_index(0);
     peerService->reply(Protocol::Raft::OpCode::APPEND_ENTRIES,
                        request, response);
     std::unique_lock<Mutex> lockGuard(consensus->mutex);
     consensus->appendEntries(lockGuard, *peer);
-    EXPECT_FALSE(peer->forceHeartbeat);
+    EXPECT_FALSE(peer->suppressBulkData);
 }
 
 TEST_F(ServerRaftConsensusPATest, appendEntries_termChanged)
@@ -2292,7 +2377,7 @@ TEST_F(ServerRaftConsensusPATest, appendEntries_termChanged)
     std::unique_lock<Mutex> lockGuard(consensus->mutex);
     consensus->appendEntries(lockGuard, *peer);
     EXPECT_EQ(TimePoint::min(), peer->backoffUntil);
-    EXPECT_EQ(0U, peer->lastAgreeIndex);
+    EXPECT_EQ(0U, peer->matchIndex);
     EXPECT_EQ(State::FOLLOWER, consensus->state);
 }
 
@@ -2304,7 +2389,7 @@ TEST_F(ServerRaftConsensusPATest, appendEntries_termStale)
                        request, response);
     std::unique_lock<Mutex> lockGuard(consensus->mutex);
     consensus->appendEntries(lockGuard, *peer);
-    EXPECT_EQ(0U, peer->lastAgreeIndex);
+    EXPECT_EQ(0U, peer->matchIndex);
     EXPECT_EQ(State::FOLLOWER, consensus->state);
     EXPECT_EQ(10U, consensus->currentTerm);
 }
@@ -2316,12 +2401,37 @@ TEST_F(ServerRaftConsensusPATest, appendEntries_ok)
     std::unique_lock<Mutex> lockGuard(consensus->mutex);
     consensus->appendEntries(lockGuard, *peer);
     EXPECT_EQ(consensus->currentEpoch, peer->lastAckEpoch);
-    EXPECT_EQ(4U, peer->lastAgreeIndex);
-    EXPECT_EQ(Clock::mockValue +
-              milliseconds(consensus->HEARTBEAT_PERIOD_MS),
+    EXPECT_EQ(4U, peer->matchIndex);
+    EXPECT_EQ(Clock::mockValue + consensus->HEARTBEAT_PERIOD,
               peer->nextHeartbeatTime);
 
     // TODO(ongaro): test catchup code
+}
+
+TEST_F(ServerRaftConsensusPATest, appendEntries_mismatch)
+{
+    // if the follower's log is too short, need to decrement nextIndex
+    std::unique_lock<Mutex> lockGuard(consensus->mutex);
+
+    // decrementing by one
+    peer->nextIndex = 5;
+    request.set_prev_log_index(4);
+    request.set_prev_log_term(6);
+    request.clear_entries();
+    response.set_success(false);
+    response.set_last_log_index(300);
+    peerService->reply(Protocol::Raft::OpCode::APPEND_ENTRIES,
+                       request, response);
+    consensus->appendEntries(lockGuard, *peer);
+    EXPECT_EQ(4U, peer->nextIndex);
+
+    // capping to last log index + 1
+    peer->nextIndex = 5;
+    response.set_last_log_index(0);
+    peerService->reply(Protocol::Raft::OpCode::APPEND_ENTRIES,
+                       request, response);
+    consensus->appendEntries(lockGuard, *peer);
+    EXPECT_EQ(1U, peer->nextIndex);
 }
 
 TEST_F(ServerRaftConsensusPATest, appendEntries_serverCapabilities)
@@ -2390,6 +2500,7 @@ class ServerRaftConsensusPSTest : public ServerRaftConsensusPTest {
         request.set_byte_offset(0);
         request.set_data("hello, world!");
         request.set_done(true);
+        request.set_version(2);
 
         response.set_term(5);
     }
@@ -2401,6 +2512,7 @@ class ServerRaftConsensusPSTest : public ServerRaftConsensusPTest {
 
 TEST_F(ServerRaftConsensusPSTest, installSnapshot_rpcFailed)
 {
+    peer->suppressBulkData = false;
     peerService->closeSession(Protocol::Raft::OpCode::INSTALL_SNAPSHOT,
                               request);
     // expect warning
@@ -2416,6 +2528,7 @@ TEST_F(ServerRaftConsensusPSTest, installSnapshot_rpcFailed)
 
 TEST_F(ServerRaftConsensusPSTest, installSnapshot_termChanged)
 {
+    peer->suppressBulkData = false;
     peerService->runArbitraryCode(
             Protocol::Raft::OpCode::INSTALL_SNAPSHOT,
             request,
@@ -2428,6 +2541,7 @@ TEST_F(ServerRaftConsensusPSTest, installSnapshot_termChanged)
 
 TEST_F(ServerRaftConsensusPSTest, installSnapshot_termStale)
 {
+    peer->suppressBulkData = false;
     response.set_term(10);
     peerService->reply(Protocol::Raft::OpCode::INSTALL_SNAPSHOT,
                        request, response);
@@ -2440,6 +2554,7 @@ TEST_F(ServerRaftConsensusPSTest, installSnapshot_termStale)
 
 TEST_F(ServerRaftConsensusPSTest, installSnapshot_ok)
 {
+    peer->suppressBulkData = false;
     consensus->SOFT_RPC_SIZE_LIMIT = 7;
     request.set_data("hello, ");
     request.set_done(false);
@@ -2455,16 +2570,68 @@ TEST_F(ServerRaftConsensusPSTest, installSnapshot_ok)
     // make sure we don't use an updated lastSnapshotIndex value
     consensus->lastSnapshotIndex = 1;
     consensus->installSnapshot(lockGuard, *peer);
-    EXPECT_EQ(2U, peer->lastAgreeIndex);
+    EXPECT_EQ(2U, peer->matchIndex);
     EXPECT_EQ(3U, peer->nextIndex);
     EXPECT_FALSE(peer->snapshotFile);
     EXPECT_EQ(0U, peer->snapshotFileOffset);
     EXPECT_EQ(0U, peer->lastSnapshotIndex);
     EXPECT_EQ(consensus->currentEpoch, peer->lastAckEpoch);
-    EXPECT_EQ(Clock::mockValue +
-              milliseconds(consensus->HEARTBEAT_PERIOD_MS),
+    EXPECT_EQ(Clock::mockValue + consensus->HEARTBEAT_PERIOD,
               peer->nextHeartbeatTime);
 }
+
+TEST_F(ServerRaftConsensusPSTest, installSnapshot_suppressBulkData)
+{
+    peer->suppressBulkData = true;
+    consensus->SOFT_RPC_SIZE_LIMIT = 7;
+    request.set_data("");
+    request.set_done(false);
+    peerService->reply(Protocol::Raft::OpCode::INSTALL_SNAPSHOT,
+                       request, response);
+    request.set_data("hello, ");
+    peerService->reply(Protocol::Raft::OpCode::INSTALL_SNAPSHOT,
+                       request, response);
+    std::unique_lock<Mutex> lockGuard(consensus->mutex);
+    consensus->installSnapshot(lockGuard, *peer);
+    EXPECT_FALSE(peer->suppressBulkData);
+    consensus->installSnapshot(lockGuard, *peer);
+    EXPECT_FALSE(peer->suppressBulkData);
+}
+
+TEST_F(ServerRaftConsensusPSTest, installSnapshot_notAllBytesStored)
+{
+    peer->suppressBulkData = false;
+    consensus->SOFT_RPC_SIZE_LIMIT = 7;
+    request.set_data("hello, ");
+    request.set_done(false);
+    response.set_bytes_stored(4);
+    peerService->reply(Protocol::Raft::OpCode::INSTALL_SNAPSHOT,
+                       request, response);
+    request.set_byte_offset(4);
+    request.set_data("o, worl");
+    response.set_bytes_stored(0);
+    peerService->reply(Protocol::Raft::OpCode::INSTALL_SNAPSHOT,
+                       request, response);
+    request.set_byte_offset(0);
+    request.set_data("hello, ");
+    response.set_bytes_stored(7);
+    peerService->reply(Protocol::Raft::OpCode::INSTALL_SNAPSHOT,
+                       request, response);
+    request.set_byte_offset(7);
+    request.set_data("world!");
+    request.set_done(true);
+    response.set_bytes_stored(13);
+    peerService->reply(Protocol::Raft::OpCode::INSTALL_SNAPSHOT,
+                       request, response);
+
+    std::unique_lock<Mutex> lockGuard(consensus->mutex);
+    consensus->installSnapshot(lockGuard, *peer);
+    consensus->installSnapshot(lockGuard, *peer);
+    consensus->installSnapshot(lockGuard, *peer);
+    consensus->installSnapshot(lockGuard, *peer);
+    EXPECT_EQ(2U, peer->matchIndex);
+}
+
 
 TEST_F(ServerRaftConsensusTest, becomeLeader)
 {
@@ -2549,6 +2716,50 @@ TEST_F(ServerRaftConsensusTest, interruptAll)
     Peer& peer = *getPeer(2);
     EXPECT_EQ("RPC canceled by user", peer.rpc.getErrorMessage());
     EXPECT_EQ(1U, consensus->stateChanged.notificationCount);
+}
+
+// packEntries used to be part of appendEntries. The tests
+// appendEntries_limitSizeAndIgnoreResult and appendEntries_limitSizeRegression
+// mostly target the packEntries functionality.
+
+TEST_F(ServerRaftConsensusTest, packEntries)
+{
+    init();
+    consensus->stepDown(5);
+
+    // limit by log length (of 0)
+    Protocol::Raft::AppendEntries::Request request;
+    EXPECT_EQ(0U, consensus->packEntries(1U, request));
+    request.clear_entries();
+
+    // limit by log length (of 2)
+    consensus->append({&entry1});
+    consensus->append({&entry2});
+    EXPECT_EQ(2U, consensus->packEntries(1U, request));
+    request.clear_entries();
+
+    // limit by number of log entries
+    for (uint64_t i = 0; i < 128; ++i)
+        consensus->append({&entry2});
+    consensus->SOFT_RPC_SIZE_LIMIT = 1024 * 1024;
+    consensus->MAX_LOG_ENTRIES_PER_REQUEST = 32;
+    EXPECT_EQ(32U, consensus->packEntries(3U, request));
+    request.clear_entries();
+    consensus->MAX_LOG_ENTRIES_PER_REQUEST = 5000;
+
+    // limit by number of bytes
+    consensus->SOFT_RPC_SIZE_LIMIT = 1024;
+    uint64_t n = consensus->packEntries(3U, request);
+    EXPECT_GT(5000U, n);
+    EXPECT_LT(0U, n);
+    EXPECT_GE(1024, request.ByteSize());
+    *request.add_entries() = consensus->log->getEntry(3);
+    EXPECT_LE(1024, request.ByteSize());
+    request.clear_entries();
+
+    // one entry is allowed even if it's too big
+    consensus->SOFT_RPC_SIZE_LIMIT = 1;
+    EXPECT_EQ(1U, consensus->packEntries(3U, request));
 }
 
 TEST_F(ServerRaftConsensusTest, readSnapshot)
@@ -2861,11 +3072,9 @@ TEST_F(ServerRaftConsensusTest, setElectionTimer)
     init();
     for (uint64_t i = 0; i < 100; ++i) {
         consensus->setElectionTimer();
-        EXPECT_LE(Clock::now() +
-                  milliseconds(consensus->ELECTION_TIMEOUT_MS),
+        EXPECT_LE(Clock::now() + consensus->ELECTION_TIMEOUT,
                   consensus->startElectionAt);
-        EXPECT_GE(Clock::now() +
-                  milliseconds(consensus->ELECTION_TIMEOUT_MS) * 2,
+        EXPECT_GE(Clock::now() + consensus->ELECTION_TIMEOUT * 2,
                   consensus->startElectionAt);
     }
 }
@@ -2879,8 +3088,7 @@ TEST_F(ServerRaftConsensusTest, startNewElection)
     EXPECT_EQ(State::FOLLOWER, consensus->state);
     EXPECT_EQ(0U, consensus->currentTerm);
     EXPECT_LT(Clock::now(), consensus->startElectionAt);
-    EXPECT_GT(Clock::now() +
-              milliseconds(consensus->ELECTION_TIMEOUT_MS) * 2,
+    EXPECT_GT(Clock::now() + consensus->ELECTION_TIMEOUT * 2,
               consensus->startElectionAt);
 
     // need other votes to win
@@ -2896,8 +3104,7 @@ TEST_F(ServerRaftConsensusTest, startNewElection)
     EXPECT_EQ(0U, consensus->leaderId);
     EXPECT_EQ(1U, consensus->votedFor);
     EXPECT_LT(Clock::now(), consensus->startElectionAt);
-    EXPECT_GT(Clock::now() +
-              milliseconds(consensus->ELECTION_TIMEOUT_MS) * 2,
+    EXPECT_GT(Clock::now() + consensus->ELECTION_TIMEOUT * 2,
               consensus->startElectionAt);
     EXPECT_FALSE(bool(consensus->snapshotWriter));
 
@@ -2942,8 +3149,7 @@ TEST_F(ServerRaftConsensusTest, stepDown)
     EXPECT_EQ(0U, consensus->votedFor);
     EXPECT_EQ(Configuration::State::STABLE, consensus->configuration->state);
     EXPECT_LT(Clock::now(), consensus->startElectionAt);
-    EXPECT_GT(Clock::now() +
-              milliseconds(consensus->ELECTION_TIMEOUT_MS) * 2,
+    EXPECT_GT(Clock::now() + consensus->ELECTION_TIMEOUT * 2,
               consensus->startElectionAt);
     EXPECT_FALSE(consensus->logSyncQueued);
 
@@ -2991,7 +3197,7 @@ class UpToDateLeaderHelper {
         if (iter == 1) {
             peer->lastAckEpoch = consensus->currentEpoch;
         } else if (iter == 2) {
-            peer->lastAgreeIndex = 4;
+            peer->matchIndex = 4;
             consensus->advanceCommitIndex();
         } else {
             FAIL();
@@ -3063,7 +3269,7 @@ TEST_F(ServerRaftConsensusTest, regression_nextIndexForNewServer)
     consensus->startNewElection();
     consensus->append({&entry5});
     EXPECT_EQ(4U, getPeer(2)->nextIndex);
-    EXPECT_TRUE(getPeer(2)->forceHeartbeat);
+    EXPECT_TRUE(getPeer(2)->suppressBulkData);
 }
 
 

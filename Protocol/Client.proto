@@ -15,8 +15,6 @@
 
 package LogCabin.Protocol.Client;
 
-import "build/Protocol/ServerStats.proto";
-
 /**
  * \file
  * This file contains the formats for RPCs between clients and servers.
@@ -132,6 +130,26 @@ message OpenSession {
          * The ID assigned to the client.
          */
         required uint64 client_id = 1;
+    }
+}
+
+/**
+ * CloseSession state machine command: Terminate a session with the cluster.
+ * This cleans up any state that the session held; future RPCs on this session
+ * will have errors.
+ * \since
+ *      This command was introduced in state machine version 2. State machines
+ *      running version 1 will ignore this command; they only expire sessions
+ *      based on timeouts.
+ */
+message CloseSession {
+    message Request {
+        /**
+         * The ID assigned to the client as previously returned by OpenSession.
+         */
+        required uint64 client_id = 1;
+    }
+    message Response {
     }
 }
 
@@ -347,21 +365,6 @@ message GetServerInfo {
 
 
 /**
- * GetServerStats RPC: Retrieve statistics from the given server, which are
- * useful for diagnostics.
- */
-message GetServerStats {
-    message Request {
-    }
-    message Response {
-        /**
-         * Metrics, statistics, state and other such information.
-         */
-        required LogCabin.Protocol.ServerStats server_stats = 1;
-    }
-}
-
-/**
  * AdvanceStateMachineVersion state machine command: changes state machine
  * behavior to the given version, if and only if the requested_version is
  * greater than the state machine's current version. This is currently only
@@ -395,15 +398,18 @@ message StateMachineCommand {
     message Request {
         // The following are mutually exclusive.
         optional OpenSession.Request open_session = 1;
+        optional CloseSession.Request close_session = 4;
         optional ReadWriteTree.Request tree = 2;
         optional AdvanceStateMachineVersion.Request advance_version = 3;
     }
     /**
-     * This is what the state machine outputs for read-write commands from the log.
+     * This is what the state machine outputs for read-write commands from the
+     * log.
      */
     message Response {
         // The following are mutually exclusive.
         optional OpenSession.Response open_session = 1;
+        optional CloseSession.Response close_session = 4;
         optional ReadWriteTree.Response tree = 2;
         optional AdvanceStateMachineVersion.Response advance_version = 3;
     }

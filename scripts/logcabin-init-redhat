@@ -25,13 +25,16 @@ prog=logcabin
 logcabin=${LOGCABIN-/usr/bin/logcabind}
 conffile=${CONFFILE-/etc/logcabin.conf}
 lockfile=${LOCKFILE-/var/lock/subsys/logcabin}
+logfile=${LOGFILE-/var/log/logcabin/logcabin.log}
 pidfile=${PIDFILE-/var/run/logcabin.pid}
 DAEMON_COREFILE_LIMIT='unlimited'
 RETVAL=0
 
 start() {
     echo -n $"Starting $prog: "
-    daemon ${logcabin} --daemon --config ${conffile} --log /var/log/${prog}.log --pidfile ${pidfile}
+    touch ${pidfile}
+    chown logcabin ${pidfile}
+    daemon --user logcabin ${logcabin} --daemon --config ${conffile} --log ${logfile} --pidfile ${pidfile}
     RETVAL=$?
     echo
     [ $RETVAL = 0 ] && touch ${lockfile}
@@ -46,13 +49,6 @@ stop() {
     [ $RETVAL = 0 ] && rm -f ${lockfile} ${pidfile}
 }
 
-reload() {
-    echo -n $"Reloading $prog: "
-    killproc -p ${pidfile} ${prog} -HUP
-    RETVAL=$?
-    echo
-}
-
 configtest() {
     ${logcabin} -t -c ${conffile} $FLAG
     RETVAL=$?
@@ -65,6 +61,9 @@ rh_status() {
 
 # See how we were called.
 case "$1" in
+    bootstrap)
+        runuser -s /bin/bash logcabin -c "$logcabin --bootstrap --config ${conffile} --log ${logfile}"
+        ;;
     start)
         rh_status >/dev/null 2>&1 && exit 0
         start
@@ -87,14 +86,11 @@ case "$1" in
             start
         fi
         ;;
-    force-reload|reload)
-        reload
-        ;;
     configtest)
         configtest
         ;;
     *)
-        echo $"Usage: $prog {start|stop|restart|condrestart|try-restart|force-reload|upgrade|reload|status|help|configtest}"
+        echo $"Usage: $prog {bootstrap|start|stop|restart|condrestart|try-restart|status|help|configtest}"
         RETVAL=2
 esac
 

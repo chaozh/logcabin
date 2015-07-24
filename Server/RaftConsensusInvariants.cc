@@ -186,7 +186,7 @@ Invariants::checkBasic()
     // advanceCommitIndex is called everywhere it needs to be.
     if (consensus.state == RaftConsensus::State::LEADER) {
         uint64_t majorityEntry =
-            consensus.configuration->quorumMin(&Server::getLastAgreeIndex);
+            consensus.configuration->quorumMin(&Server::getMatchIndex);
         expect(consensus.commitIndex >= majorityEntry ||
                majorityEntry < consensus.log->getLogStartIndex() ||
                consensus.log->getEntry(majorityEntry).term() !=
@@ -210,8 +210,7 @@ Invariants::checkBasic()
     } else {
         expect(consensus.startElectionAt > TimePoint::min());
         expect(consensus.startElectionAt <=
-               Clock::now() + std::chrono::milliseconds(
-                                    consensus.ELECTION_TIMEOUT_MS * 2));
+               Clock::now() + consensus.ELECTION_TIMEOUT * 2);
     }
 
     // Log metadata is updated when the term or vote changes.
@@ -284,12 +283,12 @@ Invariants::checkPeerBasic()
         if (!peer->requestVoteDone) {
             expect(!peer->haveVote_);
         }
-        expect(peer->lastAgreeIndex <= consensus.log->getLastLogIndex());
+        expect(peer->matchIndex <= consensus.log->getLastLogIndex());
         expect(peer->lastAckEpoch <= consensus.currentEpoch);
-        expect(peer->nextHeartbeatTime <= Clock::now() +
-               std::chrono::milliseconds(consensus.HEARTBEAT_PERIOD_MS));
-        expect(peer->backoffUntil <= Clock::now() +
-               std::chrono::milliseconds(consensus.RPC_FAILURE_BACKOFF_MS));
+        expect(peer->nextHeartbeatTime <=
+               Clock::now() + consensus.HEARTBEAT_PERIOD);
+        expect(peer->backoffUntil <=
+               Clock::now() + consensus.RPC_FAILURE_BACKOFF);
 
         // TODO(ongaro): anything about catchup?
     }

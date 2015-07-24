@@ -20,10 +20,11 @@
 #include "Core/StringUtil.h"
 #include "Protocol/Common.h"
 #include "RPC/Server.h"
-#include "Server/RaftService.h"
-#include "Server/RaftConsensus.h"
 #include "Server/ClientService.h"
+#include "Server/ControlService.h"
 #include "Server/Globals.h"
+#include "Server/RaftConsensus.h"
+#include "Server/RaftService.h"
 #include "Server/StateMachine.h"
 
 namespace LogCabin {
@@ -31,7 +32,9 @@ namespace Server {
 
 ////////// Globals::SigIntHandler //////////
 
-Globals::ExitHandler::ExitHandler(Event::Loop& eventLoop, int signalNumber)
+Globals::ExitHandler::ExitHandler(
+        Event::Loop& eventLoop,
+        int signalNumber)
     : Signal(signalNumber)
     , eventLoop(eventLoop)
 {
@@ -44,23 +47,48 @@ Globals::ExitHandler::handleSignalEvent()
     eventLoop.exit();
 }
 
+Globals::LogRotateHandler::LogRotateHandler(
+        Event::Loop& eventLoop,
+        int signalNumber)
+    : Signal(signalNumber)
+    , eventLoop(eventLoop)
+{
+}
+
+void
+Globals::LogRotateHandler::handleSignalEvent()
+{
+    NOTICE("%s: rotating logs", strsignal(signalNumber));
+    std::string error = Core::Debug::reopenLogFromFilename();
+    if (!error.empty()) {
+        PANIC("Failed to rotate log file: %s",
+              error.c_str());
+    }
+    NOTICE("%s: done rotating logs", strsignal(signalNumber));
+}
+
+
 ////////// Globals //////////
 
 Globals::Globals()
     : config()
+    , serverStats(*this)
     , eventLoop()
     , sigIntBlocker(SIGINT)
     , sigTermBlocker(SIGTERM)
     , sigUsr1Blocker(SIGUSR1)
+    , sigUsr2Blocker(SIGUSR2)
     , sigIntHandler(eventLoop, SIGINT)
     , sigIntMonitor(eventLoop, sigIntHandler)
     , sigTermHandler(eventLoop, SIGTERM)
     , sigTermMonitor(eventLoop, sigTermHandler)
-    , serverStats(*this)
+    , sigUsr2Handler(eventLoop, SIGUSR2)
+    , sigUsr2Monitor(eventLoop, sigUsr2Handler)
     , clusterUUID()
     , serverId(~0UL)
     , raft()
     , stateMachine()
+    , controlService()
     , raftService()
     , clientService()
     , rpcServer()
@@ -69,6 +97,7 @@ Globals::Globals()
 
 Globals::~Globals()
 {
+    serverStats.exit();
 }
 
 void
@@ -88,6 +117,10 @@ Globals::init()
         raft->serverId = serverId;
     }
 
+    if (!controlService) {
+        controlService.reset(new ControlService(*this));
+    }
+
     if (!raftService) {
         raftService.reset(new RaftService(*this));
     }
@@ -101,10 +134,14 @@ Globals::init()
                                         Protocol::Common::MAX_MESSAGE_LENGTH));
 
         uint32_t maxThreads = config.read<uint16_t>("maxThreads", 16);
-        rpcServer->registerService(Protocol::Common::ServiceId::RAFT_SERVICE,
+        namespace ServiceId = Protocol::Common::ServiceId;
+        rpcServer->registerService(ServiceId::CONTROL_SERVICE,
+                                   controlService,
+                                   maxThreads);
+        rpcServer->registerService(ServiceId::RAFT_SERVICE,
                                    raftService,
                                    maxThreads);
-        rpcServer->registerService(Protocol::Common::ServiceId::CLIENT_SERVICE,
+        rpcServer->registerService(ServiceId::CLIENT_SERVICE,
                                    clientService,
                                    maxThreads);
 
@@ -118,7 +155,7 @@ Globals::init()
         std::vector<std::string> listenAddresses =
             Core::StringUtil::split(listenAddressesStr, ',');
         if (listenAddresses.empty()) {
-            PANIC("No server addresses specified to listen on");
+            EXIT("No server addresses specified to listen on");
         }
         for (auto it = listenAddresses.begin();
              it != listenAddresses.end();
@@ -127,9 +164,9 @@ Globals::init()
             address.refresh(RPC::Address::TimePoint::max());
             std::string error = rpcServer->bind(address);
             if (!error.empty()) {
-                PANIC("Could not listen on address %s: %s",
-                      address.toString().c_str(),
-                      error.c_str());
+                EXIT("Could not listen on address %s: %s",
+                     address.toString().c_str(),
+                     error.c_str());
             }
             NOTICE("Serving on %s",
                    address.toString().c_str());
@@ -139,7 +176,7 @@ Globals::init()
     }
 
     if (!stateMachine) {
-        stateMachine.reset(new StateMachine(raft, config));
+        stateMachine.reset(new StateMachine(raft, config, *this));
     }
 
     serverStats.enable();
@@ -151,6 +188,7 @@ Globals::leaveSignalsBlocked()
     sigIntBlocker.leaveBlocked();
     sigTermBlocker.leaveBlocked();
     sigUsr1Blocker.leaveBlocked();
+    sigUsr2Blocker.leaveBlocked();
 }
 
 void
@@ -158,6 +196,16 @@ Globals::run()
 {
     eventLoop.runForever();
 }
+
+void
+Globals::unblockAllSignals()
+{
+    sigIntBlocker.unblock();
+    sigTermBlocker.unblock();
+    sigUsr1Blocker.unblock();
+    sigUsr2Blocker.unblock();
+}
+
 
 } // namespace LogCabin::Server
 } // namespace LogCabin
